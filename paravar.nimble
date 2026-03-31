@@ -8,7 +8,6 @@ bin         = @["paravar"]
 
 # Dependencies
 requires "nim >= 2.0.0"
-requires "hts >= 0.3.21"
 
 # Tasks
 task test, "Run all tests":

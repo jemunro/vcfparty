@@ -5,9 +5,9 @@
 # Idempotent: skips files that already exist.
 #
 # Produces:
-#   tests/data/small.vcf.gz        ~200 records, 3 chromosomes, tabix indexed
-#   tests/data/single_chrom.vcf.gz single chromosome, tabix indexed
-#   tests/data/tiny.vcf.gz         3 records (fewer than typical n_shards), tabix indexed
+#   tests/data/small.vcf.gz         ~5000 records, 3 chromosomes, TBI indexed
+#   tests/data/small_csi.vcf.gz     same content, CSI indexed only (no .tbi)
+#   tests/data/chr22_1kg.vcf.gz     25000 records from 1000 Genomes chr22 (optional)
 
 set -euo pipefail
 
@@ -64,47 +64,59 @@ if [[ ! -f "${SMALL}" ]]; then
     done
   } | bcftools sort | bgzip -c > "${SMALL}"
   tabix -p vcf "${SMALL}"
-  echo "  -> $(bcftools view -H "${SMALL}" | wc -l) records, index: ${SMALL}.tbi"
+  echo "  -> $(bcftools view -HG "${SMALL}" | wc -l) records, TBI index: ${SMALL}.tbi"
 else
   echo "Skipping ${SMALL} (already exists)"
 fi
 
 # ---------------------------------------------------------------------------
-# single_chrom.vcf.gz — 80 records on chr1 only
+# small_csi.vcf.gz — same content as small.vcf.gz but CSI indexed only.
+# No .tbi is created alongside it so paravar's index-detection falls through
+# to the .csi path — exercising parseCsiBlockStarts.
 # ---------------------------------------------------------------------------
-SINGLE="${DATA_DIR}/single_chrom.vcf.gz"
-if [[ ! -f "${SINGLE}" ]]; then
-  echo "Generating ${SINGLE} ..."
-  {
-    write_header
-    for i in $(seq 1 80); do
-      printf "chr1\t%d\t.\tA\tC\t60\tPASS\t.\tGT\t1/1\n" $((i * 2000))
-    done
-  } | bgzip -c > "${SINGLE}"
-  tabix -p vcf "${SINGLE}"
-  echo "  -> $(bcftools view -H "${SINGLE}" | wc -l) records, index: ${SINGLE}.tbi"
+CSI="${DATA_DIR}/small_csi.vcf.gz"
+if [[ ! -f "${CSI}" ]]; then
+  echo "Generating ${CSI} (CSI index only) ..."
+  cp "${SMALL}" "${CSI}"
+  tabix --csi -p vcf "${CSI}"
+  echo "  -> $(bcftools view -HG "${CSI}" | wc -l) records, CSI index: ${CSI}.csi"
 else
-  echo "Skipping ${SINGLE} (already exists)"
+  echo "Skipping ${CSI} (already exists)"
 fi
 
 # ---------------------------------------------------------------------------
-# tiny.vcf.gz — 3 records (fewer than typical n_shards=4)
+# chr22_1kg.vcf.gz — real 1000 Genomes chr22 release (optional, ~1 GB)
+# Downloaded once; skipped if already present or if no network tool found.
 # ---------------------------------------------------------------------------
-TINY="${DATA_DIR}/tiny.vcf.gz"
-if [[ ! -f "${TINY}" ]]; then
-  echo "Generating ${TINY} ..."
-  {
-    write_header
-    printf "chr1\t1000\t.\tA\tT\t50\tPASS\t.\tGT\t0/1\n"
-    printf "chr1\t2000\t.\tC\tG\t50\tPASS\t.\tGT\t0/1\n"
-    printf "chr1\t3000\t.\tG\tA\t50\tPASS\t.\tGT\t0/1\n"
-  } | bgzip -c > "${TINY}"
-  tabix -p vcf "${TINY}"
-  echo "  -> $(bcftools view -H "${TINY}" | wc -l) records, index: ${TINY}.tbi"
+KG="${DATA_DIR}/chr22_1kg.vcf.gz"
+KG_TBI="${KG}.tbi"
+KG_VCF_URL="https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
+
+SUBSAMPLE_AWK='/^#/{print; next} c<25000{print; c++} c>=25000{exit}'
+
+if [[ ! -f "${KG}" ]]; then
+  if command -v wget &>/dev/null; then
+    echo "Downloading and subsampling ${KG} (first 25000 records) ..."
+    # pipefail off: awk exits early (SIGPIPE) once it has 25000 records — that's expected.
+    set +o pipefail
+    wget -q -O - "${KG_VCF_URL}" | bgzip -d | awk "${SUBSAMPLE_AWK}" | bgzip -c > "${KG}"
+    set -o pipefail
+    tabix -p vcf "${KG}"
+    echo "  -> $(bcftools view -HG "${KG}" | wc -l) records, index: ${KG_TBI}"
+  elif command -v curl &>/dev/null; then
+    echo "Downloading and subsampling ${KG} (first 25000 records) ..."
+    set +o pipefail
+    curl -s -L "${KG_VCF_URL}" | bgzip -d | awk "${SUBSAMPLE_AWK}" | bgzip -c > "${KG}"
+    set -o pipefail
+    tabix -p vcf "${KG}"
+    echo "  -> $(bcftools view -HG "${KG}" | wc -l) records, index: ${KG_TBI}"
+  else
+    echo "Skipping ${KG} (no wget or curl found)"
+  fi
 else
-  echo "Skipping ${TINY} (already exists)"
+  echo "Skipping ${KG} (already exists)"
 fi
 
 echo ""
 echo "All fixtures ready in ${DATA_DIR}/"
-ls -lh "${DATA_DIR}"/*.vcf.gz "${DATA_DIR}"/*.tbi 2>/dev/null || true
+ls -lh "${DATA_DIR}"/*.vcf.gz "${DATA_DIR}"/*.tbi "${DATA_DIR}"/*.csi 2>/dev/null || true

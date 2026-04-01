@@ -39,15 +39,19 @@ proc `$`*(f: GatherFormat): string =
 # ---------------------------------------------------------------------------
 
 proc inferGatherFormat*(path: string; fmtOverride: string): (GatherFormat, GatherCompression) =
-  ## Infer format and compression from the --gather output path extension.
-  ## fmtOverride is the value of --gather-fmt ("vcf", "bcf", "txt") or "" if absent.
-  ## Compression is always derived from path: .gz or .bcf suffix → gcBgzf; else gcUncompressed.
-  ## Format is derived from fmtOverride when non-empty; otherwise from path extension.
-  ## Exits 1 on unknown path extension (without override) or invalid fmtOverride value.
+  ## Infer format and compression from the gather output path extension.
+  ## fmtOverride ("vcf", "bcf", "txt") overrides format when non-empty; exits 1 if invalid.
+  ## Compression: .gz / .bgz / .bcf → gcBgzf; anything else → gcUncompressed.
+  ## Format (when no override):
+  ##   .vcf.gz / .vcf.bgz → VCF+BGZF
+  ##   .vcf               → VCF+Uncompressed
+  ##   .bcf               → BCF+BGZF
+  ##   .gz / .bgz         → Text+BGZF
+  ##   anything else      → Text+Uncompressed (no error)
 
   # Compression is solely determined by the output path extension.
   let compression =
-    if path.endsWith(".gz") or path.endsWith(".bcf"): gcBgzf
+    if path.endsWith(".gz") or path.endsWith(".bgz") or path.endsWith(".bcf"): gcBgzf
     else: gcUncompressed
 
   # Format is from override if supplied; otherwise inferred from extension.
@@ -62,18 +66,16 @@ proc inferGatherFormat*(path: string; fmtOverride: string): (GatherFormat, Gathe
         " (expected vcf, bcf, or txt)"
       quit(1)
   else:
-    if path.endsWith(".vcf.gz") or path.endsWith(".vcf"):
+    if path.endsWith(".vcf.gz") or path.endsWith(".vcf.bgz"):
+      fmt = gfVcf
+    elif path.endsWith(".vcf"):
       fmt = gfVcf
     elif path.endsWith(".bcf"):
       fmt = gfBcf
-    elif path.endsWith(".txt.gz") or path.endsWith(".txt"):
+    elif path.endsWith(".gz") or path.endsWith(".bgz"):
       fmt = gfText
     else:
-      let extStart = path.rfind('.')
-      let ext = if extStart >= 0: path[extStart .. ^1] else: "(no extension)"
-      stderr.writeLine &"error: --gather: unknown extension '{ext}'" &
-        " (expected .vcf.gz, .bcf, .vcf, .txt.gz, or .txt)"
-      quit(1)
+      fmt = gfText  # unknown extension → text, no error
 
   result = (fmt, compression)
 
@@ -390,3 +392,107 @@ proc concatenateShards*(cfg: GatherConfig; tmpPaths: seq[string]) =
     discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
   outFile.close()
   cleanupTempDir(cfg.tmpDir, tmpPaths, true)
+
+# ---------------------------------------------------------------------------
+# C3 — Direct-file gather (no temp dir)
+# ---------------------------------------------------------------------------
+
+proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
+  ## Concatenate pre-existing shard files into cfg.outputPath.
+  ## Shard 0 is written with its header intact; shards 1..N have headers stripped.
+  ## No temp files are created.  Resets the global format-detection state.
+  if inputPaths.len == 0:
+    stderr.writeLine "error: gather: no input files provided"
+    quit(1)
+  gFormatDetected = false
+  gDetectedFormat = gfText
+  gStreamIsBgzf   = false
+  let outFile = open(cfg.outputPath, fmWrite)
+  for i, path in inputPaths:
+    let fileSize = getFileSize(path)
+    var allBytes = newSeq[byte](fileSize.int)
+    let f = open(path, fmRead)
+    discard readBytes(f, allBytes, 0, allBytes.len)
+    f.close()
+    # Format detection from shard 0.
+    if i == 0:
+      let (fmt, isBgzf) = sniffStreamFormat(allBytes)
+      gDetectedFormat = fmt
+      gStreamIsBgzf   = isBgzf
+      gFormatDetected = true
+      if fmt != cfg.format:
+        stderr.writeLine &"warning: shard 0 format detected as {fmt} " &
+          &"but output expects {cfg.format}; proceeding"
+    # Strip the terminal BGZF EOF block if present — we write a single EOF at the end.
+    var bytes = allBytes
+    if gStreamIsBgzf and bytes.len >= BGZF_EOF.len and
+       bytes[bytes.len - BGZF_EOF.len ..< bytes.len] == @BGZF_EOF:
+      bytes = bytes[0 ..< bytes.len - BGZF_EOF.len]
+    if i == 0:
+      # Shard 0: no header stripping; apply recompression if needed.
+      let toWrite: seq[byte] =
+        if gStreamIsBgzf and cfg.compression == gcUncompressed:
+          decompressAllBgzfBlocks(bytes)
+        elif not gStreamIsBgzf and cfg.compression == gcBgzf:
+          compressToBgzfMulti(bytes)
+        else:
+          bytes
+      discard outFile.writeBytes(toWrite, 0, toWrite.len)
+    else:
+      # Shards 1..N: strip headers.
+      let fmt = gDetectedFormat
+      if gStreamIsBgzf and fmt in {gfVcf, gfBcf}:
+        # Optimised path: decompress only the header-containing blocks, then
+        # stream the remaining data blocks (EOF already stripped above).
+        var blockPos = 0
+        var decompAccum: seq[byte]
+        var headerEnd = -1
+        while blockPos < bytes.len and headerEnd < 0:
+          let blkSize = bgzfBlockSize(bytes.toOpenArray(blockPos, bytes.high))
+          if blkSize <= 0: break
+          decompAccum.add(
+            decompressBgzf(bytes.toOpenArray(blockPos, blockPos + blkSize - 1)))
+          blockPos += blkSize
+          headerEnd =
+            if fmt == gfBcf: findBcfHeaderEnd(decompAccum)
+            else:             findVcfHeaderEnd(decompAccum)
+        if headerEnd < 0: headerEnd = decompAccum.len
+        let tail = decompAccum[headerEnd ..< decompAccum.len]
+        if tail.len > 0:
+          let chunk =
+            if cfg.compression == gcBgzf: compressToBgzfMulti(tail)
+            else: tail
+          discard outFile.writeBytes(chunk, 0, chunk.len)
+        # Stream remaining data blocks.
+        while blockPos < bytes.len:
+          let blkSize = bgzfBlockSize(bytes.toOpenArray(blockPos, bytes.high))
+          if blkSize <= 0: break
+          if cfg.compression == gcBgzf:
+            discard outFile.writeBytes(bytes, blockPos, blkSize)
+          else:
+            let d = decompressBgzf(bytes.toOpenArray(blockPos, blockPos + blkSize - 1))
+            discard outFile.writeBytes(d, 0, d.len)
+          blockPos += blkSize
+      else:
+        # General path: decompress all, strip, write.
+        let data: seq[byte] =
+          if gStreamIsBgzf: decompressAllBgzfBlocks(bytes)
+          else: bytes
+        let stripped: seq[byte] =
+          case fmt
+          of gfBcf: stripBcfHeader(data)
+          of gfVcf: stripLinesByPattern(data, "#")
+          of gfText:
+            if cfg.headerPattern.isSome:
+              stripLinesByPattern(data, cfg.headerPattern.get)
+            elif cfg.headerN.isSome:
+              stripFirstNLines(data, cfg.headerN.get)
+            else:
+              data
+        let toWrite: seq[byte] =
+          if cfg.compression == gcBgzf: compressToBgzfMulti(stripped)
+          else: stripped
+        discard outFile.writeBytes(toWrite, 0, toWrite.len)
+  if cfg.compression == gcBgzf:
+    discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
+  outFile.close()

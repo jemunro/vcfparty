@@ -22,6 +22,22 @@ template info(msg: string) =
   if verbose: stderr.writeLine "info: " & msg
 
 # ---------------------------------------------------------------------------
+# Output path helpers
+# ---------------------------------------------------------------------------
+
+proc shardOutputPath*(tmpl: string; shardIdx: int; nShards: int): string =
+  ## Resolve the output path for shard shardIdx (0-based).
+  ## If tmpl contains "{}": replace with zero-padded 1-based shard number.
+  ## Otherwise: prepend "shard_NN." to the basename of tmpl, keep directory.
+  let padded = align($(shardIdx + 1), len($nShards), '0')
+  if "{}" in tmpl:
+    return tmpl.replace("{}", padded)
+  let dir  = tmpl.parentDir
+  let base = tmpl.lastPathPart
+  let prefixed = "shard_" & padded & "." & base
+  result = if dir.len == 0: prefixed else: dir / prefixed
+
+# ---------------------------------------------------------------------------
 # Format detection
 # ---------------------------------------------------------------------------
 
@@ -653,20 +669,20 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
                           boundaryHead: boundaryHead, eofSeq: eofSeq,
                           logLine: "")
 
-proc scatter*(vcfPath: string; nShards: int; outputPrefix: string;
+proc scatter*(vcfPath: string; nShards: int; outputTemplate: string;
               nThreads: int = 1; forceScan: bool = false;
               format: FileFormat = Vcf) =
   ## Split vcfPath into nShards bgzipped files.
-  ## VCF: outputPrefix.N.vcf.gz; BCF: outputPrefix.N.bcf (zero-padded).
+  ## outputTemplate may contain {} (replaced with zero-padded shard number)
+  ## or not (shard_NN. is prepended to the basename). mkdir -p is applied.
   ## nThreads controls parallelism; pass 0 to use all CPUs.
   let actualThreads = if nThreads == 0: countProcessors() else: nThreads
   setMaxPoolSize(actualThreads)
   info(&"scatter: using {actualThreads} thread(s)")
   var tasks = computeShards(vcfPath, nShards, actualThreads, forceScan, format)
-  let nDigits = len($nShards)
-  let ext = if format == Bcf: ".bcf" else: ".vcf.gz"
   for i in 0 ..< nShards:
-    let outPath = outputPrefix & "." & align($(i + 1), nDigits, '0') & ext
+    let outPath = shardOutputPath(outputTemplate, i, nShards)
+    createDir(outPath.parentDir)
     tasks[i].outFd = posix.open(outPath.cstring,
                                 O_WRONLY or O_CREAT or O_TRUNC,
                                 0o666.Mode)

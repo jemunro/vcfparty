@@ -6,6 +6,16 @@ import scatter
 import run
 import gather
 
+proc warnFormatMismatch(inputPath: string; outputPath: string) =
+  ## Warn if input and output format extensions disagree (VCF↔BCF mismatch).
+  let inVcf  = inputPath.endsWith(".vcf.gz")
+  let inBcf  = inputPath.endsWith(".bcf")
+  let outBcf = outputPath.endsWith(".bcf")
+  let outVcf = outputPath.endsWith(".vcf.gz") or outputPath.endsWith(".vcf")
+  if (inVcf and outBcf) or (inBcf and outVcf):
+    stderr.writeLine "warning: input and output formats differ; " &
+      "format conversion is the pipeline's responsibility"
+
 proc detectFormat(path: string): FileFormat =
   ## Detect file format from extension.
   ## .vcf.gz → Vcf; .bcf → Bcf; anything else → exit 1.
@@ -28,8 +38,9 @@ proc usage() =
   stderr.writeLine "Usage: paravar <subcommand> [options]"
   stderr.writeLine ""
   stderr.writeLine "Subcommands:"
-  stderr.writeLine "  scatter   Split a bgzipped VCF into N shards"
+  stderr.writeLine "  scatter   Split a bgzipped VCF/BCF into N shards"
   stderr.writeLine "  run       Scatter, pipe each shard through a tool pipeline"
+  stderr.writeLine "  gather    Concatenate pre-existing shard files into a single output"
   stderr.writeLine ""
   stderr.writeLine "Run 'paravar <subcommand> --help' for subcommand options."
   quit(1)
@@ -130,30 +141,30 @@ proc runScatter(rawArgs: seq[string]) =
     quit(1)
   if not nThreadsSet:
     nThreads = min(nShards, 8)
+  warnFormatMismatch(inputFile, outPrefix)
   scatter(inputFile, nShards, outPrefix, nThreads, forceScan, fmt)
 
 proc runUsage() =
   ## Print run subcommand usage to stderr and exit 1.
-  stderr.writeLine "Usage: paravar run -n <n_shards> -o <prefix> [options] <input.vcf.gz> --- <cmd> [args...] [--- <cmd2> ...]"
+  stderr.writeLine "Usage: paravar run -n <n_shards> -o <output> [options] <input.vcf.gz> (--- | :::) <cmd> [args...] [(--- | :::) <cmd2> ...]"
   stderr.writeLine ""
   stderr.writeLine "Options:"
   stderr.writeLine "  -n, --n-shards <int>         number of shards (required, >= 1)"
-  stderr.writeLine "  -o, --output <str>           output file prefix (required without --gather)"
+  stderr.writeLine "  -o, --output <str>           output path or prefix (required)"
   stderr.writeLine "  -j, --max-jobs <int>         max concurrent shard pipelines (default: n-shards)"
   stderr.writeLine "  -t, --max-threads <int>      max threads for scatter/validation (default: min(max-jobs, 8))"
   stderr.writeLine "      --force-scan             always scan BGZF blocks (ignore index even if present)"
   stderr.writeLine "      --no-kill                on failure, let sibling shards finish (default: kill them)"
-  stderr.writeLine "      --gather <path>          concatenate shard outputs into a single file"
-  stderr.writeLine "      --gather-fmt vcf|bcf|txt override format inference from --gather extension"
+  stderr.writeLine "      --gather                 gather shard outputs into single -o file"
   stderr.writeLine "      --header-pattern <pat>   strip lines starting with pat from shards 2..N (text format only)"
   stderr.writeLine "      --header-n <n>           strip the first n lines from shards 2..N (text format only)"
-  stderr.writeLine "      --tmp-dir <dir>          temp dir for shard files (default: $TMPDIR/paravar)"
+  stderr.writeLine "      --tmp-dir <dir>          temp dir for gather shard files (default: $TMPDIR/paravar)"
   stderr.writeLine "  -v, --verbose                print per-shard progress to stderr"
   stderr.writeLine "  -h, --help                   show this help"
   stderr.writeLine ""
-  stderr.writeLine "Separate pipeline stages with ---:"
-  stderr.writeLine "  paravar run -n 8 -o out input.vcf.gz --- bcftools view -i \"GT='alt'\" -Oz"
-  stderr.writeLine "  paravar run -n 8 --gather out.vcf.gz input.vcf.gz --- bcftools view -Oz"
+  stderr.writeLine "Separate pipeline stages with --- or ::::"
+  stderr.writeLine "  paravar run -n 8 -o out.vcf.gz input.vcf.gz --- bcftools view -i \"GT='alt'\" -Oz"
+  stderr.writeLine "  paravar run -n 8 --gather -o out.vcf.gz input.vcf.gz --- bcftools view -Oz"
   quit(1)
 
 proc runRun(rawArgs: seq[string]) =
@@ -162,7 +173,7 @@ proc runRun(rawArgs: seq[string]) =
   ## Everything from --- onward is the pipeline stage definition.
   var firstSep = -1
   for i, tok in rawArgs:
-    if tok == "---":
+    if tok == "---" or tok == ":::":
       firstSep = i
       break
   # Parse paravar options from the slice before --- (or all args if no --- found;
@@ -178,8 +189,7 @@ proc runRun(rawArgs: seq[string]) =
   var nThreadsSet     = false
   var forceScan       = false
   var noKill          = false
-  var gatherPath      = ""
-  var gatherFmt       = ""
+  var gatherMode      = false
   var headerPattern   = ""
   var headerPatternSet = false
   var headerN         = 0
@@ -229,9 +239,7 @@ proc runRun(rawArgs: seq[string]) =
       of "no-kill":
         noKill = true
       of "gather":
-        gatherPath = nextVal(p, "gather")
-      of "gather-fmt":
-        gatherFmt = nextVal(p, "gather-fmt")
+        gatherMode = true
       of "header-pattern":
         headerPattern    = nextVal(p, "header-pattern")
         headerPatternSet = true
@@ -266,9 +274,8 @@ proc runRun(rawArgs: seq[string]) =
   if nShards < 1:
     stderr.writeLine "error: -n must be >= 1, got: " & $nShards
     quit(1)
-  let gatherMode = gatherPath != ""
-  if not gatherMode and outPrefix == "":
-    stderr.writeLine "error: -o/--output is required (or use --gather)"
+  if outPrefix == "":
+    stderr.writeLine "error: -o/--output is required"
     quit(1)
   if inputFile == "":
     stderr.writeLine "error: input VCF file is required"
@@ -286,15 +293,16 @@ proc runRun(rawArgs: seq[string]) =
     nThreads = min(nJobs, 8)
   let (_, stages) = parseRunArgv(rawArgs)
   let shellCmd    = buildShellCmd(stages)
+  warnFormatMismatch(inputFile, outPrefix)
   if gatherMode:
-    let (gFmt, gComp) = inferGatherFormat(gatherPath, gatherFmt)
+    let (gFmt, gComp) = inferGatherFormat(outPrefix, "")
     let resolvedTmpDir =
       if tmpDir != "": tmpDir
       else: getEnv("TMPDIR", "/tmp") / "paravar"
     var cfg = GatherConfig(
       format:      gFmt,
       compression: gComp,
-      outputPath:  gatherPath,
+      outputPath:  outPrefix,
       tmpDir:      resolvedTmpDir,
       shardCount:  nShards)
     if headerPatternSet:
@@ -307,6 +315,84 @@ proc runRun(rawArgs: seq[string]) =
   else:
     runShards(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs, shellCmd, noKill)
 
+proc gatherUsage() =
+  ## Print gather subcommand usage to stderr and exit 1.
+  stderr.writeLine "Usage: paravar gather -o <output> [options] <shard1> [<shard2> ...]"
+  stderr.writeLine ""
+  stderr.writeLine "Options:"
+  stderr.writeLine "  -o, --output <str>           gather output path (required)"
+  stderr.writeLine "      --header-pattern <pat>   strip lines starting with pat from shards 2..N (text format only)"
+  stderr.writeLine "      --header-n <n>           strip the first n lines from shards 2..N (text format only)"
+  stderr.writeLine "  -v, --verbose                print progress to stderr"
+  stderr.writeLine "  -h, --help                   show this help"
+  quit(1)
+
+proc runGather(rawArgs: seq[string]) =
+  ## Parse gather subcommand arguments and concatenate pre-existing shard files.
+  var outPath          = ""
+  var headerPattern    = ""
+  var headerPatternSet = false
+  var headerN          = 0
+  var headerNSet       = false
+  var inputFiles: seq[string]
+  var p = initOptParser(rawArgs)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "o", "output":
+        outPath = nextVal(p, "o")
+      of "header-pattern":
+        headerPattern    = nextVal(p, "header-pattern")
+        headerPatternSet = true
+      of "header-n":
+        let v = nextVal(p, "header-n")
+        try:
+          headerN = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: --header-n must be an integer, got: " & v
+          quit(1)
+        if headerN < 0:
+          stderr.writeLine "error: --header-n must be >= 0, got: " & $headerN
+          quit(1)
+        headerNSet = true
+      of "v", "verbose":
+        scatter.verbose = true
+      of "h", "help":
+        gatherUsage()
+      else:
+        stderr.writeLine "error: unknown option: -" & p.key
+        quit(1)
+    of cmdArgument:
+      inputFiles.add(p.key)
+  if outPath == "":
+    stderr.writeLine "error: -o/--output is required"
+    quit(1)
+  if inputFiles.len == 0:
+    stderr.writeLine "error: at least one input shard file is required"
+    quit(1)
+  for f in inputFiles:
+    if not fileExists(f):
+      stderr.writeLine "error: input file not found: " & f
+      quit(1)
+  let (gFmt, gComp) = inferGatherFormat(outPath, "")
+  var cfg = GatherConfig(
+    format:      gFmt,
+    compression: gComp,
+    outputPath:  outPath,
+    shardCount:  inputFiles.len)
+  if headerPatternSet:
+    cfg.headerPattern = some(headerPattern)
+  if headerNSet:
+    cfg.headerN = some(headerN)
+  validateGatherConfig(cfg)
+  let outDir = outPath.parentDir
+  if outDir != "":
+    createDir(outDir)
+  gatherFiles(cfg, inputFiles)
+
 proc mainEntry*() =
   ## Top-level entry point: dispatch to the appropriate subcommand.
   let args = commandLineParams()
@@ -317,6 +403,8 @@ proc mainEntry*() =
     runScatter(args[1 .. ^1])
   of "run":
     runRun(args[1 .. ^1])
+  of "gather":
+    runGather(args[1 .. ^1])
   of "--version":
     echo "paravar v" & VERSION
   of "--help", "-h":

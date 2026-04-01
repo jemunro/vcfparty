@@ -180,15 +180,14 @@ proc collectRecords(data: seq[byte]): seq[string] =
     for j in lineStart ..< data.len: s[j - lineStart] = char(data[j])
     result.add(s)
 
-proc checkShards(vcfPath: string; prefix: string; n: int) =
+proc checkShards(vcfPath: string; tmpl: string; n: int) =
   ## Verify BGZF structure, header presence, record completeness, and order.
   ## Each shard is decompressed exactly once; all checks reuse the cached bytes.
-  let nDigits = len($n)
   let origRecords = collectRecords(decompressBgzfFile(vcfPath))
   var shardRecords: seq[string]
 
   for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".vcf.gz"
+    let path = shardOutputPath(tmpl, i-1, n)
     doAssert fileExists(path), &"shard {i} missing: {path}"
 
     # BGZF magic + EOF (read-only, no decompression needed)
@@ -243,13 +242,13 @@ block testScanAllBlockStarts:
 block testScatter4ShardsTbi:
   let tmpDir = getTempDir() / "paravar_scatter_tbi_test"
   createDir(tmpDir)
-  let prefix = tmpDir / "shard"
-  scatter(SmallVcf, 4, prefix)
-  checkShards(SmallVcf, prefix, 4)
+  let tmpl = tmpDir / "shard.{}.vcf.gz"
+  scatter(SmallVcf, 4, tmpl)
+  checkShards(SmallVcf, tmpl, 4)
 
   var sizes: seq[int64]
-  for i in 1..4:
-    sizes.add(getFileSize(prefix & "." & $i & ".vcf.gz"))
+  for i in 0..3:
+    sizes.add(getFileSize(shardOutputPath(tmpl, i, 4)))
   let minSz = sizes.min(); let maxSz = sizes.max()
   doAssert minSz > 0, "scatter (TBI): at least one shard is empty"
   doAssert maxSz.float / minSz.float < 2.0,
@@ -266,9 +265,9 @@ block testVcfScatter1Shard:
   ## 1 shard must equal the original (record set and order).
   let tmpDir = getTempDir() / "paravar_scatter_vcf_1shard_test"
   createDir(tmpDir)
-  let prefix = tmpDir / "shard"
-  scatter(SmallVcf, 1, prefix)
-  checkShards(SmallVcf, prefix, 1)
+  let tmpl = tmpDir / "shard.{}.vcf.gz"
+  scatter(SmallVcf, 1, tmpl)
+  checkShards(SmallVcf, tmpl, 1)
   echo "PASS VCF scatter 1 shard: BGZF structure, header, completeness"
   removeDir(tmpDir)
 
@@ -276,9 +275,9 @@ block testScatterForceScan:
   ## scatter with forceScan=true on a fully indexed file — index is ignored.
   let tmpDir = getTempDir() / "paravar_scatter_forcescan_test"
   createDir(tmpDir)
-  let prefix = tmpDir / "shard"
-  scatter(SmallVcf, 4, prefix, 1, forceScan = true)
-  checkShards(SmallVcf, prefix, 4)
+  let tmpl = tmpDir / "shard.{}.vcf.gz"
+  scatter(SmallVcf, 4, tmpl, 1, forceScan = true)
+  checkShards(SmallVcf, tmpl, 4)
   echo "PASS scatter --force-scan: BGZF structure, header, completeness, order"
   removeDir(tmpDir)
 
@@ -286,9 +285,9 @@ block testScatter4ShardsCsi:
   doAssert fileExists(CsiVcf & ".csi"), "CSI fixture missing — run generate_fixtures.sh"
   let tmpDir = getTempDir() / "paravar_scatter_csi_test"
   createDir(tmpDir)
-  let prefix = tmpDir / "shard"
-  scatter(CsiVcf, 4, prefix)
-  checkShards(CsiVcf, prefix, 4)
+  let tmpl = tmpDir / "shard.{}.vcf.gz"
+  scatter(CsiVcf, 4, tmpl)
+  checkShards(CsiVcf, tmpl, 4)
   echo "PASS scatter CSI: BGZF structure, header, completeness, order"
   removeDir(tmpDir)
 
@@ -382,15 +381,14 @@ proc cmpRecBytes(a, b: seq[byte]): int =
     if a[i] > b[i]: return 1
   cmp(a.len, b.len)
 
-proc checkBcfShards(bcfPath: string; prefix: string; n: int) =
+proc checkBcfShards(bcfPath: string; tmpl: string; n: int) =
   ## Verify BGZF structure, BCF magic, record completeness, and order.
   ## Each shard is decompressed exactly once; all checks reuse the cached bytes.
-  let nDigits = len($n)
   let origRecs = collectBcfRecordBytes(bcfPath)
   var shardRecs: seq[seq[byte]]
 
   for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".bcf"
+    let path = shardOutputPath(tmpl, i-1, n)
     doAssert fileExists(path), &"BCF shard {i} missing: {path}"
 
     # BGZF magic + EOF (no decompression)
@@ -446,9 +444,9 @@ block testBcfScatter1Shard:
   doAssert fileExists(SmallBcf), &"BCF fixture missing: {SmallBcf}"
   let tmpDir = getTempDir() / "paravar_bcf_1shard_test"
   createDir(tmpDir)
-  let prefix = tmpDir / "shard"
-  scatter(SmallBcf, 1, prefix, format = FileFormat.Bcf)
-  checkBcfShards(SmallBcf, prefix, 1)
+  let tmpl = tmpDir / "shard.{}.bcf"
+  scatter(SmallBcf, 1, tmpl, format = FileFormat.Bcf)
+  checkBcfShards(SmallBcf, tmpl, 1)
   echo "PASS BCF scatter 1 shard: BGZF, BCF magic, completeness"
   removeDir(tmpDir)
 
@@ -456,12 +454,12 @@ block testBcfScatter4Shards:
   doAssert fileExists(SmallBcf), &"BCF fixture missing: {SmallBcf}"
   let tmpDir = getTempDir() / "paravar_bcf_4shard_test"
   createDir(tmpDir)
-  let prefix = tmpDir / "shard"
-  scatter(SmallBcf, 4, prefix, format = FileFormat.Bcf)
-  checkBcfShards(SmallBcf, prefix, 4)
+  let tmpl = tmpDir / "shard.{}.bcf"
+  scatter(SmallBcf, 4, tmpl, format = FileFormat.Bcf)
+  checkBcfShards(SmallBcf, tmpl, 4)
   var sizes: seq[int64]
-  for i in 1..4:
-    sizes.add(getFileSize(prefix & "." & $i & ".bcf"))
+  for i in 0..3:
+    sizes.add(getFileSize(shardOutputPath(tmpl, i, 4)))
   let minSz = sizes.min(); let maxSz = sizes.max()
   doAssert minSz > 0, "BCF scatter 4 shards: at least one shard is empty"
   doAssert maxSz.float / minSz.float < 2.0,
@@ -473,9 +471,9 @@ block testBcfScatterLargeHeader:
   doAssert fileExists(KgBcf), &"large BCF fixture missing: {KgBcf}"
   let tmpDir = getTempDir() / "paravar_bcf_kg_test"
   createDir(tmpDir)
-  let prefix = tmpDir / "shard"
-  scatter(KgBcf, 4, prefix, format = FileFormat.Bcf)
-  checkBcfShards(KgBcf, prefix, 4)
+  let tmpl = tmpDir / "shard.{}.bcf"
+  scatter(KgBcf, 4, tmpl, format = FileFormat.Bcf)
+  checkBcfShards(KgBcf, tmpl, 4)
   echo "PASS BCF scatter chr22_1kg.bcf 4 shards: large header handled correctly"
   removeDir(tmpDir)
 

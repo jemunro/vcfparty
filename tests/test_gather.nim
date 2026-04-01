@@ -19,8 +19,6 @@ const SmallBcf = DataDir / "small.bcf"
 
 if paramCount() >= 1:
   case paramStr(1)
-  of "--exit-test-unknown-ext":
-    discard inferGatherFormat("output.xyz", "")
   of "--exit-test-bad-override":
     discard inferGatherFormat("output.vcf.gz", "bam")
   of "--exit-test-mutual-exclusion":
@@ -44,6 +42,10 @@ block testInferAllExtensions:
     doAssert f == gfVcf,          &".vcf.gz: expected gfVcf, got {f}"
     doAssert c == gcBgzf,         &".vcf.gz: expected gcBgzf, got {c}"
   block:
+    let (f, c) = inferGatherFormat("out.vcf.bgz", "")
+    doAssert f == gfVcf,          &".vcf.bgz: expected gfVcf, got {f}"
+    doAssert c == gcBgzf,         &".vcf.bgz: expected gcBgzf, got {c}"
+  block:
     let (f, c) = inferGatherFormat("out.bcf", "")
     doAssert f == gfBcf,          &".bcf: expected gfBcf, got {f}"
     doAssert c == gcBgzf,         &".bcf: expected gcBgzf, got {c}"
@@ -59,7 +61,19 @@ block testInferAllExtensions:
     let (f, c) = inferGatherFormat("out.txt", "")
     doAssert f == gfText,         &".txt: expected gfText, got {f}"
     doAssert c == gcUncompressed, &".txt: expected gcUncompressed, got {c}"
-  echo "PASS inferGatherFormat: all 5 valid extensions"
+  block:
+    let (f, c) = inferGatherFormat("out.out.gz", "")
+    doAssert f == gfText,         &"any.gz: expected gfText, got {f}"
+    doAssert c == gcBgzf,         &"any.gz: expected gcBgzf, got {c}"
+  block:
+    let (f, c) = inferGatherFormat("out.bgz", "")
+    doAssert f == gfText,         &".bgz: expected gfText, got {f}"
+    doAssert c == gcBgzf,         &".bgz: expected gcBgzf, got {c}"
+  block:
+    let (f, c) = inferGatherFormat("out.xyz", "")
+    doAssert f == gfText,         &".xyz: expected gfText (unknown ext), got {f}"
+    doAssert c == gcUncompressed, &".xyz: expected gcUncompressed, got {c}"
+  echo "PASS inferGatherFormat: all extensions (including .vcf.bgz, .bgz, unknown)"
 
 # ---------------------------------------------------------------------------
 # G1 — inferGatherFormat: fmtOverride overrides format, compression from extension
@@ -104,11 +118,6 @@ block buildHelper:
     "nim c -d:debug -o:" & HelperBin & " " & SelfSrc & " 2>&1")
   doAssert code == 0, "failed to compile test helper:\n" & outp
   echo "PASS buildHelper: compiled exit-1 test helper"
-
-block testInferUnknownExt:
-  let (_, code) = execCmdEx(HelperBin & " --exit-test-unknown-ext 2>/dev/null")
-  doAssert code != 0, "unknown extension should exit non-zero"
-  echo "PASS inferGatherFormat: unknown extension exits 1"
 
 block testInferBadOverride:
   let (_, code) = execCmdEx(HelperBin & " --exit-test-bad-override 2>/dev/null")
@@ -852,7 +861,7 @@ block testGatherVcfCompressed:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} {SmallVcf} --- bcftools view -Oz")
+    &"-n 4 --gather -o {outPath} {SmallVcf} --- bcftools view -Oz")
   doAssert code == 0, &"VCF gather -Oz exited {code}:\n{outp}"
   doAssert fileExists(outPath), "VCF gather -Oz: output missing"
   let got = countRecords(outPath)
@@ -872,7 +881,7 @@ block testGatherVcfRecompress:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} {SmallVcf} --- bcftools view -Ov")
+    &"-n 4 --gather -o {outPath} {SmallVcf} --- bcftools view -Ov")
   doAssert code == 0, &"VCF gather -Ov exited {code}:\n{outp}"
   doAssert fileExists(outPath), "VCF gather -Ov: output missing"
   let got = countRecords(outPath)
@@ -892,7 +901,7 @@ block testGatherBcfCompressed:
   createDir(tmpDir)
   let outPath = tmpDir / "out.bcf"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} {SmallBcf} --- bcftools view -Ob")
+    &"-n 4 --gather -o {outPath} {SmallBcf} --- bcftools view -Ob")
   doAssert code == 0, &"BCF gather -Ob exited {code}:\n{outp}"
   doAssert fileExists(outPath), "BCF gather -Ob: output missing"
   let got = countRecords(outPath)
@@ -912,7 +921,7 @@ block testGatherBcfRecompress:
   createDir(tmpDir)
   let outPath = tmpDir / "out.bcf"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} {SmallBcf} --- bcftools view -Ou")
+    &"-n 4 --gather -o {outPath} {SmallBcf} --- bcftools view -Ou")
   doAssert code == 0, &"BCF gather -Ou exited {code}:\n{outp}"
   doAssert fileExists(outPath), "BCF gather -Ou: output missing"
   let got = countRecords(outPath)
@@ -932,7 +941,7 @@ block testGatherText:
   createDir(tmpDir)
   let outPath = tmpDir / "out.txt"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} {SmallVcf} --- bcftools query -f '%CHROM\\t%POS\\n'")
+    &"-n 4 --gather -o {outPath} {SmallVcf} --- bcftools query -f '%CHROM\\t%POS\\n'")
   doAssert code == 0, &"text gather exited {code}:\n{outp}"
   doAssert fileExists(outPath), "text gather: output missing"
   let (lineOut, _) = execCmdEx("wc -l < " & outPath)
@@ -956,7 +965,7 @@ block testGatherTextHeaderN:
   let outPath = tmpDir / "out.txt"
   let pipeline = "{ echo 'CHROM\tPOS'; bcftools query -f '%CHROM\\t%POS\\n'; }"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} --header-n 1 {SmallVcf} --- sh -c {quoteShell(pipeline)}")
+    &"-n 4 --gather -o {outPath} --header-n 1 {SmallVcf} --- sh -c {quoteShell(pipeline)}")
   doAssert code == 0, &"text gather --header-n 1 exited {code}:\n{outp}"
   doAssert fileExists(outPath), "text gather --header-n: output missing"
   let (lineOut, _) = execCmdEx("wc -l < " & outPath)
@@ -972,35 +981,35 @@ block testGatherTextHeaderN:
   echo &"PASS G7 text gather --header-n 1: {lineCount} lines (1 header + {orig} data)"
 
 # ---------------------------------------------------------------------------
-# G7.7 — --gather-fmt override: .out.gz extension with --gather-fmt txt
+# G7.7 — Unknown-extension gather: .out.gz → inferred as text + BGZF
 # ---------------------------------------------------------------------------
 
-block testGatherFmtOverride:
-  # .out.gz has no known format prefix → without --gather-fmt would exit 1.
-  # With --gather-fmt txt: treats output as text, BGZF (from .gz extension).
-  let tmpDir = getTempDir() / "paravar_g7_fmt_override"
+block testGatherUnknownExt:
+  # .out.gz is not a recognised VCF/BCF prefix → inferred as text, BGZF (from .gz).
+  # No --gather-fmt needed under the new lenient inference rules.
+  let tmpDir = getTempDir() / "paravar_g7_unknown_ext"
   createDir(tmpDir)
   let outPath = tmpDir / "out.out.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} --gather-fmt txt " &
+    &"-n 4 --gather -o {outPath} " &
     &"{SmallVcf} --- bcftools query -f '%CHROM\\t%POS\\n'")
-  doAssert code == 0, &"--gather-fmt txt override exited {code}:\n{outp}"
-  doAssert fileExists(outPath), "--gather-fmt override: output missing"
+  doAssert code == 0, &"unknown-ext gather exited {code}:\n{outp}"
+  doAssert fileExists(outPath), "unknown-ext gather: output missing"
   # Output should be valid BGZF (because of .gz).
   let f = open(outPath, fmRead)
   var magic = newSeq[byte](2)
   discard readBytes(f, magic, 0, 2)
   f.close()
   doAssert magic[0] == 0x1f'u8 and magic[1] == 0x8b'u8,
-    "--gather-fmt override: output should be BGZF (.gz extension)"
+    "unknown-ext gather: output should be BGZF (.gz extension)"
   let (lineOut, _) = execCmdEx(
     "bgzip -d -c " & outPath & " 2>/dev/null | wc -l")
   let lineCount = lineOut.strip.parseInt
   let orig = countRecords(SmallVcf)
   doAssert lineCount == orig,
-    &"--gather-fmt override: expected {orig} lines, got {lineCount}"
+    &"unknown-ext gather: expected {orig} lines, got {lineCount}"
   removeDir(tmpDir)
-  echo &"PASS G7 --gather-fmt txt override: {lineCount} lines, valid BGZF"
+  echo &"PASS G7 unknown-ext (.out.gz) text gather: {lineCount} lines, valid BGZF"
 
 # ---------------------------------------------------------------------------
 # G7.8 — Shard failure: temp files left on disk, exit 1, paths in stderr
@@ -1012,7 +1021,7 @@ block testGatherShardFailure:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 2 --gather {outPath} --tmp-dir {tDir} {SmallVcf} --- false")
+    &"-n 2 --gather -o {outPath} --tmp-dir {tDir} {SmallVcf} --- false")
   doAssert code != 0, "shard failure: paravar should exit non-zero"
   # At least one temp path should be printed to stderr.
   doAssert tDir in outp,
@@ -1034,7 +1043,7 @@ block testGatherCustomTmpDir:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather {outPath} --tmp-dir {customTmp} " &
+    &"-n 4 --gather -o {outPath} --tmp-dir {customTmp} " &
     &"{SmallVcf} --- bcftools view -Oz")
   doAssert code == 0, &"--tmp-dir exited {code}:\n{outp}"
   doAssert fileExists(outPath), "--tmp-dir: output missing"
@@ -1048,3 +1057,107 @@ block testGatherCustomTmpDir:
 
 echo ""
 echo "All gather G7 integration tests passed."
+
+# ===========================================================================
+# G8 — gather subcommand integration tests
+# ===========================================================================
+
+proc runGatherSubcmd(args: string): (string, int) =
+  execCmdEx(BinPath & " gather " & args & " 2>&1")
+
+# ---------------------------------------------------------------------------
+# G8.1 — VCF: scatter → gather, record count and hash match
+# ---------------------------------------------------------------------------
+
+block testGatherSubcmdVcf:
+  let tmpDir = getTempDir() / "paravar_g8_vcf"
+  createDir(tmpDir)
+  let shardTemplate = tmpDir / "shard.{}.vcf.gz"
+  # Scatter into 4 shards via CLI.
+  let (sOutp, sCode) = execCmdEx(
+    BinPath & &" scatter -n 4 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
+  doAssert sCode == 0, &"G8.1 scatter exited {sCode}:\n{sOutp}"
+  # Collect shard paths.
+  var shards: seq[string]
+  for i in 1..4:
+    shards.add(tmpDir / ("shard_" & $i & ".shard.vcf.gz"))
+  let shardsArg = shards.join(" ")
+  let outPath = tmpDir / "gathered.vcf.gz"
+  let (gOutp, gCode) = runGatherSubcmd(&"-o {outPath} {shardsArg}")
+  doAssert gCode == 0, &"G8.1 gather exited {gCode}:\n{gOutp}"
+  doAssert fileExists(outPath), "G8.1: output missing"
+  let got = countRecords(outPath)
+  let orig = countRecords(SmallVcf)
+  doAssert got == orig, &"G8.1: record count {got} != {orig}"
+  doAssert recordsHash(outPath) == recordsHash(SmallVcf),
+    "G8.1: content hash mismatch"
+  removeDir(tmpDir)
+  echo &"PASS G8.1 gather subcommand VCF: {got} records, content hash matches"
+
+# ---------------------------------------------------------------------------
+# G8.2 — BCF: scatter → gather, record count and hash match
+# ---------------------------------------------------------------------------
+
+block testGatherSubcmdBcf:
+  let tmpDir = getTempDir() / "paravar_g8_bcf"
+  createDir(tmpDir)
+  let (sOutp, sCode) = execCmdEx(
+    BinPath & &" scatter -n 4 -o {tmpDir}/shard.bcf {SmallBcf} 2>&1")
+  doAssert sCode == 0, &"G8.2 scatter exited {sCode}:\n{sOutp}"
+  var shards: seq[string]
+  for i in 1..4:
+    shards.add(tmpDir / ("shard_" & $i & ".shard.bcf"))
+  let shardsArg = shards.join(" ")
+  let outPath = tmpDir / "gathered.bcf"
+  let (gOutp, gCode) = runGatherSubcmd(&"-o {outPath} {shardsArg}")
+  doAssert gCode == 0, &"G8.2 gather exited {gCode}:\n{gOutp}"
+  doAssert fileExists(outPath), "G8.2: output missing"
+  let got = countRecords(outPath)
+  let orig = countRecords(SmallBcf)
+  doAssert got == orig, &"G8.2: record count {got} != {orig}"
+  doAssert recordsHash(outPath) == recordsHash(SmallBcf),
+    "G8.2: content hash mismatch"
+  removeDir(tmpDir)
+  echo &"PASS G8.2 gather subcommand BCF: {got} records, content hash matches"
+
+# ---------------------------------------------------------------------------
+# G8.3 — Missing -o exits non-zero
+# ---------------------------------------------------------------------------
+
+block testGatherSubcmdMissingO:
+  let (outp, code) = runGatherSubcmd("shard1.vcf.gz shard2.vcf.gz")
+  doAssert code != 0, "G8.3: missing -o should exit non-zero"
+  doAssert "o" in outp.toLowerAscii,
+    &"G8.3: error should mention '-o', got: {outp}"
+  echo "PASS G8.3 gather subcommand: missing -o exits non-zero"
+
+# ---------------------------------------------------------------------------
+# G8.4 — No input files exits non-zero
+# ---------------------------------------------------------------------------
+
+block testGatherSubcmdNoInputs:
+  let tmpDir = getTempDir() / "paravar_g8_noinput"
+  createDir(tmpDir)
+  let outPath = tmpDir / "out.vcf.gz"
+  let (outp, code) = runGatherSubcmd(&"-o {outPath}")
+  doAssert code != 0, "G8.4: no inputs should exit non-zero"
+  removeDir(tmpDir)
+  echo "PASS G8.4 gather subcommand: no input files exits non-zero"
+
+# ---------------------------------------------------------------------------
+# G8.5 — Missing input file exits non-zero
+# ---------------------------------------------------------------------------
+
+block testGatherSubcmdMissingFile:
+  let tmpDir = getTempDir() / "paravar_g8_missing"
+  createDir(tmpDir)
+  let outPath = tmpDir / "out.vcf.gz"
+  let (outp, code) = runGatherSubcmd(&"-o {outPath} /nonexistent/shard.vcf.gz")
+  doAssert code != 0, "G8.5: missing input file should exit non-zero"
+  doAssert "not found" in outp.toLowerAscii,
+    &"G8.5: error should mention 'not found', got: {outp}"
+  removeDir(tmpDir)
+  echo "PASS G8.5 gather subcommand: missing input file exits non-zero"
+
+echo ""
+echo "All gather G8 subcommand integration tests passed."

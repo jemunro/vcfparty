@@ -2,7 +2,7 @@
 
 ## What it is
 
-**paravar** is a Nim CLI tool for splitting bgzipped VCF and BCF files into N roughly equal shards without decompressing the middle blocks, and optionally piping each shard through a tool pipeline in parallel.
+**paravar** is a Nim CLI tool for splitting bgzipped VCF and BCF files into N roughly equal shards without decompressing the middle blocks, and optionally piping each shard through a tool pipeline in parallel, with optional output gathering back into a single file.
 
 The key design goal is speed — middle BGZF blocks are byte-copied from disk without decompression or recompression. Only the boundary blocks (one per shard split) are decompressed and recompressed.
 
@@ -10,24 +10,38 @@ The key design goal is speed — middle BGZF blocks are byte-copied from disk wi
 
 ## Current scope
 
-Both `scatter` and `run` subcommands are implemented for VCF (`*.vcf.gz`) and BCF (`*.bcf`) inputs. `gather` is future work.
+All four subcommand modes are implemented for VCF (`*.vcf.gz`) and BCF (`*.bcf`) inputs.
 
 ### `scatter`
 
 ```
-paravar scatter -n <n_shards> -o <prefix> [options] <input.vcf.gz|input.bcf>
+paravar scatter -n <n> -o <o> [options] <input.vcf.gz|input.bcf>
 ```
 
 | Flag | Long form | Description |
 |------|-----------|-------------|
 | `-n` | `--n-shards` | Number of output shards (required, ≥ 1) |
-| `-o` | `--output` | Output file prefix (required) |
+| `-o` | `--output` | Output filename (required) |
 | `-t` | `--max-threads` | Max threads for scan/split/write (default: min(n-shards, 8)) |
 | | `--force-scan` | Always scan BGZF blocks — VCF only; exits 1 for BCF input |
 | `-v` | `--verbose` | Print progress info to stderr |
 | `-h` | `--help` | Show usage |
 
-**Output:** `<prefix>.1.vcf.gz` / `<prefix>.1.bcf`, … (zero-padded to width of `n`). Extension matches input format.
+**Output naming** — when `{}` is absent, shard number is prepended as `shard_XX.`:
+
+```
+-o output.vcf.gz, -n 8   →  shard_01.output.vcf.gz … shard_08.output.vcf.gz
+-o out.bcf, -n 4          →  shard_1.out.bcf … shard_4.out.bcf
+```
+
+When `-o` contains `{}`, the placeholder is replaced with the zero-padded shard number:
+
+```
+-o output.{}.vcf.gz       →  output.01.vcf.gz … output.08.vcf.gz
+-o /results/{}/batch.bcf  →  /results/01/batch.bcf … /results/08/batch.bcf
+```
+
+Parent directories are created automatically (`mkdir -p`).
 
 **BCF:** requires a `.csi` index alongside the input. No auto-scan fallback (unlike VCF).
 
@@ -36,17 +50,17 @@ paravar scatter -n <n_shards> -o <prefix> [options] <input.vcf.gz|input.bcf>
 Scatter → parallel per-shard tool pipelines → per-shard output files. No temporary files; shard bytes flow directly from the scatter writer into the stdin pipe of the shell pipeline.
 
 ```
-paravar run -n <n_shards> -o <prefix> [options] <input.vcf.gz|input.bcf> \
-  --- <cmd1> [args...] \
-  [--- <cmd2> [args...] ...]
+paravar run -n <n> -o <o> [options] <input.vcf.gz|input.bcf> \
+  (--- | :::) <cmd1> [args...] \
+  [(--- | :::) <cmd2> [args...] ...]
 ```
 
-`---` (three dashes) is the pipe-stage separator, chosen to avoid collision with tools that use `--`. Multiple `---` blocks define a pipeline joined with `|`.
+`---` (three dashes) and `:::` are both valid pipe-stage separators and may be mixed freely. Multiple separator blocks define a pipeline joined with `|`.
 
 | Flag | Long form | Description |
 |------|-----------|-------------|
 | `-n` | `--n-shards` | Number of shards (required, ≥ 1) |
-| `-o` | `--output` | Output file prefix (required) |
+| `-o` | `--output` | Output filename (required) |
 | `-j` | `--max-jobs` | Max concurrent shard pipelines (default: n-shards) |
 | `-t` | `--max-threads` | Max threads for scatter/validation (default: min(max-jobs, 8)) |
 | | `--force-scan` | Always scan BGZF blocks — VCF only; exits 1 for BCF input |
@@ -54,11 +68,62 @@ paravar run -n <n_shards> -o <prefix> [options] <input.vcf.gz|input.bcf> \
 | `-v` | `--verbose` | Print per-shard progress to stderr |
 | `-h` | `--help` | Show usage |
 
-**Concurrency defaults cascade:** specify only `-n` and everything else is derived — `--max-jobs` defaults to `n-shards`, `--max-threads` defaults to `min(max-jobs, 8)`.
+**Output:** per-shard files named using the same `shard_XX.` / `{}` scheme as `scatter`.
 
-**Output:** `<prefix>.01.vcf.gz` / `<prefix>.01.bcf`, … — raw stdout of the final pipeline stage, one file per shard. paravar does not recompress or validate output; pass the right format flag (e.g. `-Oz`, `-Ob`) to the last stage command.
+### `run --gather`
 
-**On failure:** by default, paravar sends SIGTERM to all in-flight sibling shards and exits 1. With `--no-kill`, siblings are allowed to complete (useful for debugging).
+As `run`, but intercept each shard's stdout, strip duplicate headers from shards 2..N, and concatenate all shard outputs into a single output file. No external tools (bcftools etc.) used — all concatenation is native Nim.
+
+```
+paravar run --gather -n <n> -o <output.vcf.gz> [options] <input.vcf.gz|input.bcf> \
+  (--- | :::) <cmd> [args...]
+```
+
+`--gather` is a bare flag. `-o` is the single gather output path (no shard numbering applied).
+
+| Flag | Long form | Description |
+|------|-----------|-------------|
+| | `--gather` | Bare flag — gather shard outputs into a single `-o` file |
+| | `--header-pattern <pat>` | Strip lines with this prefix from shards 2..N (**text format only**) |
+| | `--header-n <n>` | Strip first N lines from shards 2..N (**text format only**) |
+| | `--tmp-dir <dir>` | Temp dir for shard files (default: `$TMPDIR/paravar`) |
+
+### `gather`
+
+Concatenate pre-existing shard files (output of `scatter` or `run`) into a single output file. Same header-stripping and recompression logic as `run --gather`. No temp files needed — reads directly from input files.
+
+```
+paravar gather -o <output.vcf.gz> [options] <shard1> [<shard2> ...]
+```
+
+| Flag | Long form | Description |
+|------|-----------|-------------|
+| `-o` | `--output` | Output path (required) |
+| | `--header-pattern <pat>` | Strip lines with this prefix from shards 2..N (**text format only**) |
+| | `--header-n <n>` | Strip first N lines from shards 2..N (**text format only**) |
+| `-v` | `--verbose` | Print progress to stderr |
+| `-h` | `--help` | Show usage |
+
+**Format inference from `-o` extension:**
+
+| Extension | Format | Compression |
+|-----------|--------|-------------|
+| `.vcf.gz` or `.vcf.bgz` | VCF | BGZF |
+| `.vcf` | VCF | Uncompressed |
+| `.bcf` | BCF | BGZF |
+| `.gz` or `.bgz` (any other stem) | Text | BGZF |
+| Anything else | Text | Uncompressed |
+
+**Header stripping:**
+- **VCF**: lines starting with `#` stripped automatically from shards 2..N.
+- **BCF**: the BCF header blob (`5 + 4 + l_text` bytes) stripped automatically from shards 2..N.
+- **Text**: `--header-pattern` or `--header-n` apply; default is no stripping.
+- Using `--header-pattern`/`--header-n` with VCF or BCF format exits 1 with an error.
+- `--header-pattern` and `--header-n` are mutually exclusive.
+
+**Recompression:** if the gather output requires BGZF but incoming bytes are uncompressed (e.g. `bcftools view -Ov`), the interceptor recompresses on the fly. The reverse (BGZF → uncompressed) is also handled.
+
+**On failure (`run --gather`):** temp shard files are left on disk and their paths are printed to stderr. On success they are deleted.
 
 ---
 
@@ -69,10 +134,11 @@ paravar run -n <n_shards> -o <prefix> [options] <input.vcf.gz|input.bcf> \
 | File | Responsibility |
 |------|----------------|
 | `src/paravar.nim` | Entry point (`include paravar/main`) |
-| `src/paravar/main.nim` | CLI arg parsing (`parseopt`), format detection, subcommand dispatch |
-| `src/paravar/scatter.nim` | Scatter algorithm: index parsing, boundary optimisation, shard writing. Full VCF and BCF paths. Exports `computeShards` and `doWriteShard` for use by `run`. |
+| `src/paravar/main.nim` | CLI arg parsing (`parseopt`), subcommand dispatch (`scatter`/`run`/`gather`) |
+| `src/paravar/scatter.nim` | Scatter algorithm: index parsing, boundary optimisation, shard writing. Exports `computeShards`, `doWriteShard`, `shardOutputPath`. |
 | `src/paravar/bgzf_utils.nim` | Low-level BGZF I/O: scan blocks, decompress, compress, raw copy, boundary split, BCF record boundary split, virtual offset helpers. No external dependencies — only `-lz`. |
-| `src/paravar/run.nim` | `run` subcommand: `---` argv parsing, shell command construction, `fork`/`exec` per shard, worker pool. Format-aware output extension. |
+| `src/paravar/run.nim` | `run` subcommand: `---`/`:::` argv parsing, shell command construction, `fork`/`exec` per shard, worker pool. Gather mode: spawns per-shard interceptor threads, calls `concatenateShards`. |
+| `src/paravar/gather.nim` | Gather module: types, format inference, sniffing, header stripping, `runInterceptor`, `concatenateShards`, `cleanupTempDir`, `gatherFiles` (direct-file gather for `gather` subcommand). |
 
 ### Scatter algorithm — VCF path (4 phases)
 
@@ -82,55 +148,71 @@ If a `.tbi` or `.csi` index exists alongside the input, it is parsed to extract 
 
 **Phase 2 — header extraction and first data block**
 
-Reads raw BGZF blocks from the start of the file, decompresses each, and collects all `#` lines until the first block containing a non-`#` data line. The collected bytes are recompressed via `compressToBgzfMulti` (handles headers larger than one 65536-byte BGZF block, e.g. VCFs with thousands of samples or many contig lines). No htslib dependency — pure file I/O and zlib.
+Reads raw BGZF blocks from the start of the file, decompresses each, and collects all `#` lines until the first block containing a non-`#` data line. The collected bytes are recompressed via `compressToBgzfMulti`. No htslib dependency — pure file I/O and zlib.
 
 **Phase 3 — shard boundary optimisation**
 
-1. Computes cumulative byte lengths and uses weighted bisection (`partitionBoundaries`) to pick `n-1` split points producing roughly equal shard sizes.
-2. For each candidate boundary block, calls `scanBgzfBlockStarts` to resolve finer sub-block offsets within the coarse index span.
-3. Validates each boundary block by decompressing it and confirming a complete record line terminates before the next block. Invalid boundaries are excluded and the partition is recalculated. Up to 1000 iterations.
+1. Computes cumulative byte lengths and uses weighted bisection (`partitionBoundaries`) to pick `n-1` split points.
+2. For each candidate boundary block, calls `scanBgzfBlockStarts` to resolve finer sub-block offsets.
+3. Validates each boundary block by decompressing it and confirming a complete record line terminates before the next block. Invalid boundaries are excluded; up to 1000 iterations.
 4. Scanning and validation run in parallel when `--max-threads > 1`.
 
 **Phase 4 — write shards**
 
-For each shard:
-- **Prepend**: recompressed header. For shard 0, also includes the data-only portion of all blocks from file offset 0 to `starts[1]`, with all `#` lines stripped (`removeHeaderLines`). For shards 1..N-1, the tail half of the previous boundary split.
-- **Middle**: raw byte-copy of whole BGZF blocks (no decompression).
-- **Boundary**: decompress the split block, divide lines at the midpoint, recompress head (appended to this shard) and tail (prepended to next shard). Boundary splits run in parallel when `--max-threads > 1`.
-- **Terminator**: explicit BGZF EOF block (28 bytes).
-
-Shard writes run in parallel when `--max-threads > 1`.
+For each shard: recompressed header prepend, raw byte-copy of middle blocks, boundary split (decompress/recompress), BGZF EOF terminator.
 
 ### Scatter algorithm — BCF path
 
-BCF uses an entirely different splitting strategy because BCF records can and do span BGZF block boundaries (the BCF reader treats the file as a continuous decompressed stream, independent of block layout).
+BCF uses an entirely different splitting strategy because BCF records can span BGZF block boundaries. The CSI `u_off` field encodes the exact uncompressed byte offset within a block where a record starts — `splitBgzfBlockAtUOffset` uses this to split without walking record lengths. Requires a `.csi` index; no auto-scan fallback.
 
-**Index requirement:** BCF requires a `.csi` index. The CSI format stores virtual offsets as `(block_file_offset << 16) | within_block_uncompressed_offset`. The `within_block_uncompressed_offset` (u_off) is the exact byte within the decompressed block where a record starts. There is no auto-scan fallback.
+### `shardOutputPath`
 
-**Algorithm:**
+Exported from `scatter.nim`. Computes the output path for shard `i` of `n` total shards given the `-o` template:
+- If the template contains `{}`, replace with zero-padded shard number.
+- Otherwise, prepend `shard_XX.` to the filename component.
 
-1. Parse the `.csi` index to extract all virtual offsets as `(block_off, u_off)` pairs (`parseCsiVirtualOffsets`).
-2. Locate the first BCF record's virtual offset (`bcfFirstDataVirtualOffset`) by scanning BGZF blocks from the file start, accumulating decompressed bytes until `5 + 4 + l_text` bytes (magic + l_text field + header text) have been read.
-3. Extract the BCF header blob (`extractBcfHeader`): decompresses from the start until `5 + 4 + l_text` bytes are accumulated, recompresses with `compressToBgzfMulti`.
-4. Select `n-1` boundary virtual offsets from the CSI virtual offset list, evenly spaced by index.
-5. For each boundary `(B_off, B_uoff)`: split the decompressed block at `B_uoff` using `splitBgzfBlockAtUOffset`. The previous shard ends with `recompress(data[0..B_uoff-1])`, the next shard starts with `recompress(data[B_uoff..end])`. Interior blocks between boundaries are raw-copied — the BCF reader handles spanning records as a continuous decompressed stream.
+Zero-padding width is determined by `n` (e.g. width 2 for n ≤ 99, width 3 for n ≤ 999).
 
-### `run` data flow
+### `run` data flow (no gather)
 
 ```
-input.vcf.gz / input.bcf
+input file
      │
-  [computeShards]   ← scatter algorithm, writes shard bytes to pipe write-end fd
+  [computeShards]
      │
-  shard 1 → posix.pipe() → sh -c "cmd1 | cmd2 | ..." → stdout → prefix.01.vcf.gz/.bcf
-  shard 2 → posix.pipe() → sh -c "cmd1 | cmd2 | ..." → stdout → prefix.02.vcf.gz/.bcf
-  shard N → posix.pipe() → sh -c "cmd1 | cmd2 | ..." → stdout → prefix.0N.vcf.gz/.bcf
-                                                   (up to --max-jobs concurrent)
+  shard 1 → posix.pipe() → sh -c "cmd1 | cmd2 | ..." → stdout → shard_01.out.vcf.gz
+  shard N → posix.pipe() → sh -c "cmd1 | cmd2 | ..." → stdout → shard_0N.out.vcf.gz
 ```
 
-Each shard: `posix.pipe()` → `fork()` → child: `dup2` pipe read-end to stdin, `execvp("sh", ["-c", shellCmd])` → parent: spawn `doWriteShard` thread to write shard bytes to pipe write-end. Worker pool (sliding window) dispatches up to `--max-jobs` shards concurrently.
+### `run --gather` data flow
 
-Shell command tokens are individually `quoteShell`-escaped before joining with `|`, so filter expressions containing `<`, `>`, `'` etc. are passed through safely without requiring the user to quote the entire stage.
+```
+input file
+     │
+  [computeShards]
+     │
+  shard 0 → pipe → shell → stdout pipe → interceptor thread 0 → output file (direct)
+  shard 1 → pipe → shell → stdout pipe → interceptor thread 1 → tmp/shard2.tmp
+  shard N → pipe → shell → stdout pipe → interceptor thread N → tmp/shardN.tmp
+                                                          │
+                                              [concatenateShards]
+                                              (appends shards 1..N to output)
+                                                          │
+                                                   output file
+```
+
+Shard 0's interceptor writes directly to the gather output file (no temp file). Shards 1..N write to numbered temp files. After all interceptors finish, `concatenateShards` opens the output file in append mode and appends each temp shard in order, then writes a single BGZF EOF block if BGZF output.
+
+### `gather` data flow
+
+```
+shard_01.out.vcf.gz ──┐
+shard_02.out.vcf.gz ──┤  [gatherFiles]  →  merged.vcf.gz
+        …             │   (reads files directly, no temp files)
+shard_0N.out.vcf.gz ──┘
+```
+
+`gatherFiles` reads each shard file entirely into memory, strips the trailing BGZF EOF block, detects format from shard 0, strips headers from shards 1..N, and writes a single output file with one trailing EOF block.
 
 ---
 
@@ -138,41 +220,43 @@ Shell command tokens are individually `quoteShell`-escaped before joining with `
 
 ### No htslib dependency
 
-Header extraction was previously done via hts-nim (`bcf_hdr_format`), which also loaded the index and built internal hash tables — the main source of slow startup on large files. It is now replaced by a direct BGZF block scan that collects `#` lines until the first data line. This eliminates the `hts` nimble dependency entirely; the only C dependency is zlib (`-lz`).
+Header extraction uses a direct BGZF block scan that collects `#` lines until the first data line. Only zlib (`-lz`) is used.
+
+### Gather: BGZF EOF block stripping
+
+Each pipeline tool (e.g. `bcftools view -Ob`) writes a BGZF EOF block at the end of its stdout. The interceptor/`gatherFiles` strips this trailing 28-byte EOF block before writing, so that a single EOF block is written at the very end of the gather output.
+
+### Gather: shard 0 direct write (`run --gather`)
+
+Shard 0's interceptor writes directly to the gather output path instead of a temp file. `concatenateShards` opens the output in `fmAppend` mode and only appends shards 1..N.
+
+### Gather: optimised BGZF header stripping (shards 1..N)
+
+For BGZF VCF and BCF streams, shards 1..N decompress only the header-containing blocks (typically 1–2), find the header end via `findVcfHeaderEnd` / `findBcfHeaderEnd`, recompress the post-header tail of the boundary block, then raw-copy all remaining BGZF blocks unchanged. This avoids decompressing and recompressing the bulk of each shard's data.
+
+### Gather: format detection race condition
+
+Small shards may buffer all pipeline output before shard 0 reads its first chunk and sets the global `gFormatDetected` flag. Shards 1..N spin-wait (`while not gFormatDetected: sleep(1)`) before accessing the detected format globals.
 
 ### Long header lines spanning BGZF block boundaries
 
-VCFs with many contigs or many samples can have `##contig` or `#CHROM` lines that span a BGZF block boundary. The second block starts with a line continuation that doesn't begin with `#`, which would naively look like a data record. `blockHasData` tracks `prevEndedWithNewline` across blocks: if the previous block didn't end with `\n`, the first "line" in the current block is skipped (it's a continuation). This fixes spurious early detection of the first data block.
+`blockHasData` tracks `prevEndedWithNewline` across blocks to avoid spurious early detection of the first data block when headers span a block boundary.
 
 ### Large headers (> 65536 bytes uncompressed)
 
-VCFs with thousands of samples can have headers exceeding the 65536-byte BGZF block limit. `compressToBgzfMulti` splits the input into ≤ 65536-byte chunks and produces multiple BGZF blocks, mirroring htslib's own writer behaviour. The BCF header (`extractBcfHeader`) also goes through `compressToBgzfMulti` for the same reason — the 1000 Genomes chr22 BCF with 2504 samples has a header of ~225 KB.
+`compressToBgzfMulti` splits input into ≤ 65536-byte chunks. Used for VCF headers, BCF headers, and gather recompression.
 
 ### BCF records span BGZF block boundaries
 
-Unlike VCF (where BGZF blocks tend to align with line ends), BCF records routinely span block boundaries. The htslib BCF reader treats the decompressed stream as continuous and is unaware of block layout. The CSI virtual offset `u_off` field encodes exactly where in the decompressed bytes of a given block a record starts — this is the authoritative split point. `splitBgzfBlockAtUOffset` uses this to split a block at a record boundary without ever needing to walk record lengths.
-
-### Interspersed `##` lines in data blocks
-
-Some VCF generators emit `##contig=` or other meta-lines in data blocks (after the initial header region). The original `removeHeaderLines` only decompressed a single BGZF block, which meant any such lines in subsequent blocks appeared verbatim in shard 1's data section, causing bcftools to fail when it encountered records referencing an undeclared contig.
-
-The fix mirrors the Python reference implementation: `removeHeaderLines` is called with the byte range `[0, starts[1])` — covering all header blocks and the entire first data block region — and now iterates through all BGZF blocks in that range before stripping `#` lines and recompressing.
+The CSI virtual offset `u_off` field is the authoritative split point. `splitBgzfBlockAtUOffset` uses this to split a block at a record boundary without walking record lengths.
 
 ### Pipe deadlock prevention
 
-After `fork()`, the child inherits the pipe write-end. If not closed before `exec`, the child holds both ends of its own stdin pipe — `cat` (or any tool reading stdin) waits for EOF that never arrives. Fixed by explicitly closing the pipe write-end in the child process before `execvp`.
-
-### EPIPE handling in writer threads
-
-When a pipeline stage exits early (e.g. non-zero exit before consuming all stdin), writing to the pipe raises `IOError` (errno 32, Broken pipe) in the `doWriteShard` thread. This is caught and silently discarded; the actual failure is detected via `waitpid` exit code.
+After `fork()`, the child's inherited pipe write-end is explicitly closed before `execvp` to prevent deadlock when the shell stage reads stdin.
 
 ### O(n²) deduplication fix
 
-The boundary-optimisation loop merges new sub-block starts into the existing `starts` list each iteration. Previously this called `deduplicate()` without `isSorted = true`, which is O(n²). For files with 100k+ TBI entries this caused multi-minute hangs. Fixed by sorting the concatenated list first and passing `isSorted = true`.
-
-### Raw copy performance
-
-Middle blocks (the bulk of each shard) are copied with 4 MiB read chunks via `rawCopyBytes`. No BGZF decompression or recompression is performed on these blocks.
+Boundary merging sorts before `deduplicate(isSorted = true)` to avoid O(n²) behaviour on files with 100k+ TBI entries.
 
 ---
 
@@ -180,29 +264,28 @@ Middle blocks (the bulk of each shard) are copied with 4 MiB read chunks via `ra
 
 ### Fixtures (`tests/generate_fixtures.sh`)
 
-Run once before testing. Creates:
+Run once before testing.
 
 | File | Description |
 |------|-------------|
-| `tests/data/tiny.vcf.gz` | 10 records, 1 BGZF block, TBI indexed (used for `splitChunk` unit tests) |
+| `tests/data/tiny.vcf.gz` | 10 records, 1 BGZF block, TBI indexed |
 | `tests/data/small.vcf.gz` | ~5000 records, 3 chromosomes, TBI indexed |
-| `tests/data/small_csi.vcf.gz` | Same content, CSI indexed only (no `.tbi`) |
+| `tests/data/small_csi.vcf.gz` | Same content, CSI indexed only |
 | `tests/data/small.bcf` | BCF conversion of `small.vcf.gz`, CSI indexed |
-| `tests/data/chr22_1kg.vcf.gz` | 25,000 records subsampled from 1000 Genomes chr22 (large header: 225 KB, 2504 samples) |
+| `tests/data/chr22_1kg.vcf.gz` | 25,000 records, 500 samples from 1000 Genomes chr22 (large header) |
 | `tests/data/chr22_1kg.bcf` | BCF conversion of `chr22_1kg.vcf.gz`, CSI indexed |
-
-The 1KG fixture is downloaded on first run by streaming `wget | bgzip -d | awk (first 25k records) | bgzip -c`. `pipefail` is disabled around this pipeline to suppress the expected SIGPIPE when awk exits early.
 
 ### Test files
 
 | File | Covers |
 |------|--------|
-| `tests/test_bgzf_utils.nim` | Block scanning, raw copy, compress/decompress round-trip, boundary split, `removeHeaderLines` multi-block, BCF record boundary split (`splitBcfBoundaryBlock`), `bcfFirstDataOffset`, `splitBgzfBlockAtUOffset`, BGZF CRC32 field validation |
-| `tests/test_scatter.nim` | TBI/CSI index parsing, `parseCsiVirtualOffsets`, `scanAllBlockStarts`, partition boundaries, VCF scatter correctness (1 shard, 4 shards, CSI, no-index auto-scan, `--force-scan`), BCF header extraction (`extractBcfHeader` for small and large headers), BCF scatter correctness (1 shard, 4 shards, large header) |
-| `tests/test_cli.nim` | Error paths (missing `-n`, `-o`, unknown extension), no-index auto-scan (VCF only; warning + valid shards), `--force-scan` (VCF), BCF mode (`.bcf` extension → correct shards, content hash), BCF no-index exits 1, BCF `--force-scan` exits 1 (scatter and run subcommands), end-to-end with `small.vcf.gz` (4 shards, content hash), CSI VCF, optional 1KG chr22 (10 shards) |
-| `tests/test_run.nim` | `parseRunArgv`/`buildShellCmd` unit tests; `runShards` direct calls (1 shard, 4 shards with content hash, serial `--max-jobs 1`, over-capacity jobs, BCF 4 shards with content hash); CLI tests via binary (1/4 shards, multi-stage pipeline, `--max-jobs`, non-zero exit → paravar exits 1, missing `---`, `--` passthrough to bcftools plugins) |
+| `tests/test_bgzf_utils.nim` | Block scanning, raw copy, compress/decompress round-trip, boundary split, `removeHeaderLines` multi-block, BCF record boundary split, `bcfFirstDataOffset`, `splitBgzfBlockAtUOffset`, BGZF CRC32 field validation |
+| `tests/test_scatter.nim` | TBI/CSI index parsing, `parseCsiVirtualOffsets`, `scanAllBlockStarts`, partition boundaries, VCF scatter correctness (1 shard, 4 shards, CSI, no-index auto-scan, `--force-scan`), BCF header extraction, BCF scatter correctness (1 shard, 4 shards, large header) |
+| `tests/test_cli.nim` | Error paths, no-index auto-scan, `--force-scan`, BCF mode, end-to-end with `small.vcf.gz` (4 shards, content hash), CSI VCF, BCF `--force-scan` rejection for `run`, optional 1KG chr22. Uses `shard_XX.` output naming throughout. |
+| `tests/test_run.nim` | `parseRunArgv`/`buildShellCmd` unit tests (including `:::` separator and mixed `---`/`:::` separators); `runShards` direct calls (1 shard, 4 shards with content hash, serial `--max-jobs 1`, BCF 4 shards); CLI tests (multi-stage pipeline, `--max-jobs`, failure propagation, `:::` separator, `--` passthrough) |
+| `tests/test_gather.nim` | **Unit:** `inferGatherFormat` (all extensions, overrides, error paths), `validateGatherConfig`, `isBgzfStream`, `sniffFormat`, `sniffStreamFormat`, `stripBcfHeader`, `stripLinesByPattern`, `stripFirstNLines`, `findBcfHeaderEnd`, `findVcfHeaderEnd`, `runInterceptor`; `concatenateShards`, `cleanupTempDir`. **Integration (`run --gather`):** VCF gather, BCF gather, text gather, format override, shard failure, `--tmp-dir`. **Integration (`gather` subcommand):** VCF gather (4 shards → record count + hash), BCF gather, missing `-o`, no input files, missing input file. |
 
-**Correctness verification:** scatter tests in `test_scatter.nim` collect raw record bytes and compare sorted sets. Integration tests in `test_cli.nim` and `test_run.nim` additionally compute an ordered `sha256sum` of all records across shards (via `bcftools view -H`) and compare to the original — this catches byte-level corruption and reordering that count-based checks miss.
+**Correctness verification:** scatter tests collect raw record bytes and compare sorted sets. Integration tests in `test_cli.nim`, `test_run.nim`, and `test_gather.nim` compute an ordered `sha256sum` of all records (via `bcftools view -H`) and compare to the original — catches byte-level corruption and reordering.
 
 ### Running
 
@@ -212,10 +295,7 @@ bash tests/generate_fixtures.sh        # once
 export PATH="$HOME/.choosenim/toolchains/nim-2.2.8/bin:$PATH"
 
 nimble test                            # all tests
-nim c -r tests/test_bgzf_utils.nim    # single file
-nim c -r tests/test_scatter.nim
-nim c -r tests/test_cli.nim
-nim c -r tests/test_run.nim
+nim c -r tests/test_gather.nim        # single file
 ```
 
 ---
@@ -232,6 +312,5 @@ No nimble package dependencies. zlib is available system-wide or via conda.
 
 ## Out of scope (not implemented)
 
-- `gather` subcommand (planned: behave like `bcftools concat -a`, merge per-shard run outputs)
 - `run` with pre-scattered input glob
 - `--chunk` / `--stdout` flags

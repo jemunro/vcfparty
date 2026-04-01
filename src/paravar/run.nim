@@ -16,13 +16,17 @@ import gather
 # Argv parsing
 # ---------------------------------------------------------------------------
 
+proc isSep(tok: string): bool {.inline.} =
+  ## Return true for "---" or ":::" — both are valid pipeline stage separators.
+  tok == "---" or tok == ":::"
+
 proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
-  ## Split argv at "---" separators.
+  ## Split argv at "---" or ":::" separators (both are equivalent).
   ## Returns (paravarArgs, stages) where stages is a seq of per-stage token seqs.
-  ## Exits 1 with a message if no "---" is present or if any stage is empty.
+  ## Exits 1 with a message if no separator is present or if any stage is empty.
   var firstSep = -1
   for i, tok in argv:
-    if tok == "---":
+    if isSep(tok):
       firstSep = i
       break
   if firstSep < 0:
@@ -32,7 +36,7 @@ proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
   var stages: seq[seq[string]]
   var cur: seq[string]
   for i in firstSep + 1 ..< argv.len:
-    if argv[i] == "---":
+    if isSep(argv[i]):
       if cur.len == 0:
         stderr.writeLine "paravar run: empty pipeline stage"
         quit(1)
@@ -114,11 +118,11 @@ proc waitOne(running: var seq[InFlight]; failed: var bool) =
       return
     j += 1
 
-proc runShards*(vcfPath: string; nShards: int; outputPrefix: string;
+proc runShards*(vcfPath: string; nShards: int; outputTemplate: string;
                 nThreads: int; forceScan: bool; maxJobs: int;
                 shellCmd: string; noKill: bool = false) =
   ## Scatter vcfPath into nShards shards and pipe each through shellCmd.
-  ## Outputs: outputPrefix.<N>.vcf.gz (zero-padded to width of nShards).
+  ## outputTemplate may contain {} or use shard_NN. prefix naming.
   ## Up to maxJobs shards run concurrently; pass 0 to use all CPUs.
   ## On failure, siblings are killed (SIGTERM) unless noKill is true.
   ## If any shard pipeline exits non-zero, prints to stderr and exits 1 at end.
@@ -126,9 +130,7 @@ proc runShards*(vcfPath: string; nShards: int; outputPrefix: string;
   let actualMaxJobs = if maxJobs == 0: countProcessors() else: maxJobs
   setMaxPoolSize(max(actualThreads, actualMaxJobs))
   let fmt      = if vcfPath.endsWith(".bcf"): FileFormat.Bcf else: FileFormat.Vcf
-  let ext      = if fmt == FileFormat.Bcf: ".bcf" else: ".vcf.gz"
   let tasks    = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt)
-  let nDigits  = len($nShards)
   var anyFailed = false
   var inFlight: seq[InFlight]
   for i in 0 ..< nShards:
@@ -139,7 +141,8 @@ proc runShards*(vcfPath: string; nShards: int; outputPrefix: string;
       waitOne(inFlight, anyFailed)
       if anyFailed and not noKill: break
     if anyFailed and not noKill: break
-    let outPath = outputPrefix & "." & align($(i + 1), nDigits, '0') & ext
+    let outPath = shardOutputPath(outputTemplate, i, nShards)
+    createDir(outPath.parentDir)
     # Create pipe: [0] = read-end (child stdin), [1] = write-end (shard writer).
     var pipeFds: array[2, cint]
     if posix.pipe(pipeFds) != 0:
@@ -201,7 +204,7 @@ proc waitOneGather(running: var seq[InFlightGather]; failed: var bool) =
       return
     j += 1
 
-proc runShardsGather*(vcfPath: string; nShards: int; outputPrefix: string;
+proc runShardsGather*(vcfPath: string; nShards: int; outputTemplate: string;
                       nThreads: int; forceScan: bool; maxJobs: int;
                       shellCmd: string; noKill: bool; cfg: GatherConfig) =
   ## Scatter vcfPath into nShards shards, pipe each through shellCmd, capture stdout
@@ -210,9 +213,8 @@ proc runShardsGather*(vcfPath: string; nShards: int; outputPrefix: string;
   let actualMaxJobs = if maxJobs == 0: countProcessors() else: maxJobs
   # Pool must accommodate scatter writer threads and interceptor threads simultaneously.
   setMaxPoolSize(max(actualThreads, actualMaxJobs) + actualMaxJobs)
-  let fmt     = if vcfPath.endsWith(".bcf"): FileFormat.Bcf else: FileFormat.Vcf
-  let tasks   = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt)
-  let nDigits = len($nShards)
+  let fmt   = if vcfPath.endsWith(".bcf"): FileFormat.Bcf else: FileFormat.Vcf
+  let tasks = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt)
   createDir(cfg.tmpDir)
   var anyFailed = false
   var inFlight:    seq[InFlightGather]
@@ -225,7 +227,9 @@ proc runShardsGather*(vcfPath: string; nShards: int; outputPrefix: string;
     if anyFailed and not noKill: break
     let tmpPath =
       if i == 0: cfg.outputPath
-      else: cfg.tmpDir / "shard." & align($(i + 1), nDigits, '0') & ".tmp"
+      else:
+        let shardBase = shardOutputPath(cfg.outputPath, i, nShards).lastPathPart
+        cfg.tmpDir / "paravar_" & shardBase & ".tmp"
     if i > 0:
       allTmpPaths.add(tmpPath)
     # stdin pipe:  shard writer → shell stdin

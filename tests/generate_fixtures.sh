@@ -120,29 +120,38 @@ fi
 # ---------------------------------------------------------------------------
 # chr22_1kg.vcf.gz — real 1000 Genomes chr22 release (optional, ~1 GB)
 # Downloaded once; skipped if already present or if no network tool found.
+# Subsampled to first 25000 records and first 500 samples to keep file small.
 # ---------------------------------------------------------------------------
 KG="${DATA_DIR}/chr22_1kg.vcf.gz"
 KG_TBI="${KG}.tbi"
 KG_VCF_URL="https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/ALL.chr22.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
 
 SUBSAMPLE_AWK='/^#/{print; next} c<25000{print; c++} c>=25000{exit}'
+KG_N_SAMPLES=500
 
 if [[ ! -f "${KG}" ]]; then
-  if command -v wget &>/dev/null; then
-    echo "Downloading and subsampling ${KG} (first 25000 records) ..."
+  if command -v wget &>/dev/null || command -v curl &>/dev/null; then
+    echo "Downloading and subsampling ${KG} (first 25000 records, first ${KG_N_SAMPLES} samples) ..."
+    KG_TMP="${DATA_DIR}/chr22_1kg_tmp.vcf.gz"
+    # Step 1: download + record-subsample to a temp file.
     # pipefail off: awk exits early (SIGPIPE) once it has 25000 records — that's expected.
     set +o pipefail
-    wget -q -O - "${KG_VCF_URL}" | bgzip -d | awk "${SUBSAMPLE_AWK}" | bgzip -c > "${KG}"
+    if command -v wget &>/dev/null; then
+      wget -q -O - "${KG_VCF_URL}" | bgzip -d | awk "${SUBSAMPLE_AWK}" | bgzip -c > "${KG_TMP}"
+    else
+      curl -s -L "${KG_VCF_URL}" | bgzip -d | awk "${SUBSAMPLE_AWK}" | bgzip -c > "${KG_TMP}"
+    fi
     set -o pipefail
+    # Step 2: subset to first N samples (avoid SIGPIPE from head by redirecting first).
+    SAMPLES_TMP="${DATA_DIR}/chr22_1kg_samples_tmp.txt"
+    ALL_SAMPLES_TMP="${DATA_DIR}/chr22_1kg_allsamples_tmp.txt"
+    bcftools query -l "${KG_TMP}" > "${ALL_SAMPLES_TMP}"
+    head -n "${KG_N_SAMPLES}" "${ALL_SAMPLES_TMP}" > "${SAMPLES_TMP}"
+    rm -f "${ALL_SAMPLES_TMP}"
+    bcftools view -Oz -S "${SAMPLES_TMP}" "${KG_TMP}" > "${KG}"
+    rm -f "${KG_TMP}" "${SAMPLES_TMP}"
     tabix -p vcf "${KG}"
-    echo "  -> $(bcftools view -HG "${KG}" | wc -l) records, index: ${KG_TBI}"
-  elif command -v curl &>/dev/null; then
-    echo "Downloading and subsampling ${KG} (first 25000 records) ..."
-    set +o pipefail
-    curl -s -L "${KG_VCF_URL}" | bgzip -d | awk "${SUBSAMPLE_AWK}" | bgzip -c > "${KG}"
-    set -o pipefail
-    tabix -p vcf "${KG}"
-    echo "  -> $(bcftools view -HG "${KG}" | wc -l) records, index: ${KG_TBI}"
+    echo "  -> $(bcftools view -HG "${KG}" | wc -l) records, $(bcftools query -l "${KG}" | wc -l) samples, index: ${KG_TBI}"
   else
     echo "Skipping ${KG} (no wget or curl found)"
   fi
@@ -152,7 +161,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # chr22_1kg.bcf — BCF conversion of chr22_1kg.vcf.gz, CSI indexed.
-# Large header: 2504 samples.
+# Large header: 500 samples (subsampled from 2504).
 # ---------------------------------------------------------------------------
 KG_BCF="${DATA_DIR}/chr22_1kg.bcf"
 if [[ ! -f "${KG_BCF}" ]]; then

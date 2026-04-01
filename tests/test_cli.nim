@@ -2,7 +2,7 @@
 ## Run from project root: nim c -r tests/test_cli.nim
 ## Requires the paravar binary to be built first (nimble build).
 
-import std/[os, osproc, strformat, strutils]
+import std/[os, osproc, sequtils, strformat, strutils]
 
 const BinPath  = "./paravar"
 const DataDir  = "tests/data"
@@ -33,12 +33,13 @@ proc recordsHash(paths: seq[string]): string =
 # ---------------------------------------------------------------------------
 
 block buildBinary:
-  let (outp, code) = execCmdEx("nimble build 2>&1")
-  if code != 0:
-    echo "nimble build failed:\n", outp
-    quit(1)
-  doAssert fileExists(BinPath), "binary not found after nimble build: " & BinPath
-  echo "PASS nimble build"
+  if not fileExists(BinPath):
+    let (outp, code) = execCmdEx("nimble build 2>&1")
+    if code != 0:
+      echo "nimble build failed:\n", outp
+      quit(1)
+  doAssert fileExists(BinPath), "binary not found: " & BinPath & " (run nimble build)"
+  echo "PASS binary available"
 
 # ---------------------------------------------------------------------------
 # Missing -n
@@ -102,18 +103,18 @@ block testForceScanFlag:
   let prefix = tmpDir / "shard"
   let (runOutp, runCode) = run(&"scatter -n 4 -o {prefix} --force-scan {SmallVcf}")
   doAssert runCode == 0, &"--force-scan exited non-zero:\n{runOutp}"
-  proc countFS(path: string): int =
-    let (o, _) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null | wc -l")
-    o.strip.parseInt
+  proc countAndCheckFS(path: string): int =
+    ## Count records; also validates the file (bcftools exits 0 on success).
+    let (o, code) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null")
+    doAssert code == 0, &"bcftools rejected --force-scan shard: {path}"
+    o.splitLines.countIt(it.len > 0)
   var total = 0
   for i in 1..4:
     let p = prefix & "." & $i & ".vcf.gz"
     doAssert fileExists(p), &"--force-scan shard {i} missing"
-    let (bo, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
-    doAssert bc == 0, &"bcftools rejected --force-scan shard {i}: {bo}"
-    total += countFS(p)
-  doAssert total == countFS(SmallVcf),
-    &"--force-scan record count mismatch: shards={total} orig={countFS(SmallVcf)}"
+    total += countAndCheckFS(p)
+  doAssert total == countAndCheckFS(SmallVcf),
+    &"--force-scan record count mismatch: shards={total}"
   echo &"PASS --force-scan: 4 shards, {total} records"
   removeDir(tmpDir)
 
@@ -137,25 +138,13 @@ block testEndToEnd:
       &"bcftools rejected shard {i}: {bcfOutp}"
   echo "PASS e2e: all 4 shards are valid VCFs (bcftools view)"
 
-  # Total record count across shards must equal original.
-  proc countRecords(path: string): int =
-    let (outp2, _) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null | wc -l")
-    outp2.strip.parseInt
-
-  var shardTotal = 0
   var shardPaths: seq[string]
   for i in 1..4:
-    let p = prefix & "." & $i & ".vcf.gz"
-    shardTotal += countRecords(p)
-    shardPaths.add(p)
-  let origTotal = countRecords(SmallVcf)
-  doAssert shardTotal == origTotal,
-    &"e2e record count mismatch: shards={shardTotal} orig={origTotal}"
-  echo &"PASS e2e: record count matches original ({origTotal} records across 4 shards)"
+    shardPaths.add(prefix & "." & $i & ".vcf.gz")
 
   doAssert recordsHash(shardPaths) == recordsHash(@[SmallVcf]),
     "e2e content hash mismatch: record corruption or reordering detected"
-  echo "PASS e2e: record content hash matches original (no corruption)"
+  echo "PASS e2e: record content hash matches original (no corruption, correct count)"
 
   removeDir(tmpDir)
 

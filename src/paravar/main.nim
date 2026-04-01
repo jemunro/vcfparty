@@ -1,0 +1,326 @@
+## paravar CLI — argument parsing and subcommand dispatch.
+## Entry point is src/paravar.nim which includes this file.
+
+import std/[options, os, parseopt, strutils]
+import scatter
+import run
+import gather
+
+proc detectFormat(path: string): FileFormat =
+  ## Detect file format from extension.
+  ## .vcf.gz → Vcf; .bcf → Bcf; anything else → exit 1.
+  if path.endsWith(".vcf.gz"):
+    result = FileFormat.Vcf
+  elif path.endsWith(".bcf"):
+    result = FileFormat.Bcf
+  else:
+    let ext = if path.rfind('.') >= 0: path[path.rfind('.')..^1] else: path
+    stderr.writeLine "error: unknown file format '" & ext &
+      "' (expected .vcf.gz or .bcf): " & path
+    quit(1)
+
+const VERSION = "0.1.0"
+
+proc usage() =
+  ## Print top-level usage to stderr and exit 1.
+  stderr.writeLine "paravar v" & VERSION
+  stderr.writeLine ""
+  stderr.writeLine "Usage: paravar <subcommand> [options]"
+  stderr.writeLine ""
+  stderr.writeLine "Subcommands:"
+  stderr.writeLine "  scatter   Split a bgzipped VCF into N shards"
+  stderr.writeLine "  run       Scatter, pipe each shard through a tool pipeline"
+  stderr.writeLine ""
+  stderr.writeLine "Run 'paravar <subcommand> --help' for subcommand options."
+  quit(1)
+
+proc scatterUsage() =
+  ## Print scatter subcommand usage to stderr and exit 1.
+  stderr.writeLine "Usage: paravar scatter -n <n_shards> -o <prefix> [options] <input.vcf.gz>"
+  stderr.writeLine ""
+  stderr.writeLine "Options:"
+  stderr.writeLine "  -n, --n-shards <int>      number of output shards (required, >= 1)"
+  stderr.writeLine "  -o, --output <str>        output file prefix (required)"
+  stderr.writeLine "  -t, --max-threads <int>   max threads for scan/split/write (default: min(n-shards, 8))"
+  stderr.writeLine "      --force-scan          always scan BGZF blocks (ignore index even if present)"
+  stderr.writeLine "  -v, --verbose             print progress info to stderr (block offsets, boundaries, shards)"
+  stderr.writeLine "  -h, --help                show this help"
+  quit(1)
+
+proc nextVal(p: var OptParser; flag: string): string =
+  ## Return the value for a flag, consuming the next argv token if the value
+  ## was not attached (i.e. '-n 4' rather than '-n4' or '-n=4').
+  if p.val != "":
+    return p.val
+  p.next()
+  if p.kind != cmdArgument:
+    stderr.writeLine "error: -" & flag & " requires a value"
+    quit(1)
+  result = p.key
+
+proc runScatter(rawArgs: seq[string]) =
+  ## Parse scatter subcommand arguments and call scatter().
+  var nShards      = 0
+  var nShardsSet   = false
+  var outPrefix    = ""
+  var inputFile    = ""
+  var nThreads     = 0
+  var nThreadsSet  = false
+  var forceScan    = false
+  var p = initOptParser(rawArgs)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "n", "n-shards":
+        let v = nextVal(p, "n")
+        try:
+          nShards = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: -n must be an integer, got: " & v
+          quit(1)
+        nShardsSet = true
+      of "o", "output":
+        outPrefix = nextVal(p, "o")
+      of "t", "max-threads":
+        let v = nextVal(p, "t")
+        try:
+          nThreads = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: -t must be an integer, got: " & v
+          quit(1)
+        if nThreads < 0:
+          stderr.writeLine "error: -t must be >= 0, got: " & $nThreads
+          quit(1)
+        nThreadsSet = true
+      of "force-scan":
+        forceScan = true
+      of "v", "verbose":
+        scatter.verbose = true
+      of "h", "help":
+        scatterUsage()
+      else:
+        stderr.writeLine "error: unknown option: -" & p.key
+        quit(1)
+    of cmdArgument:
+      if inputFile != "":
+        stderr.writeLine "error: unexpected argument: " & p.key
+        quit(1)
+      inputFile = p.key
+  if not nShardsSet:
+    stderr.writeLine "error: -n/--n-shards is required"
+    quit(1)
+  if nShards < 1:
+    stderr.writeLine "error: -n must be >= 1, got: " & $nShards
+    quit(1)
+  if outPrefix == "":
+    stderr.writeLine "error: -o/--output is required"
+    quit(1)
+  if inputFile == "":
+    stderr.writeLine "error: input VCF file is required"
+    quit(1)
+  if not fileExists(inputFile):
+    stderr.writeLine "error: input file not found: " & inputFile
+    quit(1)
+  let fmt = detectFormat(inputFile)
+  if fmt == FileFormat.Bcf and forceScan:
+    stderr.writeLine "error: paravar: --force-scan is not supported for BCF input"
+    quit(1)
+  if not nThreadsSet:
+    nThreads = min(nShards, 8)
+  scatter(inputFile, nShards, outPrefix, nThreads, forceScan, fmt)
+
+proc runUsage() =
+  ## Print run subcommand usage to stderr and exit 1.
+  stderr.writeLine "Usage: paravar run -n <n_shards> -o <prefix> [options] <input.vcf.gz> --- <cmd> [args...] [--- <cmd2> ...]"
+  stderr.writeLine ""
+  stderr.writeLine "Options:"
+  stderr.writeLine "  -n, --n-shards <int>         number of shards (required, >= 1)"
+  stderr.writeLine "  -o, --output <str>           output file prefix (required without --gather)"
+  stderr.writeLine "  -j, --max-jobs <int>         max concurrent shard pipelines (default: n-shards)"
+  stderr.writeLine "  -t, --max-threads <int>      max threads for scatter/validation (default: min(max-jobs, 8))"
+  stderr.writeLine "      --force-scan             always scan BGZF blocks (ignore index even if present)"
+  stderr.writeLine "      --no-kill                on failure, let sibling shards finish (default: kill them)"
+  stderr.writeLine "      --gather <path>          concatenate shard outputs into a single file"
+  stderr.writeLine "      --gather-fmt vcf|bcf|txt override format inference from --gather extension"
+  stderr.writeLine "      --header-pattern <pat>   strip lines starting with pat from shards 2..N (text format only)"
+  stderr.writeLine "      --header-n <n>           strip the first n lines from shards 2..N (text format only)"
+  stderr.writeLine "      --tmp-dir <dir>          temp dir for shard files (default: $TMPDIR/paravar)"
+  stderr.writeLine "  -v, --verbose                print per-shard progress to stderr"
+  stderr.writeLine "  -h, --help                   show this help"
+  stderr.writeLine ""
+  stderr.writeLine "Separate pipeline stages with ---:"
+  stderr.writeLine "  paravar run -n 8 -o out input.vcf.gz --- bcftools view -i \"GT='alt'\" -Oz"
+  stderr.writeLine "  paravar run -n 8 --gather out.vcf.gz input.vcf.gz --- bcftools view -Oz"
+  quit(1)
+
+proc runRun(rawArgs: seq[string]) =
+  ## Parse run subcommand arguments and call runShards() or runShardsGather().
+  ## Everything before the first --- is parsed as paravar options.
+  ## Everything from --- onward is the pipeline stage definition.
+  var firstSep = -1
+  for i, tok in rawArgs:
+    if tok == "---":
+      firstSep = i
+      break
+  # Parse paravar options from the slice before --- (or all args if no --- found;
+  # parseRunArgv will emit the appropriate error when called below).
+  let paravarPart = if firstSep < 0: rawArgs else: rawArgs[0 ..< firstSep]
+  var nShards         = 0
+  var nShardsSet      = false
+  var outPrefix       = ""
+  var inputFile       = ""
+  var nJobs           = 0
+  var nJobsSet        = false
+  var nThreads        = 0
+  var nThreadsSet     = false
+  var forceScan       = false
+  var noKill          = false
+  var gatherPath      = ""
+  var gatherFmt       = ""
+  var headerPattern   = ""
+  var headerPatternSet = false
+  var headerN         = 0
+  var headerNSet      = false
+  var tmpDir          = ""
+  var p = initOptParser(paravarPart)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "n", "n-shards":
+        let v = nextVal(p, "n")
+        try:
+          nShards = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: -n must be an integer, got: " & v
+          quit(1)
+        nShardsSet = true
+      of "o", "output":
+        outPrefix = nextVal(p, "o")
+      of "j", "max-jobs":
+        let v = nextVal(p, "j")
+        try:
+          nJobs = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: --max-jobs must be an integer, got: " & v
+          quit(1)
+        if nJobs < 0:
+          stderr.writeLine "error: --max-jobs must be >= 0, got: " & $nJobs
+          quit(1)
+        nJobsSet = true
+      of "t", "max-threads":
+        let v = nextVal(p, "t")
+        try:
+          nThreads = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: -t must be an integer, got: " & v
+          quit(1)
+        if nThreads < 0:
+          stderr.writeLine "error: -t must be >= 0, got: " & $nThreads
+          quit(1)
+        nThreadsSet = true
+      of "force-scan":
+        forceScan = true
+      of "no-kill":
+        noKill = true
+      of "gather":
+        gatherPath = nextVal(p, "gather")
+      of "gather-fmt":
+        gatherFmt = nextVal(p, "gather-fmt")
+      of "header-pattern":
+        headerPattern    = nextVal(p, "header-pattern")
+        headerPatternSet = true
+      of "header-n":
+        let v = nextVal(p, "header-n")
+        try:
+          headerN = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: --header-n must be an integer, got: " & v
+          quit(1)
+        if headerN < 0:
+          stderr.writeLine "error: --header-n must be >= 0, got: " & $headerN
+          quit(1)
+        headerNSet = true
+      of "tmp-dir":
+        tmpDir = nextVal(p, "tmp-dir")
+      of "v", "verbose":
+        scatter.verbose = true
+      of "h", "help":
+        runUsage()
+      else:
+        stderr.writeLine "error: unknown option: -" & p.key
+        quit(1)
+    of cmdArgument:
+      if inputFile != "":
+        stderr.writeLine "error: unexpected argument: " & p.key
+        quit(1)
+      inputFile = p.key
+  if not nShardsSet:
+    stderr.writeLine "error: -n/--n-shards is required"
+    quit(1)
+  if nShards < 1:
+    stderr.writeLine "error: -n must be >= 1, got: " & $nShards
+    quit(1)
+  let gatherMode = gatherPath != ""
+  if not gatherMode and outPrefix == "":
+    stderr.writeLine "error: -o/--output is required (or use --gather)"
+    quit(1)
+  if inputFile == "":
+    stderr.writeLine "error: input VCF file is required"
+    quit(1)
+  if not fileExists(inputFile):
+    stderr.writeLine "error: input file not found: " & inputFile
+    quit(1)
+  let fmt = detectFormat(inputFile)
+  if fmt == FileFormat.Bcf and forceScan:
+    stderr.writeLine "error: paravar: --force-scan is not supported for BCF input"
+    quit(1)
+  if not nJobsSet:
+    nJobs = nShards
+  if not nThreadsSet:
+    nThreads = min(nJobs, 8)
+  let (_, stages) = parseRunArgv(rawArgs)
+  let shellCmd    = buildShellCmd(stages)
+  if gatherMode:
+    let (gFmt, gComp) = inferGatherFormat(gatherPath, gatherFmt)
+    let resolvedTmpDir =
+      if tmpDir != "": tmpDir
+      else: getEnv("TMPDIR", "/tmp") / "paravar"
+    var cfg = GatherConfig(
+      format:      gFmt,
+      compression: gComp,
+      outputPath:  gatherPath,
+      tmpDir:      resolvedTmpDir,
+      shardCount:  nShards)
+    if headerPatternSet:
+      cfg.headerPattern = some(headerPattern)
+    if headerNSet:
+      cfg.headerN = some(headerN)
+    validateGatherConfig(cfg)
+    runShardsGather(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs,
+                    shellCmd, noKill, cfg)
+  else:
+    runShards(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs, shellCmd, noKill)
+
+proc mainEntry*() =
+  ## Top-level entry point: dispatch to the appropriate subcommand.
+  let args = commandLineParams()
+  if args.len == 0:
+    usage()
+  case args[0]
+  of "scatter":
+    runScatter(args[1 .. ^1])
+  of "run":
+    runRun(args[1 .. ^1])
+  of "--version":
+    echo "paravar v" & VERSION
+  of "--help", "-h":
+    usage()
+  else:
+    stderr.writeLine "error: unknown subcommand '" & args[0] & "'"
+    usage()

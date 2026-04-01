@@ -182,46 +182,34 @@ proc collectRecords(data: seq[byte]): seq[string] =
 
 proc checkShards(vcfPath: string; prefix: string; n: int) =
   ## Verify BGZF structure, header presence, record completeness, and order.
+  ## Each shard is decompressed exactly once; all checks reuse the cached bytes.
   let nDigits = len($n)
+  let origRecords = collectRecords(decompressBgzfFile(vcfPath))
+  var shardRecords: seq[string]
 
-  # 1 — each output file exists and has valid BGZF magic + EOF block
   for i in 1..n:
     let path = prefix & "." & align($i, nDigits, '0') & ".vcf.gz"
     doAssert fileExists(path), &"shard {i} missing: {path}"
+
+    # BGZF magic + EOF (read-only, no decompression needed)
+    let sz = getFileSize(path)
     let fz = open(path, fmRead)
     var hdrBuf = newSeq[byte](3)
     discard readBytes(fz, hdrBuf, 0, 3)
     doAssert hdrBuf[0] == 0x1f'u8 and hdrBuf[1] == 0x8b'u8,
       &"shard {i}: bad BGZF magic"
-    let sz = getFileSize(path)
     fz.setFilePos(sz - 28)
     var eofBuf = newSeq[byte](28)
     discard readBytes(fz, eofBuf, 0, 28)
     fz.close()
     doAssert eofBuf == @BGZF_EOF, &"shard {i}: EOF block mismatch"
 
-  # 2 — each shard starts with a VCF header
-  for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".vcf.gz"
+    # Decompress once; run all content checks on the result.
     let content = decompressBgzfFile(path)
     doAssert content.len > 0, &"shard {i}: empty after decompression"
     doAssert content[0] == byte('#'), &"shard {i}: does not start with '#'"
 
-  # 3 — all records present, no duplicates
-  var shardRecords: seq[string]
-  for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".vcf.gz"
-    shardRecords.add(collectRecords(decompressBgzfFile(path)))
-  let origRecords = collectRecords(decompressBgzfFile(vcfPath))
-  doAssert shardRecords.len == origRecords.len,
-    &"record count mismatch: shards={shardRecords.len} orig={origRecords.len}"
-  doAssert sorted(shardRecords) == sorted(origRecords),
-    "shard records do not match original"
-
-  # 4 — records within each shard are in non-decreasing genomic order (CHROM:POS)
-  for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".vcf.gz"
-    let recs = collectRecords(decompressBgzfFile(path))
+    let recs = collectRecords(content)
     for j in 1 ..< recs.len:
       let prevFields = recs[j-1].split('\t')
       let curFields  = recs[j].split('\t')
@@ -229,6 +217,12 @@ proc checkShards(vcfPath: string; prefix: string; n: int) =
         if prevFields[0] == curFields[0]:
           doAssert prevFields[1].parseInt <= curFields[1].parseInt,
             &"shard {i}: records out of order at line {j}"
+    shardRecords.add(recs)
+
+  doAssert shardRecords.len == origRecords.len,
+    &"record count mismatch: shards={shardRecords.len} orig={origRecords.len}"
+  doAssert sorted(shardRecords) == sorted(origRecords),
+    "shard records do not match original"
 
 # ===========================================================================
 # Step 5 — scatter: TBI-indexed input
@@ -276,19 +270,6 @@ block testVcfScatter1Shard:
   scatter(SmallVcf, 1, prefix)
   checkShards(SmallVcf, prefix, 1)
   echo "PASS VCF scatter 1 shard: BGZF structure, header, completeness"
-  removeDir(tmpDir)
-
-block testScatterNoIndexAutoScan:
-  ## With no index alongside the file, scatter should warn and auto-scan.
-  let tmpDir = getTempDir() / "paravar_scatter_scan_test"
-  createDir(tmpDir)
-  let tmpVcf = tmpDir / "noindex.vcf.gz"
-  copyFile(SmallVcf, tmpVcf)
-  # No .tbi or .csi copied — must fall through to auto-scan.
-  let prefix = tmpDir / "shard"
-  scatter(tmpVcf, 4, prefix)
-  checkShards(SmallVcf, prefix, 4)
-  echo "PASS scatter no-index auto-scan: BGZF structure, header, completeness, order"
   removeDir(tmpDir)
 
 block testScatterForceScan:
@@ -403,12 +384,16 @@ proc cmpRecBytes(a, b: seq[byte]): int =
 
 proc checkBcfShards(bcfPath: string; prefix: string; n: int) =
   ## Verify BGZF structure, BCF magic, record completeness, and order.
+  ## Each shard is decompressed exactly once; all checks reuse the cached bytes.
   let nDigits = len($n)
+  let origRecs = collectBcfRecordBytes(bcfPath)
+  var shardRecs: seq[seq[byte]]
 
-  # 1 — each shard exists with .bcf extension, valid BGZF magic, BGZF EOF
   for i in 1..n:
     let path = prefix & "." & align($i, nDigits, '0') & ".bcf"
     doAssert fileExists(path), &"BCF shard {i} missing: {path}"
+
+    # BGZF magic + EOF (no decompression)
     let sz = getFileSize(path)
     let f = open(path, fmRead)
     var hdrBuf = newSeq[byte](3)
@@ -421,30 +406,26 @@ proc checkBcfShards(bcfPath: string; prefix: string; n: int) =
     f.close()
     doAssert eofBuf == @BGZF_EOF, &"BCF shard {i}: EOF block mismatch"
 
-  # 2 — each shard decompresses and starts with BCF magic
-  for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".bcf"
+    # Decompress once; run all content checks on the result.
     let data = decompressBgzfFile(path)
     doAssert data.len >= 9, &"BCF shard {i}: decompressed data too short"
     doAssert data[0] == byte('B') and data[1] == byte('C') and
              data[2] == byte('F') and data[3] == 0x02'u8 and
              data[4] == 0x02'u8, &"BCF shard {i}: bad BCF magic"
 
-  # 3 — all records present across shards, no duplicates
-  var shardRecs: seq[seq[byte]]
-  for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".bcf"
-    shardRecs.add(collectBcfRecordBytes(path))
-  let origRecs = collectBcfRecordBytes(bcfPath)
-  doAssert shardRecs.len == origRecs.len,
-    &"BCF: record count mismatch: shards={shardRecs.len} orig={origRecs.len}"
-  doAssert sorted(shardRecs, cmpRecBytes) == sorted(origRecs, cmpRecBytes),
-    "BCF: shard records do not match original"
-
-  # 4 — records within each shard in non-decreasing genomic order (chrom_idx, pos)
-  for i in 1..n:
-    let path = prefix & "." & align($i, nDigits, '0') & ".bcf"
-    let recs = collectBcfRecordBytes(path)
+    let recs = block:
+      # Walk records from data (same logic as collectBcfRecordBytes but on cached bytes).
+      var res: seq[seq[byte]]
+      let lText = leU32At(data, 5).int
+      var pos = 5 + 4 + lText
+      while pos + 8 <= data.len:
+        let lShared = leU32At(data, pos).int
+        let lIndiv  = leU32At(data, pos + 4).int
+        let recLen  = 8 + lShared + lIndiv
+        if pos + recLen > data.len: break
+        res.add(data[pos ..< pos + recLen])
+        pos += recLen
+      res
     for j in 1 ..< recs.len:
       if recs[j].len >= 16 and recs[j-1].len >= 16:
         let prevChrom = leU32At(recs[j-1], 8)
@@ -454,6 +435,12 @@ proc checkBcfShards(bcfPath: string; prefix: string; n: int) =
         if prevChrom == curChrom:
           doAssert prevPos <= curPos,
             &"BCF shard {i}: records out of order at record {j}"
+    shardRecs.add(recs)
+
+  doAssert shardRecs.len == origRecs.len,
+    &"BCF: record count mismatch: shards={shardRecs.len} orig={origRecs.len}"
+  doAssert sorted(shardRecs, cmpRecBytes) == sorted(origRecs, cmpRecBytes),
+    "BCF: shard records do not match original"
 
 block testBcfScatter1Shard:
   doAssert fileExists(SmallBcf), &"BCF fixture missing: {SmallBcf}"

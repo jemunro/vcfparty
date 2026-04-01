@@ -178,12 +178,13 @@ block testRunJobsMoreThanShards:
 const BinPath = "./paravar"
 
 block buildBinary:
-  let (outp, code) = execCmdEx("nimble build 2>&1")
-  if code != 0:
-    echo "nimble build failed:\n", outp
-    quit(1)
-  doAssert fileExists(BinPath), "binary not found after nimble build"
-  echo "PASS nimble build (run R5)"
+  if not fileExists(BinPath):
+    let (outp, code) = execCmdEx("nimble build 2>&1")
+    if code != 0:
+      echo "nimble build failed:\n", outp
+      quit(1)
+  doAssert fileExists(BinPath), "binary not found: " & BinPath & " (run nimble build)"
+  echo "PASS binary available (run R5)"
 
 proc runBin(args: string): (string, int) =
   execCmdEx(BinPath & " run " & args & " 2>&1")

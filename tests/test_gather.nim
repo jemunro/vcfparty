@@ -33,7 +33,7 @@ if paramCount() >= 1:
   else: discard
 
 # ---------------------------------------------------------------------------
-# G1 — inferGatherFormat: all valid extensions (happy paths)
+# G1.1 — testInferAllExtensions: all valid extensions (happy paths)
 # ---------------------------------------------------------------------------
 
 block testInferAllExtensions:
@@ -76,7 +76,7 @@ block testInferAllExtensions:
   echo "PASS inferGatherFormat: all extensions (including .vcf.bgz, .bgz, unknown)"
 
 # ---------------------------------------------------------------------------
-# G1 — inferGatherFormat: fmtOverride overrides format, compression from extension
+# G1.2 — testInferWithOverride: fmtOverride overrides format, compression from extension
 # ---------------------------------------------------------------------------
 
 block testInferWithOverride:
@@ -97,7 +97,7 @@ block testInferWithOverride:
   echo "PASS inferGatherFormat: fmtOverride overrides format, compression from extension"
 
 # ---------------------------------------------------------------------------
-# G1 — validateGatherConfig: non-conflicting configs pass
+# G1.3 — testValidateConfigOk: non-conflicting configs pass
 # ---------------------------------------------------------------------------
 
 block testValidateConfigOk:
@@ -107,7 +107,7 @@ block testValidateConfigOk:
   echo "PASS validateGatherConfig: non-conflicting configs pass"
 
 # ---------------------------------------------------------------------------
-# G1 — exit-1 paths via subprocess
+# G1 — exit-1 paths via subprocess (G1.4–G1.7)
 # ---------------------------------------------------------------------------
 
 const SelfSrc   = "tests/test_gather.nim"
@@ -119,28 +119,44 @@ block buildHelper:
   doAssert code == 0, "failed to compile test helper:\n" & outp
   echo "PASS buildHelper: compiled exit-1 test helper"
 
+# ---------------------------------------------------------------------------
+# G1.4 — testInferBadOverride: invalid fmtOverride exits 1
+# ---------------------------------------------------------------------------
+
 block testInferBadOverride:
   let (_, code) = execCmdEx(HelperBin & " --exit-test-bad-override 2>/dev/null")
   doAssert code != 0, "invalid fmtOverride should exit non-zero"
-  echo "PASS inferGatherFormat: invalid fmtOverride exits 1"
+  echo "PASS G1.4 inferGatherFormat: invalid fmtOverride exits 1"
+
+# ---------------------------------------------------------------------------
+# G1.5 — testMutualExclusion: --header-pattern + --header-n exits 1
+# ---------------------------------------------------------------------------
 
 block testMutualExclusion:
   let (_, code) = execCmdEx(HelperBin & " --exit-test-mutual-exclusion 2>/dev/null")
   doAssert code != 0, "--header-pattern + --header-n should exit non-zero"
-  echo "PASS validateGatherConfig: --header-pattern + --header-n exits 1"
+  echo "PASS G1.5 validateGatherConfig: --header-pattern + --header-n exits 1"
+
+# ---------------------------------------------------------------------------
+# G1.6 — testVcfHeaderFlagRejected: --header-pattern rejected for VCF format
+# ---------------------------------------------------------------------------
 
 block testVcfHeaderFlagRejected:
   let (_, code) = execCmdEx(HelperBin & " --exit-test-vcf-header-flag 2>/dev/null")
   doAssert code != 0, "--header-pattern with VCF should exit non-zero"
-  echo "PASS validateGatherConfig: --header-pattern rejected for VCF format"
+  echo "PASS G1.6 validateGatherConfig: --header-pattern rejected for VCF format"
+
+# ---------------------------------------------------------------------------
+# G1.7 — testBcfHeaderFlagRejected: --header-n rejected for BCF format
+# ---------------------------------------------------------------------------
 
 block testBcfHeaderFlagRejected:
   let (_, code) = execCmdEx(HelperBin & " --exit-test-bcf-header-flag 2>/dev/null")
   doAssert code != 0, "--header-n with BCF should exit non-zero"
-  echo "PASS validateGatherConfig: --header-n rejected for BCF format"
+  echo "PASS G1.7 validateGatherConfig: --header-n rejected for BCF format"
 
 # ---------------------------------------------------------------------------
-# G2 — isBgzfStream
+# G2.1 — testIsBgzfStream: BGZF magic detected; plain gzip and random bytes rejected
 # ---------------------------------------------------------------------------
 
 block testIsBgzfStream:
@@ -163,7 +179,7 @@ block testIsBgzfStream:
   echo "PASS isBgzfStream"
 
 # ---------------------------------------------------------------------------
-# G2 — sniffFormat (uncompressed bytes)
+# G2.2 — testSniffFormat: BCF/VCF/text detected from uncompressed bytes
 # ---------------------------------------------------------------------------
 
 block testSniffFormat:
@@ -193,7 +209,11 @@ block testSniffFormat:
   echo "PASS sniffFormat"
 
 # ---------------------------------------------------------------------------
-# G2 — sniffStreamFormat with real fixture files
+# G2.3–G2.7 — testSniffStreamFormat*: fixture files and synthetic streams detected correctly
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# G2.3 — testSniffStreamFormatBcf: small.bcf detected as BCF/BGZF
 # ---------------------------------------------------------------------------
 
 block testSniffStreamFormatBcf:
@@ -208,6 +228,10 @@ block testSniffStreamFormatBcf:
   doAssert isBgzf,         "small.bcf: expected BGZF stream"
   echo "PASS sniffStreamFormat: small.bcf detected as BCF/BGZF"
 
+# ---------------------------------------------------------------------------
+# G2.4 — testSniffStreamFormatVcf: small.vcf.gz detected as VCF/BGZF
+# ---------------------------------------------------------------------------
+
 block testSniffStreamFormatVcf:
   doAssert fileExists(SmallVcf), "VCF fixture missing — run generate_fixtures.sh"
   let f = open(SmallVcf, fmRead)
@@ -220,6 +244,10 @@ block testSniffStreamFormatVcf:
   doAssert isBgzf,         "small.vcf.gz: expected BGZF stream"
   echo "PASS sniffStreamFormat: small.vcf.gz detected as VCF/BGZF"
 
+# ---------------------------------------------------------------------------
+# G2.5 — testSniffStreamFormatText: plain uncompressed text detected as text/uncompressed
+# ---------------------------------------------------------------------------
+
 block testSniffStreamFormatText:
   # Uncompressed text (no BGZF magic, no BCF/VCF magic).
   var raw: seq[byte]
@@ -230,6 +258,10 @@ block testSniffStreamFormatText:
   doAssert not isBgzf,    "plain text: should not be BGZF"
   echo "PASS sniffStreamFormat: plain text detected as text/uncompressed"
 
+# ---------------------------------------------------------------------------
+# G2.6 — testSniffStreamFormatUncompressedVcf: uncompressed VCF detected as VCF/uncompressed
+# ---------------------------------------------------------------------------
+
 block testSniffStreamFormatUncompressedVcf:
   # Uncompressed VCF (##fileformat header but no BGZF wrapper).
   var raw: seq[byte]
@@ -239,6 +271,10 @@ block testSniffStreamFormatUncompressedVcf:
   doAssert fmt == gfVcf,  &"uncompressed VCF: expected gfVcf, got {fmt}"
   doAssert not isBgzf,    "uncompressed VCF: should not be BGZF"
   echo "PASS sniffStreamFormat: uncompressed VCF detected as VCF/uncompressed"
+
+# ---------------------------------------------------------------------------
+# G2.7 — testSniffStreamFormatCompressedText: BGZF-compressed text detected as text/BGZF
+# ---------------------------------------------------------------------------
 
 block testSniffStreamFormatCompressedText:
   # BGZF-compressed plain text.
@@ -252,94 +288,7 @@ block testSniffStreamFormatCompressedText:
   echo "PASS sniffStreamFormat: BGZF-compressed text detected as text/BGZF"
 
 # ---------------------------------------------------------------------------
-# G3 — stripBcfHeader
-# ---------------------------------------------------------------------------
-
-block testStripBcfHeader:
-  # Build minimal fake uncompressed BCF: magic(5) + l_text(4) + header + records.
-  let hdrText = "##BCF fake header\n"
-  let lText = hdrText.len.uint32
-  var bcfData: seq[byte]
-  bcfData.add([byte('B'), byte('C'), byte('F'), 0x02'u8, 0x02'u8])
-  bcfData.add([byte(lText and 0xff), byte((lText shr 8) and 0xff),
-               byte((lText shr 16) and 0xff), byte((lText shr 24) and 0xff)])
-  for c in hdrText: bcfData.add(byte(c))
-  let recordBytes = @[0x01'u8, 0x02, 0x03, 0x04, 0x05]
-  bcfData.add(recordBytes)
-
-  let got = stripBcfHeader(bcfData)
-  doAssert got == recordBytes, &"BCF strip: expected records only, got {got}"
-
-  # Too short to hold l_text.
-  doAssert stripBcfHeader(@[0x42'u8, 0x43, 0x46]) == @[],
-    "short buffer: expected @[]"
-
-  # Exactly the header, no record bytes.
-  let hdrOnly = bcfData[0 ..< bcfData.len - recordBytes.len]
-  doAssert stripBcfHeader(hdrOnly) == @[], "header-only: expected @[]"
-
-  echo "PASS stripBcfHeader"
-
-# ---------------------------------------------------------------------------
-# G3 — stripLinesByPattern
-# ---------------------------------------------------------------------------
-
-block testStripLinesByPattern:
-  var data: seq[byte]
-  for c in "##header1\n##header2\nrecord1\nrecord2\n":
-    data.add(byte(c))
-
-  var expected: seq[byte]
-  for c in "record1\nrecord2\n": expected.add(byte(c))
-  doAssert stripLinesByPattern(data, "##") == expected,
-    "## strip: unexpected result"
-
-  # No matching lines → unchanged.
-  doAssert stripLinesByPattern(data, "XX") == data,
-    "no-match pattern: should return unchanged"
-
-  # Empty pattern → strips nothing.
-  doAssert stripLinesByPattern(data, "") == data,
-    "empty pattern: should return unchanged"
-
-  # Single-char pattern.
-  var d2: seq[byte]
-  for c in "#h1\n#h2\ndata\n": d2.add(byte(c))
-  var e2: seq[byte]
-  for c in "data\n": e2.add(byte(c))
-  doAssert stripLinesByPattern(d2, "#") == e2, "single-char strip: unexpected result"
-
-  echo "PASS stripLinesByPattern"
-
-# ---------------------------------------------------------------------------
-# G3 — stripFirstNLines
-# ---------------------------------------------------------------------------
-
-block testStripFirstNLines:
-  var data: seq[byte]
-  for c in "line1\nline2\nline3\nline4\n": data.add(byte(c))
-
-  var e2: seq[byte]
-  for c in "line3\nline4\n": e2.add(byte(c))
-  doAssert stripFirstNLines(data, 2) == e2, "strip 2: unexpected result"
-
-  # Strip 0 → unchanged.
-  doAssert stripFirstNLines(data, 0) == data, "strip 0: should return unchanged"
-
-  # Strip more than available → empty.
-  doAssert stripFirstNLines(data, 10) == @[], "strip all: should return @[]"
-
-  # Partial last line (no trailing newline).
-  var d2: seq[byte]
-  for c in "hdr\ndata": d2.add(byte(c))
-  var e3: seq[byte]
-  for c in "data": e3.add(byte(c))
-  doAssert stripFirstNLines(d2, 1) == e3, "partial last line: unexpected result"
-
-  echo "PASS stripFirstNLines"
-
-# ---------------------------------------------------------------------------
-# G3 — findBcfHeaderEnd
+# G3.1 — testFindBcfHeaderEnd: offset past magic+l_text+header text returned correctly
 # ---------------------------------------------------------------------------
 
 block testFindBcfHeaderEnd:
@@ -367,10 +316,10 @@ block testFindBcfHeaderEnd:
   doAssert findBcfHeaderEnd(buf2) == expected,
     "header + records: expected same headerEnd"
 
-  echo "PASS findBcfHeaderEnd"
+  echo "PASS G3.1 findBcfHeaderEnd"
 
 # ---------------------------------------------------------------------------
-# G3 — findVcfHeaderEnd
+# G3.2 — testFindVcfHeaderEnd: data start offset returned; all-hash returns -1
 # ---------------------------------------------------------------------------
 
 block testFindVcfHeaderEnd:
@@ -403,10 +352,97 @@ block testFindVcfHeaderEnd:
   doAssert findVcfHeaderEnd(midData) == midDataStart,
     &"mid-data-line: expected {midDataStart}, got {findVcfHeaderEnd(midData)}"
 
-  echo "PASS findVcfHeaderEnd"
+  echo "PASS G3.2 findVcfHeaderEnd"
 
 # ---------------------------------------------------------------------------
-# G3 — runInterceptor: BCF header stripping via pipe
+# G3.3 — testStripBcfHeader: record bytes returned after stripping magic+l_text+header
+# ---------------------------------------------------------------------------
+
+block testStripBcfHeader:
+  # Build minimal fake uncompressed BCF: magic(5) + l_text(4) + header + records.
+  let hdrText = "##BCF fake header\n"
+  let lText = hdrText.len.uint32
+  var bcfData: seq[byte]
+  bcfData.add([byte('B'), byte('C'), byte('F'), 0x02'u8, 0x02'u8])
+  bcfData.add([byte(lText and 0xff), byte((lText shr 8) and 0xff),
+               byte((lText shr 16) and 0xff), byte((lText shr 24) and 0xff)])
+  for c in hdrText: bcfData.add(byte(c))
+  let recordBytes = @[0x01'u8, 0x02, 0x03, 0x04, 0x05]
+  bcfData.add(recordBytes)
+
+  let got = stripBcfHeader(bcfData)
+  doAssert got == recordBytes, &"BCF strip: expected records only, got {got}"
+
+  # Too short to hold l_text.
+  doAssert stripBcfHeader(@[0x42'u8, 0x43, 0x46]) == @[],
+    "short buffer: expected @[]"
+
+  # Exactly the header, no record bytes.
+  let hdrOnly = bcfData[0 ..< bcfData.len - recordBytes.len]
+  doAssert stripBcfHeader(hdrOnly) == @[], "header-only: expected @[]"
+
+  echo "PASS G3.3 stripBcfHeader"
+
+# ---------------------------------------------------------------------------
+# G3.4 — testStripLinesByPattern: leading lines matching prefix removed; no-match unchanged
+# ---------------------------------------------------------------------------
+
+block testStripLinesByPattern:
+  var data: seq[byte]
+  for c in "##header1\n##header2\nrecord1\nrecord2\n":
+    data.add(byte(c))
+
+  var expected: seq[byte]
+  for c in "record1\nrecord2\n": expected.add(byte(c))
+  doAssert stripLinesByPattern(data, "##") == expected,
+    "## strip: unexpected result"
+
+  # No matching lines → unchanged.
+  doAssert stripLinesByPattern(data, "XX") == data,
+    "no-match pattern: should return unchanged"
+
+  # Empty pattern → strips nothing.
+  doAssert stripLinesByPattern(data, "") == data,
+    "empty pattern: should return unchanged"
+
+  # Single-char pattern.
+  var d2: seq[byte]
+  for c in "#h1\n#h2\ndata\n": d2.add(byte(c))
+  var e2: seq[byte]
+  for c in "data\n": e2.add(byte(c))
+  doAssert stripLinesByPattern(d2, "#") == e2, "single-char strip: unexpected result"
+
+  echo "PASS G3.4 stripLinesByPattern"
+
+# ---------------------------------------------------------------------------
+# G3.5 — testStripFirstNLines: first N lines removed; strip 0 unchanged; strip > total empty
+# ---------------------------------------------------------------------------
+
+block testStripFirstNLines:
+  var data: seq[byte]
+  for c in "line1\nline2\nline3\nline4\n": data.add(byte(c))
+
+  var e2: seq[byte]
+  for c in "line3\nline4\n": e2.add(byte(c))
+  doAssert stripFirstNLines(data, 2) == e2, "strip 2: unexpected result"
+
+  # Strip 0 → unchanged.
+  doAssert stripFirstNLines(data, 0) == data, "strip 0: should return unchanged"
+
+  # Strip more than available → empty.
+  doAssert stripFirstNLines(data, 10) == @[], "strip all: should return @[]"
+
+  # Partial last line (no trailing newline).
+  var d2: seq[byte]
+  for c in "hdr\ndata": d2.add(byte(c))
+  var e3: seq[byte]
+  for c in "data": e3.add(byte(c))
+  doAssert stripFirstNLines(d2, 1) == e3, "partial last line: unexpected result"
+
+  echo "PASS G3.5 stripFirstNLines"
+
+# ---------------------------------------------------------------------------
+# G3.6 — testRunInterceptorBcfStrip: BCF header stripped via pipe (shard 1)
 # ---------------------------------------------------------------------------
 
 block testRunInterceptorBcfStrip:
@@ -446,7 +482,7 @@ block testRunInterceptorBcfStrip:
   echo "PASS runInterceptor BCF header stripping"
 
 # ---------------------------------------------------------------------------
-# G3 — runInterceptor: VCF header stripping via pipe
+# G3.7 — testRunInterceptorVcfStrip: VCF header stripped via pipe (shard 1)
 # ---------------------------------------------------------------------------
 
 block testRunInterceptorVcfStrip:
@@ -486,7 +522,7 @@ block testRunInterceptorVcfStrip:
   echo "PASS runInterceptor VCF header stripping (automatic)"
 
 # ---------------------------------------------------------------------------
-# G3 — runInterceptor: --header-n stripping via pipe
+# G3.8 — testRunInterceptorHeaderN: --header-n strips first N lines via pipe (shard 1)
 # ---------------------------------------------------------------------------
 
 block testRunInterceptorHeaderN:
@@ -520,7 +556,7 @@ block testRunInterceptorHeaderN:
   echo "PASS runInterceptor text header stripping (--header-n)"
 
 # ---------------------------------------------------------------------------
-# G3 — runInterceptor: no-stripping pass-through via pipe
+# G3.9 — testRunInterceptorNoStrip: text with no flags passes through unchanged (shard 1)
 # ---------------------------------------------------------------------------
 
 block testRunInterceptorNoStrip:
@@ -552,7 +588,7 @@ block testRunInterceptorNoStrip:
   echo "PASS runInterceptor no-strip pass-through (text format, no flags)"
 
 # ---------------------------------------------------------------------------
-# G4 — recompression: uncompressed → BGZF (shard 0)
+# G4.1 — testRecompressUncompressedToBgzf: uncompressed → BGZF via runInterceptor (shard 0)
 # ---------------------------------------------------------------------------
 
 block testRecompressUncompressedToBgzf:
@@ -581,7 +617,7 @@ block testRecompressUncompressedToBgzf:
   echo "PASS runInterceptor recompress uncompressed → BGZF"
 
 # ---------------------------------------------------------------------------
-# G4 — recompression: BGZF → uncompressed (shard 0)
+# G4.2 — testDecompressBgzfToUncompressed: BGZF → uncompressed via runInterceptor (shard 0)
 # ---------------------------------------------------------------------------
 
 block testDecompressBgzfToUncompressed:
@@ -610,7 +646,7 @@ block testDecompressBgzfToUncompressed:
   echo "PASS runInterceptor decompress BGZF → uncompressed"
 
 # ---------------------------------------------------------------------------
-# G4 — recompression: BGZF → BGZF pass-through (shard 0)
+# G4.3 — testPassThroughBgzfToBgzf: BGZF → BGZF pass-through via runInterceptor (shard 0)
 # ---------------------------------------------------------------------------
 
 block testPassThroughBgzfToBgzf:
@@ -639,7 +675,7 @@ block testPassThroughBgzfToBgzf:
   echo "PASS runInterceptor pass-through BGZF → BGZF"
 
 # ---------------------------------------------------------------------------
-# G4 — recompression: uncompressed shard 1 stripped + recompressed to BGZF
+# G4.4 — testShardStripAndRecompress: uncompressed VCF shard 1 stripped + recompressed to BGZF
 # ---------------------------------------------------------------------------
 
 block testShardStripAndRecompress:
@@ -678,7 +714,7 @@ block testShardStripAndRecompress:
   echo "PASS runInterceptor shard strip (uncompressed) + BGZF recompression"
 
 # ---------------------------------------------------------------------------
-# G4 — recompression: BGZF shard 1 stripped + recompressed to BGZF
+# G4.5 — testShardBgzfInputStripAndRecompress: BGZF VCF shard 1 stripped + recompressed to BGZF
 # ---------------------------------------------------------------------------
 
 block testShardBgzfInputStripAndRecompress:
@@ -718,7 +754,7 @@ block testShardBgzfInputStripAndRecompress:
   echo "PASS runInterceptor shard strip (BGZF input) + BGZF recompression"
 
 # ---------------------------------------------------------------------------
-# G5 — cleanupTempDir: success path
+# G5.1 — testCleanupSuccess: success path — temp files and dir deleted
 # ---------------------------------------------------------------------------
 
 block testCleanupSuccess:
@@ -737,7 +773,7 @@ block testCleanupSuccess:
   echo "PASS cleanupTempDir success: files and dir deleted"
 
 # ---------------------------------------------------------------------------
-# G5 — cleanupTempDir: failure path
+# G5.2 — testCleanupFailure: failure path — temp files preserved on disk
 # ---------------------------------------------------------------------------
 
 block testCleanupFailure:
@@ -755,7 +791,7 @@ block testCleanupFailure:
   echo "PASS cleanupTempDir failure: files preserved on disk"
 
 # ---------------------------------------------------------------------------
-# G5 — concatenateShards: uncompressed
+# G5.3 — testConcatShardsUncompressed: two uncompressed shards concatenated, tmpDir cleaned
 # ---------------------------------------------------------------------------
 
 block testConcatShardsUncompressed:
@@ -780,7 +816,7 @@ block testConcatShardsUncompressed:
   echo "PASS concatenateShards uncompressed"
 
 # ---------------------------------------------------------------------------
-# G5 — concatenateShards: BGZF (with EOF block)
+# G5.4 — testConcatShardsBgzf: BGZF shards concatenated, single EOF block appended, tmpDir cleaned
 # ---------------------------------------------------------------------------
 
 block testConcatShardsBgzf:
@@ -883,7 +919,7 @@ block testGatherVcfCompressed:
   doAssert recordsHash(outPath) == recordsHash(SmallVcf),
     "VCF gather -Oz: content hash mismatch"
   removeDir(tmpDir)
-  echo &"PASS G7 VCF gather -Oz: {got} records, content hash matches"
+  echo &"PASS G7.1 VCF gather -Oz: {got} records, content hash matches"
 
 # ---------------------------------------------------------------------------
 # G7.2 — VCF gather, uncompressed pipeline (-Ov) → .vcf.gz (recompression)
@@ -903,7 +939,7 @@ block testGatherVcfRecompress:
   doAssert recordsHash(outPath) == recordsHash(SmallVcf),
     "VCF gather -Ov: content hash mismatch (recompression corrupted data)"
   removeDir(tmpDir)
-  echo &"PASS G7 VCF gather -Ov (recompress uncompressed→BGZF): {got} records, hash matches"
+  echo &"PASS G7.2 VCF gather -Ov (recompress uncompressed→BGZF): {got} records, hash matches"
 
 # ---------------------------------------------------------------------------
 # G7.3 — BCF gather, compressed pipeline (-Ob) → .bcf
@@ -923,7 +959,7 @@ block testGatherBcfCompressed:
   doAssert recordsHash(outPath) == recordsHash(SmallBcf),
     "BCF gather -Ob: content hash mismatch"
   removeDir(tmpDir)
-  echo &"PASS G7 BCF gather -Ob: {got} records, content hash matches"
+  echo &"PASS G7.3 BCF gather -Ob: {got} records, content hash matches"
 
 # ---------------------------------------------------------------------------
 # G7.4 — BCF gather, uncompressed pipeline (-Ou) → .bcf (recompression)
@@ -943,7 +979,7 @@ block testGatherBcfRecompress:
   doAssert recordsHash(outPath) == recordsHash(SmallBcf),
     "BCF gather -Ou: content hash mismatch (recompression corrupted data)"
   removeDir(tmpDir)
-  echo &"PASS G7 BCF gather -Ou (recompress uncompressed→BGZF): {got} records, hash matches"
+  echo &"PASS G7.4 BCF gather -Ou (recompress uncompressed→BGZF): {got} records, hash matches"
 
 # ---------------------------------------------------------------------------
 # G7.5 — Text gather (bcftools query) → .txt, no stripping
@@ -963,7 +999,7 @@ block testGatherText:
   doAssert lineCount == orig,
     &"text gather: expected {orig} lines, got {lineCount}"
   removeDir(tmpDir)
-  echo &"PASS G7 text gather → .txt: {lineCount} lines, matches record count"
+  echo &"PASS G7.5 text gather → .txt: {lineCount} lines, matches record count"
 
 # ---------------------------------------------------------------------------
 # G7.6 — Text gather with --header-n 1: first line of shards 2..N stripped
@@ -991,7 +1027,7 @@ block testGatherTextHeaderN:
   doAssert firstLine.strip == "CHROM\tPOS",
     &"text gather --header-n 1: first line should be header, got: {firstLine.strip}"
   removeDir(tmpDir)
-  echo &"PASS G7 text gather --header-n 1: {lineCount} lines (1 header + {orig} data)"
+  echo &"PASS G7.6 text gather --header-n 1: {lineCount} lines (1 header + {orig} data)"
 
 # ---------------------------------------------------------------------------
 # G7.7 — Unknown-extension gather: .out.gz → inferred as text + BGZF
@@ -1022,7 +1058,7 @@ block testGatherUnknownExt:
   doAssert lineCount == orig,
     &"unknown-ext gather: expected {orig} lines, got {lineCount}"
   removeDir(tmpDir)
-  echo &"PASS G7 unknown-ext (.out.gz) text gather: {lineCount} lines, valid BGZF"
+  echo &"PASS G7.7 unknown-ext (.out.gz) text gather: {lineCount} lines, valid BGZF"
 
 # ---------------------------------------------------------------------------
 # G7.8 — Shard failure: temp files left on disk, exit 1, paths in stderr
@@ -1044,7 +1080,7 @@ block testGatherShardFailure:
   # Cleanup.
   removeDir(tmpDir)
   removeDir(tDir)
-  echo "PASS G7 shard failure: exit non-zero, temp paths printed, files preserved"
+  echo "PASS G7.8 shard failure: exit non-zero, temp paths printed, files preserved"
 
 # ---------------------------------------------------------------------------
 # G7.9 — --tmp-dir custom path
@@ -1066,7 +1102,35 @@ block testGatherCustomTmpDir:
   let orig = countRecords(SmallVcf)
   doAssert got == orig, &"--tmp-dir: record count {got} != {orig}"
   removeDir(tmpDir)
-  echo &"PASS G7 --tmp-dir custom path: {got} records, tmp dir cleaned up"
+  echo &"PASS G7.9 --tmp-dir custom path: {got} records, tmp dir cleaned up"
+
+# ---------------------------------------------------------------------------
+# G7.10 — testGatherTextHeaderPattern: --header-pattern strips matching lines from shards 2..N
+# ---------------------------------------------------------------------------
+
+block testGatherTextHeaderPattern:
+  # Pipeline prepends a "##"-prefixed header line to each shard's output.
+  # With --header-pattern "##", shards 2..4 should have that line stripped.
+  # Result: 1 header line + 5000 data lines = 5001 lines total.
+  let tmpDir = getTempDir() / "paravar_g7_text_headerpattern"
+  createDir(tmpDir)
+  let outPath = tmpDir / "out.txt"
+  let pipeline = "{ echo '##CHROM\tPOS'; bcftools query -f '%CHROM\\t%POS\\n'; }"
+  let (outp, code) = runGather(
+    &"-n 4 --gather -o {outPath} --header-pattern \"##\" {SmallVcf} --- sh -c {quoteShell(pipeline)}")
+  doAssert code == 0, &"text gather --header-pattern exited {code}:\n{outp}"
+  doAssert fileExists(outPath), "text gather --header-pattern: output missing"
+  let (lineOut, _) = execCmdEx("wc -l < " & outPath)
+  let lineCount = lineOut.strip.parseInt
+  let orig = countRecords(SmallVcf)
+  # 1 header from shard 0 + orig data lines from all shards
+  doAssert lineCount == orig + 1,
+    &"text gather --header-pattern: expected {orig + 1} lines, got {lineCount}"
+  let (firstLine, _) = execCmdEx("head -1 " & outPath)
+  doAssert firstLine.strip == "##CHROM\tPOS",
+    &"text gather --header-pattern: first line should be header, got: {firstLine.strip}"
+  removeDir(tmpDir)
+  echo &"PASS G7.10 text gather --header-pattern: {lineCount} lines (1 header + {orig} data)"
 
 echo ""
 echo "All gather G7 integration tests passed."

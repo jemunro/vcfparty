@@ -19,9 +19,12 @@ proc readMagic(path: string; offset: int64): array[3, byte] =
   discard readBytes(f, result, 0, 3)
 
 # ===========================================================================
-# Step 3 — Index parsing: TBI
+# SC1–SC4 — Index parsing: TBI and CSI
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# SC1 — testParseTbi: offsets non-empty, strictly increasing, valid BGZF magic
+# ---------------------------------------------------------------------------
 block testParseTbi:
   let starts = parseTbiBlockStarts(SmallVcf & ".tbi")
   doAssert starts.len > 0, "parseTbiBlockStarts: no blocks"
@@ -33,6 +36,9 @@ block testParseTbi:
       &"bad BGZF magic at offset {off}"
   echo &"PASS parseTbiBlockStarts ({starts.len} blocks)"
 
+# ---------------------------------------------------------------------------
+# SC2 — testReadIndexBlockStartsTbi: readIndexBlockStarts falls back to TBI
+# ---------------------------------------------------------------------------
 block testReadIndexBlockStartsTbi:
   let starts = readIndexBlockStarts(SmallVcf)
   doAssert starts.len > 0, "readIndexBlockStarts (TBI): no blocks"
@@ -40,10 +46,9 @@ block testReadIndexBlockStartsTbi:
     doAssert starts[i] > starts[i-1], "readIndexBlockStarts (TBI): not sorted"
   echo &"PASS readIndexBlockStarts via TBI ({starts.len} blocks)"
 
-# ===========================================================================
-# Step 3 — Index parsing: CSI
-# ===========================================================================
-
+# ---------------------------------------------------------------------------
+# SC3 — testParseCsi: CSI-only fixture; offsets valid and strictly increasing
+# ---------------------------------------------------------------------------
 block testParseCsi:
   doAssert fileExists(CsiVcf & ".csi"), "CSI fixture missing — run generate_fixtures.sh"
   doAssert not fileExists(CsiVcf & ".tbi"), "CSI fixture must not have a .tbi alongside it"
@@ -57,6 +62,9 @@ block testParseCsi:
       &"bad BGZF magic at offset {off}"
   echo &"PASS parseCsiBlockStarts ({starts.len} blocks)"
 
+# ---------------------------------------------------------------------------
+# SC4 — testReadIndexBlockStartsCsi: readIndexBlockStarts falls through to CSI
+# ---------------------------------------------------------------------------
 block testReadIndexBlockStartsCsi:
   let starts = readIndexBlockStarts(CsiVcf)   # must fall through to .csi
   doAssert starts.len > 0, "readIndexBlockStarts (CSI): no blocks"
@@ -65,9 +73,12 @@ block testReadIndexBlockStartsCsi:
   echo &"PASS readIndexBlockStarts via CSI ({starts.len} blocks)"
 
 # ===========================================================================
-# Step 4 — Header extraction
+# SC5–SC10 — Boundary computation: header extraction, lengths, partition, validation
 # ===========================================================================
 
+# ---------------------------------------------------------------------------
+# SC5 — testGetHeaderAndFirstBlock: header is valid BGZF, starts with '#'; firstBlock has BGZF magic
+# ---------------------------------------------------------------------------
 block testGetHeaderAndFirstBlock:
   let (hdrBytes, firstBlock) = getHeaderAndFirstBlock(SmallVcf)
   # Compressed header must be a valid BGZF block
@@ -84,10 +95,9 @@ block testGetHeaderAndFirstBlock:
     &"getHeaderAndFirstBlock: firstBlock {firstBlock} has bad BGZF magic"
   echo &"PASS getHeaderAndFirstBlock (firstBlock={firstBlock})"
 
-# ===========================================================================
-# Step 4 — getLengths / partitionBoundaries
-# ===========================================================================
-
+# ---------------------------------------------------------------------------
+# SC6 — testGetLengths: converts block starts to cumulative lengths correctly
+# ---------------------------------------------------------------------------
 block testGetLengths:
   let starts: seq[int64] = @[0'i64, 100, 300, 700]
   let lengths = getLengths(starts, 1000)
@@ -95,6 +105,9 @@ block testGetLengths:
     &"getLengths: expected [100,200,400,300] got {lengths}"
   echo "PASS getLengths"
 
+# ---------------------------------------------------------------------------
+# SC7 — testPartitionBoundaries2: 4 equal blocks → 2 shards → 1 boundary at index 1
+# ---------------------------------------------------------------------------
 block testPartitionBoundaries2:
   # 4 equal blocks → split into 2 shards → boundary at index 1 (bisect_left on cumsum)
   let lengths: seq[int64] = @[100'i64, 100, 100, 100]
@@ -103,6 +116,9 @@ block testPartitionBoundaries2:
   doAssert bounds[0] == 1, &"partitionBoundaries 2: expected index 1, got {bounds[0]}"
   echo "PASS partitionBoundaries (2 shards)"
 
+# ---------------------------------------------------------------------------
+# SC8 — testPartitionBoundaries4: 8 equal blocks → 4 shards → boundaries [1,3,5]
+# ---------------------------------------------------------------------------
 block testPartitionBoundaries4:
   # 8 equal blocks → 4 shards → boundaries at 1, 3, 5 (bisect_left on cumsum)
   let lengths: seq[int64] = @[100'i64, 100, 100, 100, 100, 100, 100, 100]
@@ -111,10 +127,9 @@ block testPartitionBoundaries4:
   doAssert bounds == @[1, 3, 5], &"partitionBoundaries 4: expected [1,3,5] got {bounds}"
   echo "PASS partitionBoundaries (4 shards)"
 
-# ===========================================================================
-# Step 4 — isValidBoundary
-# ===========================================================================
-
+# ---------------------------------------------------------------------------
+# SC9 — testIsValidBoundary: every non-EOF data block in small.vcf.gz is a valid boundary
+# ---------------------------------------------------------------------------
 block testIsValidBoundary:
   # Every non-EOF data block in small.vcf.gz should be valid (contains >= 2 lines).
   let allStarts = scanBgzfBlockStarts(SmallVcf)
@@ -135,10 +150,9 @@ block testIsValidBoundary:
   doAssert validCount > 0, "isValidBoundary: no valid blocks found"
   echo &"PASS isValidBoundary ({validCount} valid blocks)"
 
-# ===========================================================================
-# Step 4 — optimiseBoundaries end-to-end
-# ===========================================================================
-
+# ---------------------------------------------------------------------------
+# SC10 — testOptimiseBoundaries4: 4 shards; all boundaries valid; all lengths > 0
+# ---------------------------------------------------------------------------
 block testOptimiseBoundaries4:
   var starts = readIndexBlockStarts(SmallVcf)
   let (_, firstBlock) = getHeaderAndFirstBlock(SmallVcf)
@@ -161,7 +175,7 @@ block testOptimiseBoundaries4:
   echo &"PASS optimiseBoundaries 4-shard ({finalStarts.len} fine blocks)"
 
 # ===========================================================================
-# Step 5 — scatter end-to-end helpers
+# SC11–SC15 — VCF scatter end-to-end (TBI, CSI, --force-scan)
 # ===========================================================================
 
 proc collectRecords(data: seq[byte]): seq[string] =
@@ -223,10 +237,9 @@ proc checkShards(vcfPath: string; tmpl: string; n: int) =
   doAssert sorted(shardRecords) == sorted(origRecords),
     "shard records do not match original"
 
-# ===========================================================================
-# Step 5 — scatter: TBI-indexed input
-# ===========================================================================
-
+# ---------------------------------------------------------------------------
+# SC11 — testScanAllBlockStarts: scanAllBlockStarts returns non-empty, increasing, valid BGZF offsets
+# ---------------------------------------------------------------------------
 block testScanAllBlockStarts:
   let (_, firstBlock) = getHeaderAndFirstBlock(SmallVcf)
   let starts = scanAllBlockStarts(SmallVcf, firstBlock)
@@ -239,6 +252,9 @@ block testScanAllBlockStarts:
     doAssert starts[i] > starts[i-1], "scanAllBlockStarts: not strictly increasing"
   echo &"PASS scanAllBlockStarts ({starts.len} data blocks, firstBlock={firstBlock})"
 
+# ---------------------------------------------------------------------------
+# SC12 — testScatter4ShardsTbi: 4 shards (TBI); BGZF structure, completeness, order, size balance
+# ---------------------------------------------------------------------------
 block testScatter4ShardsTbi:
   let tmpDir = getTempDir() / "paravar_scatter_tbi_test"
   createDir(tmpDir)
@@ -257,10 +273,9 @@ block testScatter4ShardsTbi:
   echo "PASS scatter TBI: BGZF structure, header, completeness, order, balance"
   removeDir(tmpDir)
 
-# ===========================================================================
-# Step 5 — scatter: CSI-indexed input
-# ===========================================================================
-
+# ---------------------------------------------------------------------------
+# SC13 — testVcfScatter1Shard: 1 shard equals original (BGZF, header, completeness)
+# ---------------------------------------------------------------------------
 block testVcfScatter1Shard:
   ## 1 shard must equal the original (record set and order).
   let tmpDir = getTempDir() / "paravar_scatter_vcf_1shard_test"
@@ -271,6 +286,9 @@ block testVcfScatter1Shard:
   echo "PASS VCF scatter 1 shard: BGZF structure, header, completeness"
   removeDir(tmpDir)
 
+# ---------------------------------------------------------------------------
+# SC14 — testScatterForceScan: forceScan=true ignores index; result matches indexed scatter
+# ---------------------------------------------------------------------------
 block testScatterForceScan:
   ## scatter with forceScan=true on a fully indexed file — index is ignored.
   let tmpDir = getTempDir() / "paravar_scatter_forcescan_test"
@@ -281,6 +299,9 @@ block testScatterForceScan:
   echo "PASS scatter --force-scan: BGZF structure, header, completeness, order"
   removeDir(tmpDir)
 
+# ---------------------------------------------------------------------------
+# SC15 — testScatter4ShardsCsi: 4 shards (CSI); BGZF structure, completeness, order
+# ---------------------------------------------------------------------------
 block testScatter4ShardsCsi:
   doAssert fileExists(CsiVcf & ".csi"), "CSI fixture missing — run generate_fixtures.sh"
   let tmpDir = getTempDir() / "paravar_scatter_csi_test"
@@ -292,13 +313,16 @@ block testScatter4ShardsCsi:
   removeDir(tmpDir)
 
 # ===========================================================================
-# Step B3 — BCF header extraction
+# SC16–SC20 — BCF: header extraction and scatter end-to-end
 # ===========================================================================
 
 proc leU32At(data: seq[byte]; pos: int): uint32 =
   data[pos].uint32 or (data[pos+1].uint32 shl 8) or
   (data[pos+2].uint32 shl 16) or (data[pos+3].uint32 shl 24)
 
+# ---------------------------------------------------------------------------
+# SC16 — testExtractBcfHeaderSmall: BGZF magic, BCF magic, l_text > 0, total decompressed == 5+4+l_text
+# ---------------------------------------------------------------------------
 block testExtractBcfHeaderSmall:
   let hdrBytes = extractBcfHeader(SmallBcf)
   # Must be a valid BGZF block sequence
@@ -329,6 +353,9 @@ block testExtractBcfHeaderSmall:
     &"extractBcfHeader: decompressed {totalDecomp} bytes, expected {expectedSize}"
   echo &"PASS extractBcfHeader small.bcf (l_text={lText})"
 
+# ---------------------------------------------------------------------------
+# SC17 — testExtractBcfHeaderLarge: large BCF (2504 samples); multi-block header decompresses correctly
+# ---------------------------------------------------------------------------
 block testExtractBcfHeaderLarge:
   # chr22_1kg.bcf has 2504 samples — verify extractBcfHeader handles it correctly.
   doAssert fileExists(KgBcf), &"large BCF fixture missing: {KgBcf}"
@@ -357,9 +384,7 @@ block testExtractBcfHeaderLarge:
     &"extractBcfHeader large: decompressed {totalDecomp} bytes, expected {expectedSize}"
   echo &"PASS extractBcfHeader chr22_1kg.bcf (l_text={lText})"
 
-# ===========================================================================
-# Step B4 — BCF scatter end-to-end
-# ===========================================================================
+# (checkBcfShards helper follows)
 
 proc collectBcfRecordBytes(path: string): seq[seq[byte]] =
   ## Decompress BCF file, skip header, return raw bytes of each complete record.
@@ -440,6 +465,9 @@ proc checkBcfShards(bcfPath: string; tmpl: string; n: int) =
   doAssert sorted(shardRecs, cmpRecBytes) == sorted(origRecs, cmpRecBytes),
     "BCF: shard records do not match original"
 
+# ---------------------------------------------------------------------------
+# SC18 — testBcfScatter1Shard: 1 BCF shard equals original (BGZF, BCF magic, completeness)
+# ---------------------------------------------------------------------------
 block testBcfScatter1Shard:
   doAssert fileExists(SmallBcf), &"BCF fixture missing: {SmallBcf}"
   let tmpDir = getTempDir() / "paravar_bcf_1shard_test"
@@ -450,6 +478,9 @@ block testBcfScatter1Shard:
   echo "PASS BCF scatter 1 shard: BGZF, BCF magic, completeness"
   removeDir(tmpDir)
 
+# ---------------------------------------------------------------------------
+# SC19 — testBcfScatter4Shards: 4 BCF shards; BGZF, BCF magic, completeness, order, size balance
+# ---------------------------------------------------------------------------
 block testBcfScatter4Shards:
   doAssert fileExists(SmallBcf), &"BCF fixture missing: {SmallBcf}"
   let tmpDir = getTempDir() / "paravar_bcf_4shard_test"
@@ -467,6 +498,9 @@ block testBcfScatter4Shards:
   echo "PASS BCF scatter 4 shards: BGZF, BCF magic, completeness, order, balance"
   removeDir(tmpDir)
 
+# ---------------------------------------------------------------------------
+# SC20 — testBcfScatterLargeHeader: 4 BCF shards from 1KG (large header); completeness and order
+# ---------------------------------------------------------------------------
 block testBcfScatterLargeHeader:
   doAssert fileExists(KgBcf), &"large BCF fixture missing: {KgBcf}"
   let tmpDir = getTempDir() / "paravar_bcf_kg_test"

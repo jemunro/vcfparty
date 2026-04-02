@@ -34,7 +34,7 @@ proc readFileSlice(path: string; start: int64; length: int): seq[byte] =
   discard readBytes(f, result, 0, length)
 
 # ---------------------------------------------------------------------------
-# Test: scanBgzfBlockStarts
+# B1 — testScanBlockStarts: offsets valid, first=0, last block is 28-byte EOF
 # ---------------------------------------------------------------------------
 
 block testScanBlockStarts:
@@ -56,7 +56,7 @@ block testScanBlockStarts:
   echo "PASS scanBgzfBlockStarts"
 
 # ---------------------------------------------------------------------------
-# Test: scanBgzfBlockStarts with startAt / endAt
+# B2 — testScanRange: range-limited scan truncates at upper bound correctly
 # ---------------------------------------------------------------------------
 
 block testScanRange:
@@ -69,7 +69,7 @@ block testScanRange:
   echo "PASS scanBgzfBlockStarts range"
 
 # ---------------------------------------------------------------------------
-# Test: rawCopyBytes
+# B3 — testRawCopyBytes: copied bytes match source slice exactly
 # ---------------------------------------------------------------------------
 
 block testRawCopyBytes:
@@ -93,7 +93,7 @@ block testRawCopyBytes:
   echo "PASS rawCopyBytes"
 
 # ---------------------------------------------------------------------------
-# Test: compressToBgzf / decompressBgzf round-trip
+# B4 — testRoundTrip: compressToBgzf + decompressBgzf round-trips; BGZF magic + BC subfield present
 # ---------------------------------------------------------------------------
 
 block testRoundTrip:
@@ -112,7 +112,7 @@ block testRoundTrip:
   echo "PASS compressToBgzf/decompressBgzf round-trip"
 
 # ---------------------------------------------------------------------------
-# Test: round-trip with empty input
+# B5 — testRoundTripEmpty: empty input compresses and decompresses correctly
 # ---------------------------------------------------------------------------
 
 block testRoundTripEmpty:
@@ -123,7 +123,7 @@ block testRoundTripEmpty:
   echo "PASS round-trip empty"
 
 # ---------------------------------------------------------------------------
-# Test: decompressBgzf on an actual fixture block
+# B6 — testDecompressFixture: decompressBgzf on a real fixture block starts with '#'
 # ---------------------------------------------------------------------------
 
 block testDecompressFixture:
@@ -148,7 +148,7 @@ block testDecompressFixture:
   echo "PASS decompressBgzf fixture"
 
 # ---------------------------------------------------------------------------
-# Test: splitChunk — halves decompress and concatenate back to original
+# B7 — testSplitChunk: head ++ tail decompresses to original block contents
 # ---------------------------------------------------------------------------
 
 block testSplitChunk:
@@ -181,7 +181,7 @@ block testSplitChunk:
   echo "PASS splitChunk"
 
 # ---------------------------------------------------------------------------
-# Test: bcfFirstDataOffset — returns the block containing the first BCF record
+# B8 — testBcfFirstDataOffset: returned block straddles the l_text boundary
 # ---------------------------------------------------------------------------
 
 block testBcfFirstDataOffset:
@@ -224,7 +224,7 @@ block testBcfFirstDataOffset:
   echo "PASS bcfFirstDataOffset"
 
 # ---------------------------------------------------------------------------
-# Test: splitBcfBoundaryBlock — round-trip: decompressed halves reconstitute original
+# B9 — testSplitBcfBoundaryBlockRoundTrip: decompressed head ++ tail equals original
 # ---------------------------------------------------------------------------
 
 block testSplitBcfBoundaryBlockRoundTrip:
@@ -253,7 +253,7 @@ block testSplitBcfBoundaryBlockRoundTrip:
   echo "PASS splitBcfBoundaryBlock round-trip"
 
 # ---------------------------------------------------------------------------
-# Test: splitBcfBoundaryBlock — head ends on a record boundary (no mid-record split)
+# B10 — testSplitBcfBoundaryBlockMidpoint: head ends exactly on a record boundary
 # ---------------------------------------------------------------------------
 
 block testSplitBcfBoundaryBlockMidpoint:
@@ -283,7 +283,7 @@ block testSplitBcfBoundaryBlockMidpoint:
   echo "PASS splitBcfBoundaryBlock midpoint"
 
 # ---------------------------------------------------------------------------
-# Test: splitBcfBoundaryBlock — zero-record block returns (false, @[], @[])
+# B11 — testSplitBcfBoundaryBlockZeroRecords: single-record block returns (false, @[], @[])
 # ---------------------------------------------------------------------------
 
 block testSplitBcfBoundaryBlockZeroRecords:
@@ -310,7 +310,7 @@ block testSplitBcfBoundaryBlockZeroRecords:
   echo "PASS splitBcfBoundaryBlock zero-record block"
 
 # ---------------------------------------------------------------------------
-# Test: BGZF CRC32 field matches decompressed data
+# B12 — testBgzfCrc32Validation: CRC32 field in BGZF block matches computed value
 # ---------------------------------------------------------------------------
 
 block testBgzfCrc32Validation:

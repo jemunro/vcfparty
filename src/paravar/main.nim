@@ -60,14 +60,19 @@ proc scatterUsage() =
 
 proc nextVal(p: var OptParser; flag: string): string =
   ## Return the value for a flag, consuming the next argv token if the value
-  ## was not attached (i.e. '-n 4' rather than '-n4' or '-n=4').
+  ## was not attached (i.e. '-n 4' rather than '-n=4').
+  ## Also handles the -j2 style: Nim's parseopt splits -j2 into two short
+  ## options (key=j, key=2); we recover the value when the second token is
+  ## all-digit and therefore cannot be a valid flag name.
   if p.val != "":
     return p.val
   p.next()
-  if p.kind != cmdArgument:
-    stderr.writeLine "error: -" & flag & " requires a value"
-    quit(1)
-  result = p.key
+  if p.kind == cmdArgument:
+    return p.key
+  if p.kind == cmdShortOption and p.key.allCharsInSet({'0'..'9'}):
+    return p.key
+  stderr.writeLine "error: -" & flag & " requires a value"
+  quit(1)
 
 proc runScatter(rawArgs: seq[string]) =
   ## Parse scatter subcommand arguments and call scatter().

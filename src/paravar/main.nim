@@ -279,9 +279,6 @@ proc runRun(rawArgs: seq[string]) =
   if nShards < 1:
     stderr.writeLine "error: -n must be >= 1, got: " & $nShards
     quit(1)
-  if outPrefix == "" and not gatherMode:
-    stderr.writeLine "error: -o/--output is required"
-    quit(1)
   if inputFile == "":
     stderr.writeLine "error: input VCF file is required"
     quit(1)
@@ -297,8 +294,10 @@ proc runRun(rawArgs: seq[string]) =
   if not nThreadsSet:
     nThreads = min(nJobs, 8)
   let (_, stages) = parseRunArgv(rawArgs)
-  let shellCmd    = buildShellCmd(stages)
-  if gatherMode:
+  let hasBrace    = hasBracePlaceholder(stages)
+  let mode        = inferRunMode(outPrefix != "", hasBrace, gatherMode)
+  case mode
+  of rmGatherFile, rmGatherStdout, rmGatherTool:
     let isStdout = (outPrefix == "" or outPrefix == "/dev/stdout")
     let (gFmt, gComp) = inferGatherFormat(outPrefix, "")
     let resolvedTmpDir =
@@ -319,10 +318,14 @@ proc runRun(rawArgs: seq[string]) =
     if not isStdout:
       warnFormatMismatch(inputFile, outPrefix)
     runShardsGather(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs,
-                    shellCmd, noKill, cfg)
-  else:
+                    stages, noKill, cfg)
+  of rmToolManaged:
+    runShards(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs,
+              stages, noKill, toolManaged = true)
+  of rmNormal:
     warnFormatMismatch(inputFile, outPrefix)
-    runShards(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs, shellCmd, noKill)
+    runShards(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs,
+              stages, noKill)
 
 proc gatherUsage() =
   ## Print gather subcommand usage to stderr and exit 1.

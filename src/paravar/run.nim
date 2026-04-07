@@ -3,7 +3,8 @@
 ## This module is responsible for:
 ##   1. Parsing the "---"-separated argv into paravar args + pipeline stages.
 ##   2. Building the sh -c command string for each shard.
-##   3. Executing per-shard pipelines concurrently up to --jobs.
+##   3. Mode inference from -o / {} / --gather flags.
+##   4. Executing per-shard pipelines concurrently up to --jobs.
 
 import std/[cpuinfo, os, posix, sequtils, strformat, strutils]
 {.warning[Deprecated]: off.}
@@ -55,12 +56,95 @@ proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
 # ---------------------------------------------------------------------------
 
 proc buildShellCmd*(stages: seq[seq[string]]): string =
-  ## Build a sh -c command string from pipeline stages.
+  ## Build a sh -c command string from pipeline stages (no {} substitution).
   ## Each token is shell-quoted so special characters (< > | & etc.) in
   ## filter expressions are passed through safely.  Stages are joined with " | ".
   var parts: seq[string]
   for stage in stages:
     parts.add(stage.mapIt(quoteShell(it)).join(" "))
+  result = parts.join(" | ")
+
+# ---------------------------------------------------------------------------
+# Mode inference
+# ---------------------------------------------------------------------------
+
+type RunMode* = enum
+  rmNormal,       ## paravar writes shard output files via -o
+  rmGatherStdout, ## gather → stdout (no -o, no {}, --gather)
+  rmGatherFile,   ## gather → -o file  (-o set, no {}, --gather)
+  rmToolManaged,  ## tool manages own output; paravar discards shard stdout
+  rmGatherTool    ## --gather + {} in cmd: {} substituted, gather proceeds
+
+proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
+  ## Return true if any token in any stage contains an unescaped {}.
+  ## A \{} sequence is considered escaped and does NOT count.
+  for stage in stages:
+    for tok in stage:
+      var i = 0
+      while i < tok.len:
+        if tok[i] == '\\' and i + 2 < tok.len and tok[i+1] == '{' and tok[i+2] == '}':
+          i += 3  # skip \{}
+        elif tok[i] == '{' and i + 1 < tok.len and tok[i+1] == '}':
+          return true
+        else:
+          i += 1
+  false
+
+proc inferRunMode*(hasOutput: bool; hasBrace: bool; hasGather: bool): RunMode =
+  ## Infer run mode from -o presence, {} in tool cmd, and --gather flag.
+  ## Emits warnings to stderr for ambiguous configurations.
+  ## Calls quit(1) for the error case (no output of any kind specified).
+  if not hasOutput and not hasBrace and not hasGather:
+    stderr.writeLine "error: no output specified: provide -o, --gather, or {} in the tool command"
+    quit(1)
+  if hasOutput and not hasBrace and hasGather:
+    return rmGatherFile
+  if not hasOutput and not hasBrace and hasGather:
+    return rmGatherStdout
+  if hasOutput and not hasBrace and not hasGather:
+    return rmNormal
+  if not hasOutput and hasBrace and not hasGather:
+    return rmToolManaged
+  if hasOutput and hasBrace and not hasGather:
+    stderr.writeLine "warning: -o is ignored in tool-managed mode (tool command contains {})"
+    return rmToolManaged
+  if not hasOutput and hasBrace and hasGather:
+    stderr.writeLine "warning: --gather and {} in tool command are both active; tool manages output, gather output written to stdout"
+    return rmGatherTool
+  # hasOutput and hasBrace and hasGather
+  stderr.writeLine "warning: --gather and {} in tool command are both active; -o used for gather output"
+  return rmGatherTool
+
+# ---------------------------------------------------------------------------
+# {} substitution
+# ---------------------------------------------------------------------------
+
+proc substituteToken*(tok: string; shardNum: string): string =
+  ## Replace each unescaped {} in tok with shardNum.
+  ## Replace \{} with a literal {} (backslash consumed by paravar).
+  ## Other characters are copied unchanged.
+  var r = newStringOfCap(tok.len + shardNum.len)
+  var i = 0
+  while i < tok.len:
+    if tok[i] == '\\' and i + 2 < tok.len and tok[i+1] == '{' and tok[i+2] == '}':
+      r.add('{')
+      r.add('}')
+      i += 3
+    elif tok[i] == '{' and i + 1 < tok.len and tok[i+1] == '}':
+      r.add(shardNum)
+      i += 2
+    else:
+      r.add(tok[i])
+      i += 1
+  r
+
+proc buildShellCmdForShard*(stages: seq[seq[string]]; shardIdx: int; nShards: int): string =
+  ## Build a per-shard shell command with {} replaced by the zero-padded shard number.
+  ## \{} in tokens is replaced by a literal {} passed to the tool.
+  let padded = align($(shardIdx + 1), len($nShards), '0')
+  var parts: seq[string]
+  for stage in stages:
+    parts.add(stage.mapIt(quoteShell(substituteToken(it, padded))).join(" "))
   result = parts.join(" | ")
 
 # ---------------------------------------------------------------------------
@@ -120,12 +204,15 @@ proc waitOne(running: var seq[InFlight]; failed: var bool) =
 
 proc runShards*(vcfPath: string; nShards: int; outputTemplate: string;
                 nThreads: int; forceScan: bool; maxJobs: int;
-                shellCmd: string; noKill: bool = false) =
-  ## Scatter vcfPath into nShards shards and pipe each through shellCmd.
+                stages: seq[seq[string]]; noKill: bool = false;
+                toolManaged: bool = false) =
+  ## Scatter vcfPath into nShards shards and pipe each through the tool pipeline.
   ## outputTemplate may contain {} or use shard_NN. prefix naming.
   ## Up to maxJobs shards run concurrently; pass 0 to use all CPUs.
   ## On failure, siblings are killed (SIGTERM) unless noKill is true.
   ## If any shard pipeline exits non-zero, prints to stderr and exits 1 at end.
+  ## When toolManaged is true, shard stdout is discarded (/dev/null); the tool
+  ## is expected to write its own output files using {} in the command.
   let actualThreads = if nThreads == 0: countProcessors() else: nThreads
   let actualMaxJobs = if maxJobs == 0: countProcessors() else: maxJobs
   setMaxPoolSize(max(actualThreads, actualMaxJobs))
@@ -141,20 +228,28 @@ proc runShards*(vcfPath: string; nShards: int; outputTemplate: string;
       waitOne(inFlight, anyFailed)
       if anyFailed and not noKill: break
     if anyFailed and not noKill: break
-    let outPath = shardOutputPath(outputTemplate, i, nShards)
-    createDir(outPath.parentDir)
     # Create pipe: [0] = read-end (child stdin), [1] = write-end (shard writer).
     var pipeFds: array[2, cint]
     if posix.pipe(pipeFds) != 0:
       stderr.writeLine &"error: pipe() failed for shard {i + 1}"
       quit(1)
-    let outFileFd = posix.open(outPath.cstring,
-                               O_WRONLY or O_CREAT or O_TRUNC,
-                               0o666.Mode)
-    if outFileFd < 0:
-      stderr.writeLine &"error: could not create output file: {outPath}"
-      quit(1)
-    let pid = forkExecSh(pipeFds[0], pipeFds[1], outFileFd, shellCmd, i)
+    var outFileFd: cint
+    if toolManaged:
+      outFileFd = posix.open("/dev/null".cstring, O_WRONLY)
+      if outFileFd < 0:
+        stderr.writeLine &"error: could not open /dev/null for shard {i + 1}"
+        quit(1)
+    else:
+      let outPath = shardOutputPath(outputTemplate, i, nShards)
+      createDir(outPath.parentDir)
+      outFileFd = posix.open(outPath.cstring,
+                             O_WRONLY or O_CREAT or O_TRUNC,
+                             0o666.Mode)
+      if outFileFd < 0:
+        stderr.writeLine &"error: could not create output file: {outPath}"
+        quit(1)
+    let shardCmd = buildShellCmdForShard(stages, i, nShards)
+    let pid = forkExecSh(pipeFds[0], pipeFds[1], outFileFd, shardCmd, i)
     # Parent closes the fds the child owns.
     discard posix.close(pipeFds[0])
     discard posix.close(outFileFd)
@@ -206,9 +301,10 @@ proc waitOneGather(running: var seq[InFlightGather]; failed: var bool) =
 
 proc runShardsGather*(vcfPath: string; nShards: int; outputTemplate: string;
                       nThreads: int; forceScan: bool; maxJobs: int;
-                      shellCmd: string; noKill: bool; cfg: GatherConfig) =
-  ## Scatter vcfPath into nShards shards, pipe each through shellCmd, capture stdout
-  ## via interceptor threads, then concatenate temp files into cfg.outputPath.
+                      stages: seq[seq[string]]; noKill: bool; cfg: GatherConfig) =
+  ## Scatter vcfPath into nShards shards, pipe each through the tool pipeline,
+  ## capture stdout via interceptor threads, then concatenate into cfg.outputPath.
+  ## {} in stage tokens is substituted with the zero-padded shard number.
   let actualThreads = if nThreads == 0: countProcessors() else: nThreads
   let actualMaxJobs = if maxJobs == 0: countProcessors() else: maxJobs
   # Pool must accommodate scatter writer threads and interceptor threads simultaneously.
@@ -239,7 +335,8 @@ proc runShardsGather*(vcfPath: string; nShards: int; outputTemplate: string;
     if posix.pipe(stdinPipe) != 0 or posix.pipe(stdoutPipe) != 0:
       stderr.writeLine &"error: pipe() failed for shard {i + 1}"
       quit(1)
-    let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutPipe[1], shellCmd, i)
+    let shardCmd = buildShellCmdForShard(stages, i, nShards)
+    let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutPipe[1], shardCmd, i)
     # Parent closes fds that now belong to the child.
     discard posix.close(stdinPipe[0])
     discard posix.close(stdoutPipe[1])

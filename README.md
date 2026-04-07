@@ -42,6 +42,10 @@ paravar run -n 8 -o filtered.vcf.gz input.vcf.gz \
 # Filter and gather into a single file
 paravar run --gather -n 8 -o filtered.vcf.gz input.vcf.gz \
   ::: bcftools view -i "GT='alt'" -Oz
+
+# Tool-managed: tool writes per-shard files using {} in the command
+paravar run -n 8 input.vcf.gz \
+  ::: bcftools view -i "GT='alt'" -Oz -o output.{}.vcf.gz
 ```
 
 ---
@@ -80,16 +84,16 @@ BCF input requires a `.csi` index alongside the file (`bcftools index input.bcf`
 
 ### `run`
 
-Scatter and pipe each shard through a tool pipeline in parallel. Without `--gather`, writes N per-shard output files.
+Scatter and pipe each shard through a tool pipeline in parallel. Without `--gather`, writes N per-shard output files. `-o` is optional when `{}` appears in the tool command (tool-managed mode — see below).
 
 ```
-paravar run -n <n> -o <o> [options] <input> ::: <cmd> [::: <cmd> ...]
+paravar run -n <n> [-o <o>] [options] <input> ::: <cmd> [::: <cmd> ...]
 ```
 
 | Flag | Long form | Description |
 |---|---|---|
 | `-n` | `--n-shards` | Number of shards (required, ≥ 1) |
-| `-o` | `--output` | Output path or suffix. Required. |
+| `-o` | `--output` | Output path or suffix. Required unless `{}` is in the tool command or `--gather` is set. |
 | `-j` | `--max-jobs` | Max concurrent shard pipelines (default: n-shards) |
 | `-t` | `--max-threads` | Max threads for scatter/validation (default: min(max-jobs, 8)) |
 | | `--force-scan` | Ignore index, scan all BGZF blocks — VCF only; exits 1 for BCF |
@@ -188,6 +192,37 @@ Parent directories are created automatically. With `--gather`, `-o` is the final
 
 ---
 
+## Tool-managed output
+
+When `{}` appears in the tool command, paravar substitutes it with the zero-padded shard number in each per-shard pipeline invocation. If `-o` is absent, paravar enters tool-managed output mode: shard stdout is discarded and the tool is expected to write its own files using `{}`.
+
+```bash
+# Tool writes output.01.vcf.gz ... output.08.vcf.gz
+paravar run -n 8 input.vcf.gz \
+  ::: bcftools view -Oz -o output.{}.vcf.gz
+
+# Multi-stage: {} only needed in the stage that writes the file
+paravar run -n 8 input.vcf.gz \
+  ::: bcftools view -i "GT='alt'" -Ou \
+  ::: bcftools view -s Sample -Oz -o filtered.{}.vcf.gz
+```
+
+`{}` substitution also applies in normal (`-o`) and gather modes — the shard number is replaced in every tool command token that contains `{}`.
+
+To pass a literal `{}` to a tool without substitution, escape it as `\{}` (use single quotes in the shell: `'\{}'`). The backslash is consumed by paravar; the tool receives `{}`.
+
+| `-o` present | `{}` in tool cmd | `--gather` | Mode |
+|---|---|---|---|
+| No | No | Yes | Gather → stdout |
+| Yes | No | Yes | Gather → `-o` file |
+| Yes | No | No | Normal — paravar writes shard files |
+| No | Yes | No | Tool-managed — tool writes its own files |
+| No | No | No | Error |
+
+If `-o` is provided alongside `{}` in the tool command, a warning is printed and `-o` is ignored (tool-managed mode applies). If `--gather` and `{}` are both present, `{}` is substituted and gather proceeds normally.
+
+---
+
 ## Pipeline separator
 
 `:::` separates pipeline stages, which are joined with `|` and executed via `sh -c`. Multiple `:::` blocks define a multi-stage pipeline. `---` (three dashes) is also accepted as an alternative to `:::`.
@@ -259,6 +294,10 @@ paravar run --gather -n 32 -j 8 -o filtered.bcf input.bcf \
 
 # BCF scatter with CSI index
 paravar scatter -n 4 -o output.bcf input.bcf
+
+# Tool-managed: bcftools writes per-shard files, paravar discards stdout
+paravar run -n 8 input.vcf.gz \
+  ::: bcftools view -i "GT='alt'" -Oz -o filtered.{}.vcf.gz
 ```
 
 ---
@@ -272,7 +311,7 @@ When gathering VCF or BCF output, paravar checks that the `#CHROM` line (the sam
 ## Limitations
 
 - BCF input requires a CSI index (`bcftools index input.bcf`). There is no auto-scan fallback for BCF.
-- Tools in the pipeline must read from stdin and write to stdout. Tools requiring seekable input are not supported.
+- Tools in the pipeline must read from stdin. In normal and gather modes they must also write to stdout; in tool-managed mode (`{}` in the tool command) they may write to their own files instead. Tools requiring seekable input are not supported.
 - Format conversion between VCF and BCF is not automatic — use `bcftools view -Ob` or similar within the pipeline.
 
 ---

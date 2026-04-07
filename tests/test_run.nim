@@ -152,7 +152,7 @@ block testRunSingle1Shard:
   let tmpDir = getTempDir() / "paravar_run_r10_1shard"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 1, tmpl, 1, false, 1, "cat")
+  runShards(SmallVcf, 1, tmpl, 1, false, 1, @[@["cat"]])
   let outPath = shardOutputPath(tmpl, 0, 1)
   doAssert fileExists(outPath), "output missing: " & outPath
   let (_, bcCode) = execCmdEx("bcftools view -HG " & outPath & " > /dev/null 2>&1")
@@ -171,7 +171,7 @@ block testRun4Shards:
   let tmpDir = getTempDir() / "paravar_run_r11_4shards"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 4, tmpl, 1, false, 4, "cat")
+  runShards(SmallVcf, 4, tmpl, 1, false, 4, @[@["cat"]])
   var total = 0
   var shardPaths: seq[string]
   for i in 0..3:
@@ -196,7 +196,7 @@ block testRunJobs1Serial:
   let tmpDir = getTempDir() / "paravar_run_r12_jobs1"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 4, tmpl, 1, false, 1, "cat")  # maxJobs = 1
+  runShards(SmallVcf, 4, tmpl, 1, false, 1, @[@["cat"]])  # maxJobs = 1
   var total = 0
   for i in 0..3:
     let p = shardOutputPath(tmpl, i, 4)
@@ -217,7 +217,7 @@ block testRunJobsMoreThanShards:
   let tmpDir = getTempDir() / "paravar_run_r13_jobsover"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 2, tmpl, 1, false, 10, "cat")  # 10 jobs for 2 shards
+  runShards(SmallVcf, 2, tmpl, 1, false, 10, @[@["cat"]])  # 10 jobs for 2 shards
   for i in 0..1:
     doAssert fileExists(shardOutputPath(tmpl, i, 2)), &"over-jobs shard {i+1} missing"
   removeDir(tmpDir)
@@ -231,7 +231,7 @@ block testBcfRun4Shards:
   let tmpDir = getTempDir() / "paravar_run_r14_bcf4"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.bcf"
-  runShards(SmallBcf, 4, tmpl, 1, false, 4, "bcftools view -Ob")
+  runShards(SmallBcf, 4, tmpl, 1, false, 4, @[@["bcftools", "view", "-Ob"]])
   var total = 0
   var bcfShardPaths: seq[string]
   for i in 0..3:
@@ -443,6 +443,185 @@ block testCliRunNoKill:
     doAssert fileExists(tmpDir / ("shard_" & $i & ".out.vcf.gz")), &"--no-kill shard {i} missing"
   removeDir(tmpDir)
   echo "PASS CLI run: --no-kill flag accepted, all shards complete normally"
+
+# ===========================================================================
+# T1 — inferRunMode: 7 non-error cases from the inference table
+# (The error case — no output, no {}, no --gather — calls quit(1) so it is
+#  covered by R15/testCliRunMissingSep at the CLI level rather than here.)
+# ===========================================================================
+
+block testInferGatherStdout:
+  let m = inferRunMode(false, false, true)
+  doAssert m == rmGatherStdout, "expected rmGatherStdout, got " & $m
+  echo "PASS inferRunMode: no-o / no-{} / gather → rmGatherStdout"
+
+block testInferGatherFile:
+  let m = inferRunMode(true, false, true)
+  doAssert m == rmGatherFile, "expected rmGatherFile, got " & $m
+  echo "PASS inferRunMode: o / no-{} / gather → rmGatherFile"
+
+block testInferNormal:
+  let m = inferRunMode(true, false, false)
+  doAssert m == rmNormal, "expected rmNormal, got " & $m
+  echo "PASS inferRunMode: o / no-{} / no-gather → rmNormal"
+
+block testInferToolManaged:
+  let m = inferRunMode(false, true, false)
+  doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
+  echo "PASS inferRunMode: no-o / {} / no-gather → rmToolManaged"
+
+block testInferToolManagedWithO:
+  # -o present but {} in cmd: -o ignored, still tool-managed (warning emitted)
+  let m = inferRunMode(true, true, false)
+  doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
+  echo "PASS inferRunMode: o / {} / no-gather → rmToolManaged (warning: -o ignored)"
+
+block testInferGatherToolNoO:
+  let m = inferRunMode(false, true, true)
+  doAssert m == rmGatherTool, "expected rmGatherTool, got " & $m
+  echo "PASS inferRunMode: no-o / {} / gather → rmGatherTool"
+
+block testInferGatherToolWithO:
+  let m = inferRunMode(true, true, true)
+  doAssert m == rmGatherTool, "expected rmGatherTool, got " & $m
+  echo "PASS inferRunMode: o / {} / gather → rmGatherTool"
+
+# ===========================================================================
+# T2 — hasBracePlaceholder and substituteToken / buildShellCmdForShard
+# ===========================================================================
+
+block testHasBraceTrue:
+  doAssert hasBracePlaceholder(@[@["bcftools", "view", "-o", "out.{}.vcf.gz"]]),
+    "expected true for token containing {}"
+  echo "PASS hasBracePlaceholder: detects {} in token"
+
+block testHasBraceFalse:
+  doAssert not hasBracePlaceholder(@[@["bcftools", "view", "-Oz"]]),
+    "expected false when no {} present"
+  echo "PASS hasBracePlaceholder: false when no {} present"
+
+block testHasBraceEscaped:
+  # \{} is escaped — should NOT count as a placeholder
+  doAssert not hasBracePlaceholder(@[@["tool", "\\{}"  ]]),
+    "expected false for escaped \\{}"
+  echo "PASS hasBracePlaceholder: escaped \\{} does not count"
+
+block testSubstituteBasic:
+  let r = substituteToken("out.{}.vcf.gz", "03")
+  doAssert r == "out.03.vcf.gz", "basic sub: got " & r
+  echo "PASS substituteToken: basic {} substitution"
+
+block testSubstituteMultiple:
+  let r = substituteToken("{}-{}", "05")
+  doAssert r == "05-05", "multiple: got " & r
+  echo "PASS substituteToken: multiple {} replaced"
+
+block testSubstituteEscaped:
+  # \{} should become literal {} in the output (backslash consumed)
+  let r = substituteToken("\\{}", "07")
+  doAssert r == "{}", "escaped: got " & r
+  echo "PASS substituteToken: \\{} → literal {}"
+
+block testSubstituteNoBrace:
+  let r = substituteToken("bcftools", "02")
+  doAssert r == "bcftools", "no-brace: got " & r
+  echo "PASS substituteToken: no {} → unchanged"
+
+block testSubstituteEscapedAndUnescaped:
+  # \{} followed by {} → literal {} then shardNum
+  let r = substituteToken("\\{}{}", "04")
+  doAssert r == "{}04", "mixed escape: got " & r
+  echo "PASS substituteToken: \\{} then {} → literal {} then shardNum"
+
+block testBuildShellCmdForShardPadding:
+  # nShards = 10 → width 2; shardIdx = 0 → "01"
+  let cmd = buildShellCmdForShard(@[@["bcftools", "view", "-o", "out.{}.vcf.gz"]], 0, 10)
+  doAssert "out.01.vcf.gz" in cmd, "padding w2: got " & cmd
+  echo "PASS buildShellCmdForShard: zero-pads to width 2 for nShards=10"
+
+block testBuildShellCmdForShardNoBrace:
+  # No {} → cmd unchanged (aside from quoting)
+  let cmd = buildShellCmdForShard(@[@["cat"]], 0, 4)
+  doAssert cmd == "cat", "no-brace: got " & cmd
+  echo "PASS buildShellCmdForShard: no {} → cmd unchanged"
+
+block testBuildShellCmdForShardWidthOne:
+  # nShards = 4 → width 1; shardIdx = 2 → "3"
+  let cmd = buildShellCmdForShard(@[@["tool", "{}"]], 2, 4)
+  doAssert "3" in cmd, "width-1: got " & cmd
+  doAssert "03" notin cmd, "width-1: should not be zero-padded: got " & cmd
+  echo "PASS buildShellCmdForShard: width 1 for nShards=4"
+
+# ===========================================================================
+# T3 — tool-managed mode integration tests
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# T3-1: tool-managed mode via API (runShards toolManaged=true)
+# ---------------------------------------------------------------------------
+block testToolManagedApiDirect:
+  doAssert fileExists(SmallVcf), "fixture missing"
+  let tmpDir = getTempDir() / "paravar_t3_1_tool_api"
+  createDir(tmpDir)
+  let outTemplate = tmpDir / "out.{}.vcf.gz"
+  # Tool writes its own output using {} substitution.
+  # We use bcftools view -Oz -o <path> rather than stdout.
+  let stages = @[@["bcftools", "view", "-Oz", "-o", outTemplate]]
+  runShards(SmallVcf, 2, "", 1, false, 2, stages, toolManaged = true)
+  var total = 0
+  for i in 0..1:
+    let p = shardOutputPath(outTemplate, i, 2)
+    doAssert fileExists(p), &"tool-managed shard {i+1} missing: {p}"
+    let (_, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
+    doAssert bc == 0, &"bcftools rejected tool-managed shard {i+1}"
+    total += countRecords(p)
+  doAssert total == countRecords(SmallVcf),
+    &"tool-managed record count mismatch: {total}"
+  removeDir(tmpDir)
+  echo &"PASS tool-managed API: 2 shards, tool writes own output, {total} records"
+
+# ---------------------------------------------------------------------------
+# T3-2: tool-managed CLI — {} in tool cmd, no -o → tool writes files
+# ---------------------------------------------------------------------------
+block testToolManagedCli:
+  doAssert fileExists(SmallVcf), "fixture missing"
+  let tmpDir = getTempDir() / "paravar_t3_2_tool_cli"
+  createDir(tmpDir)
+  let outTemplate = tmpDir / "out.{}.vcf.gz"
+  let (outp, code) = execCmdEx(
+    BinPath & " run -n 2 " & SmallVcf &
+    " ::: bcftools view -Oz -o " & outTemplate & " 2>&1")
+  doAssert code == 0, &"tool-managed CLI exited {code}:\n{outp}"
+  var total = 0
+  for i in 0..1:
+    let p = shardOutputPath(outTemplate, i, 2)
+    doAssert fileExists(p), &"tool-managed CLI shard {i+1} missing: {p}"
+    total += countRecords(p)
+  doAssert total == countRecords(SmallVcf),
+    &"tool-managed CLI record count mismatch: {total}"
+  removeDir(tmpDir)
+  echo &"PASS tool-managed CLI: {{}} in tool cmd, no -o, {total} records"
+
+# ---------------------------------------------------------------------------
+# T3-3: tool-managed CLI — {} in tool cmd, -o present → warning + tool-managed
+# ---------------------------------------------------------------------------
+block testToolManagedCliWithO:
+  doAssert fileExists(SmallVcf), "fixture missing"
+  let tmpDir = getTempDir() / "paravar_t3_3_tool_cli_o"
+  createDir(tmpDir)
+  let outTemplate = tmpDir / "out.{}.vcf.gz"
+  let (outp, code) = execCmdEx(
+    BinPath & " run -n 2 -o " & tmpDir / "ignored.vcf.gz" &
+    " " & SmallVcf &
+    " ::: bcftools view -Oz -o " & outTemplate & " 2>&1")
+  doAssert code == 0, &"tool-managed -o CLI exited {code}:\n{outp}"
+  doAssert "warning" in outp.toLowerAscii, &"expected warning about -o ignored:\n{outp}"
+  for i in 0..1:
+    let p = shardOutputPath(outTemplate, i, 2)
+    doAssert fileExists(p), &"tool-managed -o shard {i+1} missing"
+  doAssert not fileExists(tmpDir / "ignored.vcf.gz"), "-o file should not be created"
+  removeDir(tmpDir)
+  echo "PASS tool-managed CLI: -o present with {} → warning, -o ignored"
 
 echo ""
 echo "All run tests passed."

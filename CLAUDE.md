@@ -59,14 +59,14 @@ Execute steps in order. Do not skip ahead. Check off each step before proceeding
 
 ---
 
-### Milestone 0: rename to `vcfparty`
+### Milestone 0: rename to `vcfparty` ✅ complete
 
-- [ ] **V1** — Rename `paravar.nimble` → `vcfparty.nimble`. Update package name, binary name, and all internal `paravar` references in source files. Update all help text, error messages, and log output to say `vcfparty`. Update `README.md` and `CLAUDE.md` header. Run `nimble test` — all tests must pass with the new binary name.
-- [ ] **V2** — Update all test files: any hardcoded `paravar` binary invocations → `vcfparty`. Update `generate_fixtures.sh` if it references the binary. Run `nimble test` — full suite green.
+- [x] **V1** — Rename `paravar.nimble` → `vcfparty.nimble`. Update package name, binary name, and all internal `paravar` references in source files. Update all help text, error messages, and log output to say `vcfparty`. Update `README.md` and `CLAUDE.md` header. Run `nimble test` — all tests must pass with the new binary name.
+- [x] **V2** — Update all test files: any hardcoded `paravar` binary invocations → `vcfparty`. Update `generate_fixtures.sh` if it references the binary. Run `nimble test` — full suite green.
 
 ---
 
-### Milestone 1: interface consolidation
+### Milestone 1: interface consolidation ✅ complete
 
 This milestone retires `--gather`, introduces terminal operators, consolidates `-n`/`-j`, adds `--concat`/`--merge` flags to `gather`, adds `-O` and `-d` flags, and aligns scatter/run feature symmetry. It is a pure refactor — no new algorithms.
 
@@ -108,27 +108,27 @@ Native (no bcftools): compress/decompress within same format. VCF↔BCF conversi
 
 #### Steps
 
-- [ ] **I1** — Retire `-j`/`--max-jobs` from `run` in `main.nim`. Remove all references in `run.nim`. Update help text. Add an error if `-j` is passed: `"error: -j is no longer supported; use -n to control both shard count and concurrency"`. Run `nimble test` — update any test that used `-j`.
+- [x] **I1** — Retire `-j`/`--max-jobs` from `run` in `main.nim`. Remove all references in `run.nim`. Update help text. Add an error if `-j` is passed: `"error: -j is no longer supported; use -n to control both shard count and concurrency"`. Run `nimble test` — update any test that used `-j`.
 
-- [ ] **I2** — Implement terminal operator parsing in `main.nim`. Scan `run` argv for tokens exactly equal to `+concat+`, `+merge+`, or `+collect+`. Everything after the last `:::` / `---` / `+verb+` token is parsed accordingly. Validate: `-o` without a terminal operator is an error; no terminal operator and no `{}` in tool command is an error; `+merge+` with `-s` is an error. Unit test the parser with all valid and error cases — do not wire up any new output behaviour yet, just parse and validate.
+- [x] **I2** — Implement terminal operator parsing in `main.nim`. Scan `run` argv for tokens exactly equal to `+concat+`, `+merge+`, or `+collect+`. Everything after the last `:::` / `---` / `+verb+` token is parsed accordingly. Validate: `-o` without a terminal operator is an error; no terminal operator and no `{}` in tool command is an error; `+merge+` with `-s` is an error. Unit test the parser with all valid and error cases — do not wire up any new output behaviour yet, just parse and validate.
 
-- [ ] **I3** — Wire `+concat+` as the replacement for `--gather`. `+concat+` uses the existing gather/temp-file path in `gather.nim` unchanged. `--gather` is retired — add a clear error if passed: `"error: --gather is retired; use +concat+ instead"`. Update `test_run.nim` and `test_cli.nim` to use `+concat+` syntax. Run `nimble test`.
+- [x] **I3** — Wire `+concat+` as the replacement for `--gather`. `+concat+` uses the existing gather/temp-file path in `gather.nim` unchanged. `--gather` is retired — add a clear error if passed: `"error: --gather is retired; use +concat+ instead"`. Update `test_run.nim` and `test_cli.nim` to use `+concat+` syntax. Run `nimble test`.
 
-- [ ] **I4** — Implement `+collect+` streaming output in `run.nim`. Each shard's pipeline stdout is read in a dedicated thread. As complete records arrive (VCF: `\n`-terminated; BCF: `l_shared + l_indiv` bytes), they are immediately written to the output fd (stdout or `-o` file) under a mutex. No temp files. No ordering guarantee. Write `test_collect.nim` covering: single shard, 4 shards, BCF, stdout, all records present (order-insensitive check). Run `nimble test`.
+- [x] **I4** — Implement `+collect+` streaming output in `run.nim`. Each shard's pipeline stdout is read in a dedicated thread. As complete records arrive (VCF: `\n`-terminated; BCF: `l_shared + l_indiv` bytes), they are immediately written to the output fd (stdout or `-o` file) under a mutex. No temp files. No ordering guarantee. Write `test_collect.nim` covering: single shard, 4 shards, BCF, stdout, all records present (order-insensitive check). Run `nimble test`.
 
-- [ ] **I5** — Add `--concat` (default) and `--merge` flags to the `gather` subcommand in `main.nim`. `gather` subcommand keeps its name. `--merge` is a no-op for now — accepted and noted but falls back to `--concat` behaviour with a warning: `"warning: --merge not yet implemented, using --concat"`. Note in help text that `vcfparty gather` is similar to `bcftools concat -a`. Update `test_gather.nim` to cover `--concat` and `--merge` (warning) flags. Run `nimble test`.
+- [x] **I5** — Add `--concat` (default) and `--merge` flags to the `gather` subcommand in `main.nim`. `gather` subcommand keeps its name. `--merge` is a no-op for now — accepted and noted but falls back to `--concat` behaviour with a warning: `"warning: --merge not yet implemented, using --concat"`. Note in help text that `vcfparty gather` is similar to `bcftools concat -a`. Update `test_gather.nim` to cover `--concat` and `--merge` (warning) flags. Run `nimble test`.
 
-- [ ] **I6** — Add `-i`/`--interleave` and `-s`/`--sequential` flags to both `scatter` and `run` in `main.nim`. For now, both flags are parsed and stored but only `-s` (sequential) actually changes behaviour — `-i` on an indexed file emits the overlapping-ranges warning and proceeds with sequential scatter (interleaved scatter is implemented in Milestone 3). Document this in help text. Run `nimble test`.
+- [x] **I6** — Add `-i`/`--interleave` and `-s`/`--sequential` flags to both `scatter` and `run` in `main.nim`. For now, both flags are parsed and stored but only `-s` (sequential) actually changes behaviour — `-i` on an indexed file emits the overlapping-ranges warning and proceeds with sequential scatter (interleaved scatter is implemented in Milestone 3). Document this in help text. Run `nimble test`.
 
-- [ ] **I7** — Add `-O` flag to `run` and `scatter` in `main.nim`. Implement compression-only cases natively in `gather.nim` (BGZF↔uncompressed within same format). For VCF↔BCF conversion: detect if bcftools is on PATH (`findExe("bcftools")`); if yes, insert `bcftools view -O<fmt>` as an implicit final stage after the terminal operator; if no, exit 1 with a clear message. Write unit tests for each `-O` case: same-format compress, same-format decompress, cross-format with bcftools mock, cross-format without bcftools (error). Run `nimble test`.
+- [x] **I7** — Add `-O` flag to `run` and `scatter` in `main.nim`. Implement compression-only cases natively in `gather.nim` (BGZF↔uncompressed within same format). For VCF↔BCF conversion: detect if bcftools is on PATH (`findExe("bcftools")`); if yes, insert `bcftools view -O<fmt>` as an implicit final stage after the terminal operator; if no, exit 1 with a clear message. Write unit tests for each `-O` case: same-format compress, same-format decompress, cross-format with bcftools mock, cross-format without bcftools (error). Run `nimble test`.
 
-- [ ] **I8** — Add `-d`/`--decompress` flag to `run` and `scatter`. In sequential mode: decompress BGZF blocks before writing to subprocess stdin rather than raw-copying. In interleaved mode (future): accept silently as no-op. Update `scatter.nim` to support the decompress path alongside the existing raw-copy path. Write tests: `-d` with VCF produces valid uncompressed VCF shard files; `-d` with BCF produces valid uncompressed BCF; `-d` with `+collect+` all records present. Run `nimble test`.
+- [x] **I8** — Add `-d`/`--decompress` flag to `run` and `scatter`. In sequential mode: decompress BGZF blocks before writing to subprocess stdin rather than raw-copying. In interleaved mode (future): accept silently as no-op. Update `scatter.nim` to support the decompress path alongside the existing raw-copy path. Write tests: `-d` with VCF produces valid uncompressed VCF shard files; `-d` with BCF produces valid uncompressed BCF; `-d` with `+collect+` all records present. Run `nimble test`.
 
-- [ ] **I9** — Full integration test pass. Write `test_interface.nim` covering the complete new CLI surface: all terminal operators, `-O` flag, `-d` flag, `-i`/`-s` flags, `gather --concat`/`gather --merge` flags, retired `--gather` and `-j` errors. Run full `nimble test` — all suites green.
+- [x] **I9** — Full integration test pass. Write `test_interface.nim` covering the complete new CLI surface: all terminal operators, `-O` flag, `-d` flag, `-i`/`-s` flags, `gather --concat`/`gather --merge` flags, retired `--gather` and `-j` errors. Run full `nimble test` — all suites green.
 
 ---
 
-### Milestone 2: `+merge+` and `+collect+` (sequential)
+### Milestone 2: `+merge+` and `+collect+` (sequential) ✅ complete
 
 Implements the merge sorter for `+merge+` using sequential (contiguous) scatter. This is limited — it will block on the slowest shard — but gets the merge sorter working and tested before interleaved scatter is added in Milestone 3.
 
@@ -144,17 +144,200 @@ Requires uncompressed pipeline output (`-Ou` or `-Ov`) from the last stage. If B
 
 #### Steps
 
-- [ ] **M1** — Implement `extractContigTable(headerBytes: seq[byte]): seq[string]` in `gather.nim` — returns ordered contig names from VCF header `##contig` lines or BCF header blob. Unit test against `small.vcf.gz` and `small.bcf` headers. Run relevant test file.
+- [x] **M1** — Implement `extractContigTable(headerBytes: seq[byte]): seq[string]` in `gather.nim` — returns ordered contig names from VCF header `##contig` lines or BCF header blob. Unit test against `small.vcf.gz` and `small.bcf` headers. Run relevant test file.
 
-- [ ] **M2** — Implement `readNextVcfRecord(fd: cint): seq[byte]` and `readNextBcfRecord(fd: cint): seq[byte]` in `gather.nim` — read exactly one complete record from an fd (VCF: read until `\n`; BCF: read 8-byte header, then `l_shared + l_indiv` bytes). Return empty seq on EOF. Unit test with synthetic byte sequences. Run test file.
+- [x] **M2** — Implement `readNextVcfRecord(fd: cint): seq[byte]` and `readNextBcfRecord(fd: cint): seq[byte]` in `gather.nim` — read exactly one complete record from an fd (VCF: read until `\n`; BCF: read 8-byte header, then `l_shared + l_indiv` bytes). Return empty seq on EOF. Unit test with synthetic byte sequences. Run test file.
 
-- [ ] **M3** — Implement `extractSortKey(record: seq[byte], fmt: GatherFormat, contigTable: seq[string]): (int, int32)` in `gather.nim` — returns `(contig_rank, pos)` from a record. For BCF: read int32 at offset 0 (chrom_id) and int32 at offset 8 (pos). For VCF: split on `\t`, look up CHROM in contig table. Unit test on known records from `small.vcf.gz` and `small.bcf`. Run test file.
+- [x] **M3** — Implement `extractSortKey(record: seq[byte], fmt: GatherFormat, contigTable: seq[string]): (int, int32)` in `gather.nim` — returns `(contig_rank, pos)` from a record. For BCF: read int32 at offset 0 (chrom_id) and int32 at offset 8 (pos). For VCF: split on `\t`, look up CHROM in contig table. Unit test on known records from `small.vcf.gz` and `small.bcf`. Run test file.
 
-- [ ] **M4** — Implement `kWayMerge(fds: seq[cint], outFd: cint, fmt: GatherFormat, contigTable: seq[string])` in `gather.nim` — priority queue merge. Initialise by reading first record from each fd. Loop: pop minimum, write to outFd, read next from that fd. Handle EOF per stream. Unit test: merge 2 synthetic sorted VCF streams → verify output is sorted and contains all records. Run test file.
+- [x] **M4** — Implement `kWayMerge(fds: seq[cint], outFd: cint, fmt: GatherFormat, contigTable: seq[string])` in `gather.nim` — priority queue merge. Initialise by reading first record from each fd. Loop: pop minimum, write to outFd, read next from that fd. Handle EOF per stream. Unit test: merge 2 synthetic sorted VCF streams → verify output is sorted and contains all records. Run test file.
 
-- [ ] **M5** — Wire `+merge+` into `run.nim`. After all N subprocess pipelines complete, call `kWayMerge` with each subprocess's stdout fd and the `-o` output fd. For sequential scatter: warn that merge may block on slowest shard (this is expected until interleaved scatter is implemented). Write `test_merge.nim`: 4 shards VCF, `+merge+`, output sorted and record-complete (sha256 vs sorted baseline); BCF equivalent; stdout output; BGZF pipeline output (triggers decompress warning). Run `nimble test`.
+- [x] **M5** — Wire `+merge+` into `run.nim`. After all N subprocess pipelines complete, call `kWayMerge` with each subprocess's stdout fd and the `-o` output fd. For sequential scatter: warn that merge may block on slowest shard (this is expected until interleaved scatter is implemented). Write `test_merge.nim`: 4 shards VCF, `+merge+`, output sorted and record-complete (sha256 vs sorted baseline); BCF equivalent; stdout output; BGZF pipeline output (triggers decompress warning). Run `nimble test`.
 
-- [ ] **M6** — Implement `gather --merge` in the `gather` subcommand: wire `kWayMerge` from existing shard files rather than live fds. Read each shard file, open as fd, pass to `kWayMerge`. Remove the "not yet implemented" warning added in I5. Unit test: `vcfparty gather --merge` on 4 shard files → sorted output matches `bcftools concat -a` output. Run `nimble test`.
+- [x] **M6** — Implement `gather --merge` in the `gather` subcommand: wire `kWayMerge` from existing shard files rather than live fds. Read each shard file, open as fd, pass to `kWayMerge`. Remove the "not yet implemented" warning added in I5. Unit test: `vcfparty gather --merge` on 4 shard files → sorted output matches `bcftools concat -a` output. Run `nimble test`.
+
+---
+
+### Milestone R: refactor and consolidation
+
+This milestone is a structured cleanup pass before Milestone 3 adds new concurrency complexity. The goal is to reduce duplication, unify patterns, fix latent bugs, and leave the codebase in a state where Milestones 3 and 4 can be implemented without fighting the existing structure.
+
+**Zero behaviour changes** (except latent bug fixes). All existing tests must pass unchanged throughout. No new features.
+
+#### Step R0 — self-audit ✅ complete
+
+Audit completed and approved. Findings below drive R1–R7.
+
+**Confirmed dead code (verify in tests/ before removing):**
+- `computeZeroBytes` and `computeDataBytes` in `gather.nim` — suspected dead; confirm no call sites in `tests/`
+- `bcfFirstDataOffset` in `bgzf_utils.nim` — suspected dead; confirm no call sites in `tests/` or `src/`
+
+**Confirmed issues to fix:**
+- `doMergeFeeder` (`run.nim`) and `doFileFeeder` (`gather.nim`) are near-identical — unify into one proc in `gather.nim`
+- `doCollectInterceptor` contains a third copy of the BGZF-accumulation pattern — consolidate
+- `leU32At` in `gather.nim` duplicates `leU32` in `bgzf_utils.nim` — export `leU32*` and remove duplicate
+- `writeShardZero`/`writeShardData` vs `computeZeroBytes`/`computeDataBytes` — dead compute variants to be removed; write variants survive if still called from `gatherFiles`
+- All GC-safe globals (`gChromLine*`, `gMergeHeader*`, `gMergeFormat`, `gMergeBgzfWarned`) lack a shared abstraction; `gMergeBgzfWarned` lives in wrong file
+- `FD_CLOEXEC` missing on pipe write-ends in `runShards`, `runShardsGather`, `runShardsCollect` (set correctly only in `runShardsMerge`)
+- `runShardsMerge` missing `noKill` support and kill-all on failure — inconsistent with other orchestrators
+- `killAllGather` and `killAllCollect` have identical bodies — consolidate
+- `waitOne*` procs are structurally identical across orchestrator types — consolidate
+- `readNextVcfRecord` reads one byte per syscall — **note in a comment, defer fix to Milestone 3**
+- `optimiseBoundaries` O(n²) `notin` check on `seq[int64]` — **note in a comment, defer to later**
+
+- [x] **R0** — Audit complete and approved.
+
+#### Step R1 — call-site verification before cleanup
+
+Before removing anything, search all files under `src/` and `tests/` for call sites of the suspected dead procs:
+
+1. `computeZeroBytes` and `computeDataBytes` — if unused everywhere, mark for removal in R6
+2. `bcfFirstDataOffset` — if unused everywhere, mark for removal in R6
+3. Confirm `writeShardZero` and `writeShardData` are still called from `gatherFiles` (or wherever)
+4. Confirm `leU32At` is only used within `gather.nim` and not re-exported
+
+Show results. Update the CLAUDE.md M5 and M6 checkboxes to `[x]`. No code changes yet.
+
+- [ ] **R1** — Call-site verification complete. Dead procs identified. M5/M6 checkboxes updated.
+
+#### Step R2 — export `leU32` and unify the BGZF accumulation pattern
+
+Two changes:
+
+1. Add `*` to `leU32` in `bgzf_utils.nim`. Replace `leU32At` in `gather.nim` with calls to `bgzf_utils.leU32`. Remove the private duplicate.
+
+2. The BGZF-accumulation pattern (`flushBgzf`/`appendRead` templates or equivalents) appears in `doMergeFeeder`, `doFileFeeder`, and `doCollectInterceptor`. Extract it into a shared proc or template in `gather.nim`. All three callers use the shared version.
+
+Before implementing step 2: show the proposed shared abstraction signature and all three call sites. Wait for approval.
+
+- [ ] **R2** — `leU32` exported from `bgzf_utils`. BGZF accumulation pattern unified. All tests pass.
+
+#### Step R3 — unify GC-safe globals
+
+The fixed-size-array pattern (`array[N, byte]` + `int32` length + `bool` spin flag) appears for `gChromLine*` and `gMergeHeader*`. A third instance will be needed in Milestone 3. Define a single reusable type, e.g.:
+
+```nim
+type SharedBuf* = object
+  buf*: array[4 * 1024 * 1024, byte]
+  len*: int32
+  ready*: bool
+```
+
+Move all merge-related globals (`gMergeFormat`, `gMergeHeaderAvail`, `gMergeHeaderBuf`, `gMergeHeaderLen`, `gMergeBgzfWarned`) to `gather.nim` — they currently straddle both files. Apply `SharedBuf` to both `gChromLine*` and `gMergeHeader*`. Verify spin-wait pattern is consistently applied at all read sites.
+
+Before implementing: confirm Nim version and whether `std/atomics` is available for a cleaner atomic flag. Check `vcfparty.nimble` for the Nim version constraint.
+
+- [ ] **R3** — GC-safe globals unified under `SharedBuf`. All merge globals in `gather.nim`. All tests pass.
+
+#### Step R4 — unify orchestrator fork/exec structure
+
+Extract `spawnShardPipelines` from the common structure shared by `runShards`, `runShardsGather`, `runShardsMerge`, and `runShardsCollect`. The shared proc handles: shard computation, pipe creation, fork/exec, fd lifetime management, and `doWriteShard` spawning. Each orchestrator calls it and handles subprocess stdout differently.
+
+Consolidate `killAllGather` and `killAllCollect` into a single `killAll(running: openArray[...])` proc. Consolidate `waitOneGather`, `waitOneMerge`, `waitOneCollect` into a shared `waitOne` proc parameterised on the in-flight type, or restructure `InFlight` into a single type with a variant field.
+
+Add `noKill` support and kill-all on failure to `runShardsMerge` — it is currently missing both.
+
+**Critically:** set `FD_CLOEXEC` on all pipe write-ends inside `spawnShardPipelines`. This fixes the latent fd inheritance issue in `runShards`, `runShardsGather`, and `runShardsCollect`.
+
+Before implementing: show the proposed `spawnShardPipelines` signature and the refactored orchestrator skeletons. Wait for approval.
+
+- [ ] **R4** — `spawnShardPipelines` extracted. All orchestrators use it. `FD_CLOEXEC` on all write-ends. `noKill` and kill-all in `runShardsMerge`. All tests pass.
+
+#### Step R5 — FD inheritance regression test
+
+Write a specific test that exercises `+concat+` with N=4 shards and a subprocess that pauses briefly before producing output (e.g. `sh -c 'sleep 0.05 && cat'`). This surfaces the fd inheritance bug if `FD_CLOEXEC` was not correctly applied. Confirm the test passes.
+
+- [ ] **R5** — Regression test added and passing. `+concat+` FD inheritance verified clean.
+
+#### Step R6 — dead code removal and comments
+
+Remove all confirmed-dead procs from R1: `computeZeroBytes`, `computeDataBytes`, `bcfFirstDataOffset` (if confirmed unused). Remove unused imports exposed by the refactor.
+
+Add comments to the two deferred performance issues:
+- `readNextVcfRecord`: `# TODO: reads one byte per syscall; buffer in Milestone 3`
+- `optimiseBoundaries` `notin` check: `# TODO: use HashSet[int64] to avoid O(n²) behaviour`
+
+Run `nimble build -d:release` and confirm no warnings.
+
+- [ ] **R6** — Dead code removed. Deferred issues commented. Clean release build. All tests pass.
+
+#### Step R7 — final verification
+
+Run `nimble test` in full. Confirm no behaviour changes from before Milestone R.
+
+- [ ] **R7** — Full test suite green. Milestone R complete. Ready for Milestone 3.
+
+---
+
+### Milestone C: CLI audit and compression flags
+
+This milestone audits the current CLI implementation for inconsistencies, then adds `-Oz`/`-Ou` (output compression) and `-Iu` (pipeline input decompression). `--decompress`/`-d` is retired.
+
+#### Step C0 — CLI audit
+
+Before implementing any new flags, read `src/vcfparty/main.nim` and `src/vcfparty/run.nim` in full and audit the current CLI surface:
+
+1. **Flag inventory** — list every flag currently accepted by each subcommand (`scatter`, `run`, `gather`), its long form, default value, and where it is handled in code.
+2. **`--decompress`/`-d`** — confirm it is still present and identify every code path that reads it in `main.nim`, `run.nim`, and `scatter.nim`.
+3. **Output path handling** — trace how `-o` is used in each subcommand. Is extension inference for output format already implemented from Milestone 1 (`-O` work)? What format/compression is currently written when no `-O` is specified?
+4. **Stdout detection** — how is stdout currently detected (omitted `-o`, `/dev/stdout`)? Is uncompressed output already enforced for stdout, or is this still to be implemented?
+5. **Inconsistencies** — flag any inconsistencies between subcommands (e.g. flags present on `run` but missing on `scatter`, mismatched defaults, help text that doesn't match behaviour).
+
+Present findings to the user. Wait for approval before C1.
+
+- [ ] **C0** — CLI audit complete, inconsistencies identified, approved.
+
+#### Step C1 — retire `--decompress`/`-d`, add `-Iu`
+
+Remove `--decompress`/`-d` from `main.nim`, `run.nim`, and `scatter.nim`. Replace all call sites with the new `-Iu` flag:
+
+- `-Iu`: valid on `run` only, sequential scatter only
+- Semantics: decompress BGZF blocks before piping to subprocess stdin (same behaviour as old `--decompress`)
+- If specified with interleaved scatter: warn `"warning: -Iu has no effect with interleaved scatter (always pipes uncompressed)"` and proceed
+- If specified with `--stdin`: warn `"warning: -Iu has no effect with --stdin (always pipes uncompressed)"` and proceed
+- Not valid on `scatter` or `gather`: error if passed
+
+Update help text for all subcommands. Update `test_interface.nim` and any other tests that reference `--decompress`/`-d`. Run `nimble test` — all tests pass.
+
+- [ ] **C1** — `--decompress` retired. `-Iu` implemented. All tests pass.
+
+#### Step C2 — add `-Oz`/`-Ou` output compression flags
+
+Add `-Oz` and `-Ou` to `scatter`, `run`, and `gather`:
+
+| Flag | Meaning |
+|---|---|
+| `-Oz` | Force BGZF-compressed output |
+| `-Ou` | Force uncompressed output |
+
+**Default behaviour (no flag):**
+- Infer from `-o` extension: `.vcf.gz`, `.bcf`, `.gz`, `.bgz` → BGZF; `.vcf`, `.bcf` uncompressed variant, anything else → uncompressed
+- Stdout (no `-o` or `/dev/stdout`): uncompressed
+
+**Warnings:**
+- `-Oz` with an extension that implies uncompressed (e.g. `-o out.vcf -Oz`): warn `"warning: -Oz specified but output extension suggests uncompressed"`
+- `-Ou` with an extension that implies compressed (e.g. `-o out.vcf.gz -Ou`): warn `"warning: -Ou specified but output extension suggests BGZF"`
+
+**Error:**
+- `-Oz` and `-Ou` together: error `"error: -Oz and -Ou are mutually exclusive"`
+
+Implement by wiring `-Oz`/`-Ou` into the `GatherCompression` value passed to all output-writing paths. Where extension inference already exists (from Milestone I7), `-Oz`/`-Ou` overrides it. Where it does not exist yet, implement it now.
+
+Write tests covering: `-Oz` produces valid BGZF output; `-Ou` produces uncompressed output; extension mismatch warnings; mutual exclusion error; stdout always uncompressed regardless of flag. Run `nimble test`.
+
+- [ ] **C2** — `-Oz`/`-Ou` implemented on all subcommands. Extension inference consistent. All tests pass.
+
+#### Step C3 — address audit inconsistencies
+
+Fix any inconsistencies identified in C0 that are not already resolved by C1/C2. Likely candidates based on the audit findings:
+
+- Flags present on `run` but missing on `scatter` or `gather` (or vice versa) where they should be symmetric
+- Help text that does not match current behaviour
+- Any subcommand that does not yet enforce the stdout-must-be-uncompressed rule
+
+Each fix: minimal change, test added or updated, `nimble test` passes.
+
+- [ ] **C3** — All audit inconsistencies resolved. Full `nimble test` green. Ready for Milestone 3.
 
 ---
 
@@ -259,69 +442,11 @@ Format auto-detected from first bytes: BGZF magic → decompress → check for `
 
 ---
 
-## Key constants
-
-### BGZF EOF block
-
-```nim
-const BGZF_EOF* = [
-  0x1f'u8, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
-  0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-  0x00, 0x00, 0x00, 0x00
-]
-```
-
-### BCF magic
-
-```nim
-const BCF_MAGIC* = [byte('B'), byte('C'), byte('F'), 0x02'u8, 0x02'u8]
-```
-
----
-
 ## Build reference
 
 ```bash
 nimble build
 nimble build -d:release
 nimble test
-nim c -d:debug -r tests/test_merge.nim   # example single file
+nim c -d:debug -r tests/test_merge.nim   # single test file
 ```
-
----
-
-## Performance testing
-
-Not run by default. Requires `--perf` fixture:
-
-```bash
-bash tests/generate_fixtures.sh --perf
-# → tests/data/chr22_1kg_full.vcf.gz (50k records, 2504 samples)
-# → tests/data/chr22_1kg_full.bcf
-
-# Benchmark
-time vcfparty run -n 8 -o out.vcf.gz tests/data/chr22_1kg_full.vcf.gz \
-  ::: bcftools view -Oz +concat+
-
-# Baseline
-time bcftools view -Oz -o out_baseline.vcf.gz tests/data/chr22_1kg_full.vcf.gz
-
-# Correctness
-bcftools view -H out.vcf.gz | sha256sum
-bcftools view -H out_baseline.vcf.gz | sha256sum
-
-# Profiling
-nim c -d:release -g src/vcfparty.nim
-perf record -g ./vcfparty run -n 8 tests/data/chr22_1kg_full.vcf.gz \
-  ::: bcftools view -Oz +concat+
-perf report
-```
-
----
-
-## Out of scope (do not implement)
-
-- Windows support
-- bcftools as a hard build or test dependency (soft runtime dependency for `-O` conversion only)
-- Tools that do not support stdin/stdout

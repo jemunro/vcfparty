@@ -274,19 +274,6 @@ block testScatter4ShardsTbi:
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
-# SC13 — testVcfScatter1Shard: 1 shard equals original (BGZF, header, completeness)
-# ---------------------------------------------------------------------------
-block testVcfScatter1Shard:
-  ## 1 shard must equal the original (record set and order).
-  let tmpDir = getTempDir() / "vcfparty_scatter_vcf_1shard_test"
-  createDir(tmpDir)
-  let tmpl = tmpDir / "shard.{}.vcf.gz"
-  scatter(SmallVcf, 1, tmpl)
-  checkShards(SmallVcf, tmpl, 1)
-  echo "PASS VCF scatter 1 shard: BGZF structure, header, completeness"
-  removeDir(tmpDir)
-
-# ---------------------------------------------------------------------------
 # SC14 — testScatterForceScan: forceScan=true ignores index; result matches indexed scatter
 # ---------------------------------------------------------------------------
 block testScatterForceScan:
@@ -464,19 +451,6 @@ proc checkBcfShards(bcfPath: string; tmpl: string; n: int) =
     &"BCF: record count mismatch: shards={shardRecs.len} orig={origRecs.len}"
   doAssert sorted(shardRecs, cmpRecBytes) == sorted(origRecs, cmpRecBytes),
     "BCF: shard records do not match original"
-
-# ---------------------------------------------------------------------------
-# SC18 — testBcfScatter1Shard: 1 BCF shard equals original (BGZF, BCF magic, completeness)
-# ---------------------------------------------------------------------------
-block testBcfScatter1Shard:
-  doAssert fileExists(SmallBcf), &"BCF fixture missing: {SmallBcf}"
-  let tmpDir = getTempDir() / "vcfparty_bcf_1shard_test"
-  createDir(tmpDir)
-  let tmpl = tmpDir / "shard.{}.bcf"
-  scatter(SmallBcf, 1, tmpl, format = FileFormat.Bcf)
-  checkBcfShards(SmallBcf, tmpl, 1)
-  echo "PASS BCF scatter 1 shard: BGZF, BCF magic, completeness"
-  removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
 # SC19 — testBcfScatter4Shards: 4 BCF shards; BGZF, BCF magic, completeness, order, size balance

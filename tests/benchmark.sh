@@ -158,7 +158,7 @@ for input_fmt in vcf bcf; do
         outfile="${TMPDIR_BASE}/pv_${input_fmt}_to_${out_fmt}_n${n}_j${j}.${outext}"
 
         t=$(run_time \
-          "${BINARY}" run -n "${n}" -j "${j}" --gather \
+          "${BINARY}" run -n "${n}" --gather \
             -o "${outfile}" "${infile}" \
             ::: bcftools view "${outflag}")
 

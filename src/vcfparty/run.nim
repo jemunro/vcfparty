@@ -3,8 +3,8 @@
 ## This module is responsible for:
 ##   1. Parsing the "---"-separated argv into vcfparty args + pipeline stages.
 ##   2. Building the sh -c command string for each shard.
-##   3. Mode inference from -o / {} / --gather flags.
-##   4. Executing per-shard pipelines concurrently up to --jobs.
+##   3. Mode inference from -o / {} flags.
+##   4. Executing per-shard pipelines concurrently (all N shards run at once).
 
 import std/[cpuinfo, os, posix, sequtils, strformat, strutils]
 {.warning[Deprecated]: off.}
@@ -12,19 +12,38 @@ import std/threadpool
 {.warning[Deprecated]: on.}
 import scatter
 import gather
+import bgzf_utils
+import std/locks
 
 # ---------------------------------------------------------------------------
 # Argv parsing
 # ---------------------------------------------------------------------------
 
+type TerminalOp* = enum
+  topNone,    ## no terminal operator — tool manages output via {}
+  topConcat,  ## +concat+  gather in genomic order via temp files
+  topMerge,   ## +merge+   k-way merge sort (interleaved scatter, future)
+  topCollect  ## +collect+ streaming gather in arrival order
+
+proc toTerminalOp*(tok: string): TerminalOp {.inline.} =
+  ## Return the TerminalOp for tok, or topNone if tok is not a terminal operator.
+  case tok
+  of "+concat+":  topConcat
+  of "+merge+":   topMerge
+  of "+collect+": topCollect
+  else:           topNone
+
 proc isSep(tok: string): bool {.inline.} =
   ## Return true for "---" or ":::" — both are valid pipeline stage separators.
   tok == "---" or tok == ":::"
 
-proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
-  ## Split argv at "---" or ":::" separators (both are equivalent).
-  ## Returns (paravarArgs, stages) where stages is a seq of per-stage token seqs.
-  ## Exits 1 with a message if no separator is present or if any stage is empty.
+proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]], TerminalOp) =
+  ## Split argv at "---" / ":::" separators and extract the terminal operator.
+  ## Returns (vcfpartyArgs, stages, terminalOp).
+  ## Terminal operators (+concat+, +merge+, +collect+) terminate the last stage;
+  ## no tokens may follow the terminal operator.
+  ## Exits 1 with a message if no separator is present, any stage is empty,
+  ## multiple terminal operators are found, or tokens appear after the terminal op.
   var firstSep = -1
   for i, tok in argv:
     if isSep(tok):
@@ -33,10 +52,30 @@ proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
   if firstSep < 0:
     stderr.writeLine "vcfparty run: at least one --- stage is required"
     quit(1)
-  let paravarArgs = argv[0 ..< firstSep]
+  let vcfpartyArgs = argv[0 ..< firstSep]
+
+  # First pass: locate the terminal operator (if any).
+  var termOpIdx = -1
+  var termOp    = topNone
+  for i in firstSep + 1 ..< argv.len:
+    let op = toTerminalOp(argv[i])
+    if op != topNone:
+      if termOp != topNone:
+        stderr.writeLine "vcfparty run: multiple terminal operators not allowed"
+        quit(1)
+      termOp    = op
+      termOpIdx = i
+  # Nothing may follow the terminal operator.
+  if termOpIdx >= 0 and termOpIdx + 1 < argv.len:
+    stderr.writeLine "vcfparty run: unexpected tokens after '" & argv[termOpIdx] &
+                     "': " & argv[termOpIdx + 1]
+    quit(1)
+
+  # Second pass: parse stages up to (but not including) the terminal operator.
+  let stageEnd = if termOpIdx >= 0: termOpIdx else: argv.len
   var stages: seq[seq[string]]
   var cur: seq[string]
-  for i in firstSep + 1 ..< argv.len:
+  for i in firstSep + 1 ..< stageEnd:
     if isSep(argv[i]):
       if cur.len == 0:
         stderr.writeLine "vcfparty run: empty pipeline stage"
@@ -46,10 +85,10 @@ proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
     else:
       cur.add(argv[i])
   if cur.len == 0:
-    stderr.writeLine "paravar run: empty pipeline stage"
+    stderr.writeLine "vcfparty run: empty pipeline stage"
     quit(1)
   stages.add(cur)
-  result = (paravarArgs, stages)
+  result = (vcfpartyArgs, stages, termOp)
 
 # ---------------------------------------------------------------------------
 # Shell command construction
@@ -69,11 +108,8 @@ proc buildShellCmd*(stages: seq[seq[string]]): string =
 # ---------------------------------------------------------------------------
 
 type RunMode* = enum
-  rmNormal,       ## paravar writes shard output files via -o
-  rmGatherStdout, ## gather → stdout (no -o, no {}, --gather)
-  rmGatherFile,   ## gather → -o file  (-o set, no {}, --gather)
-  rmToolManaged,  ## tool manages own output; paravar discards shard stdout
-  rmGatherTool    ## --gather + {} in cmd: {} substituted, gather proceeds
+  rmNormal,      ## vcfparty writes shard output files via -o
+  rmToolManaged  ## tool manages own output; vcfparty discards shard stdout
 
 proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
   ## Return true if any token in any stage contains an unescaped {}.
@@ -90,30 +126,18 @@ proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
           i += 1
   false
 
-proc inferRunMode*(hasOutput: bool; hasBrace: bool; hasGather: bool): RunMode =
-  ## Infer run mode from -o presence, {} in tool cmd, and --gather flag.
-  ## Emits warnings to stderr for ambiguous configurations.
-  ## Calls quit(1) for the error case (no output of any kind specified).
-  if not hasOutput and not hasBrace and not hasGather:
-    stderr.writeLine "error: no output specified: provide -o, --gather, or {} in the tool command"
+proc inferRunMode*(hasOutput: bool; hasBrace: bool): RunMode =
+  ## Infer run mode from -o presence and {} in tool cmd.
+  ## Emits a warning when -o is ignored (tool-managed mode).
+  ## Calls quit(1) when no output of any kind is specified.
+  if not hasOutput and not hasBrace:
+    stderr.writeLine "error: no output specified: provide -o or {} in the tool command"
     quit(1)
-  if hasOutput and not hasBrace and hasGather:
-    return rmGatherFile
-  if not hasOutput and not hasBrace and hasGather:
-    return rmGatherStdout
-  if hasOutput and not hasBrace and not hasGather:
-    return rmNormal
-  if not hasOutput and hasBrace and not hasGather:
+  if hasBrace:
+    if hasOutput:
+      stderr.writeLine "warning: -o is ignored in tool-managed mode (tool command contains {})"
     return rmToolManaged
-  if hasOutput and hasBrace and not hasGather:
-    stderr.writeLine "warning: -o is ignored in tool-managed mode (tool command contains {})"
-    return rmToolManaged
-  if not hasOutput and hasBrace and hasGather:
-    stderr.writeLine "warning: --gather and {} in tool command are both active; tool manages output, gather output written to stdout"
-    return rmGatherTool
-  # hasOutput and hasBrace and hasGather
-  stderr.writeLine "warning: --gather and {} in tool command are both active; -o used for gather output"
-  return rmGatherTool
+  return rmNormal
 
 # ---------------------------------------------------------------------------
 # {} substitution
@@ -121,7 +145,7 @@ proc inferRunMode*(hasOutput: bool; hasBrace: bool; hasGather: bool): RunMode =
 
 proc substituteToken*(tok: string; shardNum: string): string =
   ## Replace each unescaped {} in tok with shardNum.
-  ## Replace \{} with a literal {} (backslash consumed by paravar).
+  ## Replace \{} with a literal {} (backslash consumed by vcfparty).
   ## Other characters are copied unchanged.
   var r = newStringOfCap(tok.len + shardNum.len)
   var i = 0
@@ -203,19 +227,18 @@ proc waitOne(running: var seq[InFlight]; failed: var bool) =
     j += 1
 
 proc runShards*(vcfPath: string; nShards: int; outputTemplate: string;
-                nThreads: int; forceScan: bool; maxJobs: int;
+                nThreads: int; forceScan: bool;
                 stages: seq[seq[string]]; noKill: bool = false;
-                toolManaged: bool = false) =
+                toolManaged: bool = false; decompress: bool = false) =
   ## Scatter vcfPath into nShards shards and pipe each through the tool pipeline.
   ## outputTemplate may contain {} or use shard_NN. prefix naming.
-  ## Up to maxJobs shards run concurrently; pass 0 to use all CPUs.
-  ## On failure, siblings are killed (SIGTERM) unless noKill is true.
-  ## If any shard pipeline exits non-zero, prints to stderr and exits 1 at end.
+  ## All N shards run concurrently. On failure, siblings are killed (SIGTERM)
+  ## unless noKill is true. If any shard pipeline exits non-zero, prints to
+  ## stderr and exits 1 at end.
   ## When toolManaged is true, shard stdout is discarded (/dev/null); the tool
   ## is expected to write its own output files using {} in the command.
   let actualThreads = if nThreads == 0: countProcessors() else: nThreads
-  let actualMaxJobs = if maxJobs == 0: countProcessors() else: maxJobs
-  setMaxPoolSize(max(actualThreads, actualMaxJobs))
+  setMaxPoolSize(max(actualThreads, nShards))
   let fmt      = if vcfPath.endsWith(".bcf"): FileFormat.Bcf else: FileFormat.Vcf
   let tasks    = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt)
   var anyFailed = false
@@ -223,8 +246,8 @@ proc runShards*(vcfPath: string; nShards: int; outputTemplate: string;
   for i in 0 ..< nShards:
     # Stop launching new shards if a failure has been detected and !noKill.
     if anyFailed and not noKill: break
-    # Drain one finished shard if at job capacity.
-    while inFlight.len >= actualMaxJobs:
+    # Drain one finished shard if all N shards are already in flight.
+    while inFlight.len >= nShards:
       waitOne(inFlight, anyFailed)
       if anyFailed and not noKill: break
     if anyFailed and not noKill: break
@@ -256,6 +279,7 @@ proc runShards*(vcfPath: string; nShards: int; outputTemplate: string;
     # Assign pipe write-end to the shard task and spawn the writer thread.
     var task = tasks[i]
     task.outFd = pipeFds[1]
+    task.decompress = decompress
     let writeFv = spawn doWriteShard(task)
     inFlight.add(InFlight(pid: pid, writeFv: writeFv, shardIdx: i))
   # On failure without --no-kill: terminate all remaining children, then reap.
@@ -300,15 +324,16 @@ proc waitOneGather(running: var seq[InFlightGather]; failed: var bool) =
     j += 1
 
 proc runShardsGather*(vcfPath: string; nShards: int; outputTemplate: string;
-                      nThreads: int; forceScan: bool; maxJobs: int;
-                      stages: seq[seq[string]]; noKill: bool; cfg: GatherConfig) =
+                      nThreads: int; forceScan: bool;
+                      stages: seq[seq[string]]; noKill: bool; cfg: GatherConfig;
+                      decompress: bool = false) =
   ## Scatter vcfPath into nShards shards, pipe each through the tool pipeline,
   ## capture stdout via interceptor threads, then concatenate into cfg.outputPath.
   ## {} in stage tokens is substituted with the zero-padded shard number.
+  ## All N shards run concurrently.
   let actualThreads = if nThreads == 0: countProcessors() else: nThreads
-  let actualMaxJobs = if maxJobs == 0: countProcessors() else: maxJobs
   # Pool must accommodate scatter writer threads and interceptor threads simultaneously.
-  setMaxPoolSize(max(actualThreads, actualMaxJobs) + actualMaxJobs)
+  setMaxPoolSize(max(actualThreads, nShards) + nShards)
   let fmt   = if vcfPath.endsWith(".bcf"): FileFormat.Bcf else: FileFormat.Vcf
   let tasks = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt)
   createDir(cfg.tmpDir)
@@ -317,7 +342,7 @@ proc runShardsGather*(vcfPath: string; nShards: int; outputTemplate: string;
   var allTmpPaths: seq[string]
   for i in 0 ..< nShards:
     if anyFailed and not noKill: break
-    while inFlight.len >= actualMaxJobs:
+    while inFlight.len >= nShards:
       waitOneGather(inFlight, anyFailed)
       if anyFailed and not noKill: break
     if anyFailed and not noKill: break
@@ -343,6 +368,7 @@ proc runShardsGather*(vcfPath: string; nShards: int; outputTemplate: string;
     # Spawn shard writer (writes shard bytes to stdinPipe[1]).
     var task = tasks[i]
     task.outFd = stdinPipe[1]
+    task.decompress = decompress
     let writeFv = spawn doWriteShard(task)
     # Spawn interceptor (reads shell stdout from stdoutPipe[0], writes to tmpPath).
     let interceptFd = stdoutPipe[0]
@@ -358,3 +384,456 @@ proc runShardsGather*(vcfPath: string; nShards: int; outputTemplate: string;
     cleanupTempDir(cfg.tmpDir, allTmpPaths, false)
     quit(1)
   concatenateShards(cfg, allTmpPaths)
+
+# ---------------------------------------------------------------------------
+# I4 — +collect+ streaming output (arrival-order gather, no temp files)
+# ---------------------------------------------------------------------------
+
+var gCollectLock {.global.}: Lock
+
+proc writeUnderCollectLock(outFd: cint; data: seq[byte]) {.gcsafe.} =
+  ## Write data to outFd under gCollectLock. No-op for empty data.
+  if data.len == 0: return
+  acquire(gCollectLock)
+  var written = 0
+  while written < data.len:
+    let n = posix.write(outFd,
+                        cast[pointer](unsafeAddr data[written]),
+                        data.len - written)
+    if n <= 0: break
+    written += n
+  release(gCollectLock)
+
+proc lastVcfOrTextRecordEnd*(buf: seq[byte]): int {.gcsafe.} =
+  ## Return index one past the last '\n' in buf, or 0 if none.
+  for i in countdown(buf.len - 1, 0):
+    if buf[i] == byte('\n'): return i + 1
+  0
+
+proc lastBcfRecordEnd*(buf: seq[byte]): int {.gcsafe.} =
+  ## Return index one past the last complete BCF record in buf, or 0 if none.
+  var pos = 0
+  var last = 0
+  while pos + 8 <= buf.len:
+    let lS = buf[pos].uint32 or (buf[pos+1].uint32 shl 8) or
+             (buf[pos+2].uint32 shl 16) or (buf[pos+3].uint32 shl 24)
+    let lI = buf[pos+4].uint32 or (buf[pos+5].uint32 shl 8) or
+             (buf[pos+6].uint32 shl 16) or (buf[pos+7].uint32 shl 24)
+    let sz = 8 + lS.int + lI.int
+    if pos + sz > buf.len: break
+    pos += sz
+    last = pos
+  last
+
+proc doCollectInterceptor*(shardIdx: int; inputFd: cint; outFd: cint): int {.gcsafe.} =
+  ## Per-shard collect interceptor. Reads from inputFd in a streaming loop,
+  ## writing complete records to outFd under gCollectLock on each iteration.
+  ## Shard 0 writes the header then records; shards 1..N strip the header.
+  ## Returns 0 on success.
+  const ReadSize = 65536
+  var raw     = newSeq[byte](ReadSize)
+  var fmt:    GatherFormat
+  var isBgzf: bool
+  var pending:  seq[byte]   ## accumulated decompressed bytes not yet written
+  var rawAccum: seq[byte]   ## raw bytes accumulated for BGZF block reassembly
+  var bgzfPos = 0           ## offset into rawAccum of next unprocessed BGZF block
+
+  # Decompress any complete BGZF blocks from rawAccum into pending.
+  template flushBgzfBlocks() =
+    while bgzfPos + 18 <= rawAccum.len:
+      let blkSize = bgzfBlockSize(rawAccum.toOpenArray(bgzfPos, rawAccum.high))
+      if blkSize <= 0 or bgzfPos + blkSize > rawAccum.len: break
+      pending.add(
+        decompressBgzf(rawAccum.toOpenArray(bgzfPos, bgzfPos + blkSize - 1)))
+      bgzfPos += blkSize
+
+  # Append n bytes from raw[] to the decompressed pending buffer.
+  template appendRead(n: int) =
+    if isBgzf:
+      rawAccum.add(raw[0 ..< n])
+      flushBgzfBlocks()
+    else:
+      let base = pending.len
+      pending.setLen(base + n)
+      copyMem(addr pending[base], addr raw[0], n)
+
+  # ── Format detection ───────────────────────────────────────────────────
+  if shardIdx == 0:
+    let n = posix.read(inputFd, cast[pointer](addr raw[0]), ReadSize)
+    if n <= 0:
+      discard posix.close(inputFd)
+      gFormatDetected = true   # unblock shards 1..N even on empty shard 0
+      return 0
+    let (detFmt, detBgzf) = sniffStreamFormat(raw[0 ..< n])
+    fmt    = detFmt
+    isBgzf = detBgzf
+    appendRead(n)
+  else:
+    while not gFormatDetected: sleep(1)
+    fmt    = gDetectedFormat
+    isBgzf = gStreamIsBgzf
+
+  # ── Header accumulation ────────────────────────────────────────────────
+  # Read until we have the full header in pending.
+  var hEnd = -1
+  while hEnd < 0:
+    hEnd =
+      case fmt
+      of gfBcf:  findBcfHeaderEnd(pending)
+      of gfVcf:  findVcfHeaderEnd(pending)
+      of gfText: 0
+    if hEnd >= 0: break
+    let n = posix.read(inputFd, cast[pointer](addr raw[0]), ReadSize)
+    if n <= 0: break
+    appendRead(n)
+  if hEnd < 0: hEnd = pending.len
+
+  if shardIdx == 0:
+    # Write header first, then release shards 1..N.
+    writeUnderCollectLock(outFd, pending[0 ..< hEnd])
+    gDetectedFormat = fmt
+    gStreamIsBgzf   = isBgzf
+    gChromLineLen   = 0
+    gFormatDetected = true
+
+  # Advance past header.
+  pending = if hEnd < pending.len: pending[hEnd ..< pending.len] else: @[]
+
+  # ── Streaming record writes ────────────────────────────────────────────
+  # On each read(), find complete records and mutex-write them.
+  while true:
+    let eIdx =
+      case fmt
+      of gfVcf, gfText: lastVcfOrTextRecordEnd(pending)
+      of gfBcf:         lastBcfRecordEnd(pending)
+    if eIdx > 0:
+      writeUnderCollectLock(outFd, pending[0 ..< eIdx])
+      pending = if eIdx < pending.len: pending[eIdx ..< pending.len] else: @[]
+    let n = posix.read(inputFd, cast[pointer](addr raw[0]), ReadSize)
+    if n <= 0: break
+    appendRead(n)
+
+  # Final flush of any trailing complete records.
+  let eIdx =
+    case fmt
+    of gfVcf, gfText: lastVcfOrTextRecordEnd(pending)
+    of gfBcf:         lastBcfRecordEnd(pending)
+  if eIdx > 0:
+    writeUnderCollectLock(outFd, pending[0 ..< eIdx])
+
+  discard posix.close(inputFd)
+  result = 0
+
+type InFlightCollect = object
+  pid:         Pid
+  writeFv:     FlowVar[int]
+  interceptFv: FlowVar[int]
+  shardIdx:    int
+
+proc killAllCollect(running: seq[InFlightCollect]) =
+  for s in running: discard posix.kill(s.pid, SIGTERM)
+
+proc waitOneCollect(running: var seq[InFlightCollect]; failed: var bool) =
+  var status: cint
+  let donePid = posix.waitpid(-1, status, 0)
+  let code    = int((status shr 8) and 0xff)
+  var j = 0
+  while j < running.len:
+    if running[j].pid == donePid:
+      discard ^running[j].writeFv
+      let interceptCode = ^running[j].interceptFv
+      if code != 0 or interceptCode != 0:
+        stderr.writeLine &"shard {running[j].shardIdx + 1}: pipeline exited with code {code}"
+        failed = true
+      running.del(j)
+      return
+    j += 1
+
+proc runShardsCollect*(vcfPath: string; nShards: int; outputPath: string;
+                       nThreads: int; forceScan: bool;
+                       stages: seq[seq[string]]; noKill: bool; toStdout: bool;
+                       decompress: bool = false) =
+  ## +collect+: scatter into N shards, pipe each through the pipeline,
+  ## stream complete records to outputPath (or stdout) in arrival order.
+  ## No temp files. No ordering guarantee.
+  let actualThreads = if nThreads == 0: countProcessors() else: nThreads
+  # Pool must accommodate scatter writer threads and interceptor threads.
+  setMaxPoolSize(max(actualThreads, nShards) + nShards)
+  let fmt   = if vcfPath.endsWith(".bcf"): FileFormat.Bcf else: FileFormat.Vcf
+  let tasks = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt)
+
+  # Reset format-detection globals (shared with gather).
+  gFormatDetected = false
+  gDetectedFormat = gfText
+  gStreamIsBgzf   = false
+  gChromLineLen   = 0
+
+  initLock(gCollectLock)
+
+  # Open output fd (or use stdout).
+  let outFd: cint =
+    if toStdout: STDOUT_FILENO
+    else:
+      let fd = posix.open(outputPath.cstring,
+                          O_WRONLY or O_CREAT or O_TRUNC, 0o666.Mode)
+      if fd < 0:
+        stderr.writeLine "error: could not create output file: " & outputPath
+        quit(1)
+      fd
+
+  var anyFailed = false
+  var inFlight: seq[InFlightCollect]
+  for i in 0 ..< nShards:
+    if anyFailed and not noKill: break
+    while inFlight.len >= nShards:
+      waitOneCollect(inFlight, anyFailed)
+      if anyFailed and not noKill: break
+    if anyFailed and not noKill: break
+    # stdin pipe: shard writer → shell stdin
+    # stdout pipe: shell stdout → collect interceptor
+    var stdinPipe:  array[2, cint]
+    var stdoutPipe: array[2, cint]
+    if posix.pipe(stdinPipe) != 0 or posix.pipe(stdoutPipe) != 0:
+      stderr.writeLine &"error: pipe() failed for shard {i + 1}"
+      quit(1)
+    let shardCmd = buildShellCmdForShard(stages, i, nShards)
+    let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutPipe[1], shardCmd, i)
+    discard posix.close(stdinPipe[0])
+    discard posix.close(stdoutPipe[1])
+    var task = tasks[i]
+    task.outFd = stdinPipe[1]
+    task.decompress = decompress
+    let writeFv     = spawn doWriteShard(task)
+    let interceptFv = spawn doCollectInterceptor(i, stdoutPipe[0], outFd)
+    inFlight.add(InFlightCollect(pid: pid, writeFv: writeFv,
+                                 interceptFv: interceptFv, shardIdx: i))
+
+  if anyFailed and not noKill:
+    killAllCollect(inFlight)
+  while inFlight.len > 0:
+    waitOneCollect(inFlight, anyFailed)
+
+  deinitLock(gCollectLock)
+  if not toStdout: discard posix.close(outFd)
+  if anyFailed: quit(1)
+
+# ---------------------------------------------------------------------------
+# M5 — +merge+ k-way merge output (sequential scatter)
+# ---------------------------------------------------------------------------
+
+var gMergeBgzfWarned {.global.}: bool = false
+
+proc doMergeFeeder(shardIdx: int; srcFd: cint; relayWriteFd: cint): int {.gcsafe.} =
+  ## Read from srcFd (subprocess stdout), strip VCF/BCF header, relay
+  ## post-header bytes (decompressed if BGZF) to relayWriteFd.
+  ## Shard 0: sets gMergeFormat and gMergeHeaderAvail when header is found.
+  ## Closes relayWriteFd and srcFd before returning.
+  const ReadSize = 65536
+  var raw      = newSeq[byte](ReadSize)
+  var pending: seq[byte]
+  var isBgzf   = false
+  var fmt      = gfVcf
+  var rawAccum: seq[byte]
+  var bgzfPos  = 0
+
+  template flushBgzf() =
+    while bgzfPos + 18 <= rawAccum.len:
+      let blkSize = bgzfBlockSize(rawAccum.toOpenArray(bgzfPos, rawAccum.high))
+      if blkSize <= 0 or bgzfPos + blkSize > rawAccum.len: break
+      pending.add(decompressBgzf(rawAccum.toOpenArray(bgzfPos, bgzfPos + blkSize - 1)))
+      bgzfPos += blkSize
+
+  template appendRead(n: int) =
+    if isBgzf:
+      rawAccum.add(raw[0 ..< n])
+      flushBgzf()
+    else:
+      let base = pending.len
+      pending.setLen(base + n)
+      copyMem(addr pending[base], addr raw[0], n)
+
+  # --- First read: format + BGZF detection ---
+  let n0 = posix.read(srcFd, cast[pointer](addr raw[0]), ReadSize)
+  if n0 <= 0:
+    discard posix.close(relayWriteFd)
+    if shardIdx == 0:
+      gMergeFormat      = gfVcf
+      gMergeHeaderAvail = true
+    discard posix.close(srcFd)
+    return 0
+
+  let (detFmt, detBgzf) = sniffStreamFormat(raw[0 ..< n0])
+  fmt    = detFmt
+  isBgzf = detBgzf
+  if isBgzf and not gMergeBgzfWarned:
+    gMergeBgzfWarned = true
+    stderr.writeLine "warning: +merge+ works best with uncompressed output (-Ou/-Ov) from the last pipeline stage"
+  appendRead(n0.int)
+
+  # --- Header accumulation ---
+  var hEnd = -1
+  while hEnd < 0:
+    hEnd =
+      case fmt
+      of gfBcf:  findBcfHeaderEnd(pending)
+      of gfVcf:  findVcfHeaderEnd(pending)
+      of gfText: 0
+    if hEnd >= 0: break
+    let n = posix.read(srcFd, cast[pointer](addr raw[0]), ReadSize)
+    if n <= 0: break
+    appendRead(n.int)
+  if hEnd < 0: hEnd = pending.len
+
+  # --- Signal shard 0 format availability ---
+  if shardIdx == 0:
+    let sz = min(hEnd, gMergeHeaderCap)
+    if sz > 0:
+      copyMem(addr gMergeHeaderBuf[0], unsafeAddr pending[0], sz)
+    gMergeHeaderLen   = sz.int32
+    gMergeFormat      = fmt
+    gMergeHeaderAvail = true
+
+  # --- Relay post-header records to relayWriteFd ---
+  template relayBytes(data: openArray[byte]) =
+    var w = 0
+    while w < data.len:
+      let nw = posix.write(relayWriteFd, cast[pointer](unsafeAddr data[w]),
+                           data.len - w)
+      if nw <= 0:
+        discard posix.close(relayWriteFd)
+        discard posix.close(srcFd)
+        return 0
+      w += nw
+
+  # Flush already-buffered post-header bytes.
+  if hEnd < pending.len:
+    relayBytes(pending.toOpenArray(hEnd, pending.high))
+  pending = @[]
+
+  # Continue reading and relaying until srcFd EOF.
+  while true:
+    let n = posix.read(srcFd, cast[pointer](addr raw[0]), ReadSize)
+    if n <= 0: break
+    if isBgzf:
+      rawAccum.add(raw[0 ..< n])
+      flushBgzf()
+      if pending.len > 0:
+        relayBytes(pending.toOpenArray(0, pending.high))
+        pending = @[]
+    else:
+      relayBytes(raw.toOpenArray(0, n - 1))
+
+  discard posix.close(relayWriteFd)
+  discard posix.close(srcFd)
+  result = 0
+
+type InFlightMerge = object
+  pid:      Pid
+  writeFv:  FlowVar[int]
+  feederFv: FlowVar[int]
+  shardIdx: int
+
+proc waitOneMerge(running: var seq[InFlightMerge]; failed: var bool) =
+  var status: cint
+  let donePid = posix.waitpid(-1, status, 0)
+  let code    = int((status shr 8) and 0xff)
+  var j = 0
+  while j < running.len:
+    if running[j].pid == donePid:
+      discard ^running[j].writeFv
+      discard ^running[j].feederFv
+      if code != 0:
+        stderr.writeLine &"shard {running[j].shardIdx + 1}: pipeline exited with code {code}"
+        failed = true
+      running.del(j)
+      return
+    j += 1
+
+proc runShardsMerge*(vcfPath: string; nShards: int; outputPath: string;
+                     nThreads: int; forceScan: bool;
+                     stages: seq[seq[string]]; noKill: bool; toStdout: bool;
+                     decompress: bool = false) =
+  ## +merge+: scatter vcfPath into nShards shards, pipe each through the pipeline,
+  ## strip headers, k-way merge records to outputPath (or stdout) in genomic order.
+  ## No temp files. Output is uncompressed VCF or BCF.
+  ## Sequential scatter warning: may block on the slowest shard until M3 implements
+  ## interleaved scatter.
+  let actualThreads = if nThreads == 0: countProcessors() else: nThreads
+  setMaxPoolSize(max(actualThreads, nShards) + nShards)
+  let fmt   = if vcfPath.endsWith(".bcf"): FileFormat.Bcf else: FileFormat.Vcf
+  let tasks = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt)
+
+  # Reset merge globals.
+  gMergeHeaderAvail = false
+  gMergeHeaderLen   = 0
+  gMergeFormat      = if fmt == FileFormat.Bcf: gfBcf else: gfVcf
+  gMergeBgzfWarned  = false
+
+  stderr.writeLine "warning: +merge+ with sequential scatter may block on the slowest shard (expected until interleaved scatter is implemented)"
+
+  var inFlight:    seq[InFlightMerge]
+  var relayReadFds: seq[cint]
+
+  for i in 0 ..< nShards:
+    var stdinPipe:  array[2, cint]
+    var stdoutPipe: array[2, cint]
+    var relayPipe:  array[2, cint]
+    if posix.pipe(stdinPipe) != 0 or posix.pipe(stdoutPipe) != 0 or
+       posix.pipe(relayPipe) != 0:
+      stderr.writeLine &"error: pipe() failed for shard {i + 1}"
+      quit(1)
+    # Prevent inherited write-ends from causing deadlocks in future forks.
+    # Child j+1 must not hold stdinPipe[1][j] or relayPipe[1][j] after exec.
+    discard posix.fcntl(stdinPipe[1], F_SETFD, FD_CLOEXEC)
+    discard posix.fcntl(relayPipe[1], F_SETFD, FD_CLOEXEC)
+    let shardCmd = buildShellCmdForShard(stages, i, nShards)
+    let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutPipe[1], shardCmd, i)
+    discard posix.close(stdinPipe[0])
+    discard posix.close(stdoutPipe[1])
+    var task = tasks[i]
+    task.outFd     = stdinPipe[1]
+    task.decompress = decompress
+    let writeFv  = spawn doWriteShard(task)
+    let feederFv = spawn doMergeFeeder(i, stdoutPipe[0], relayPipe[1])
+    relayReadFds.add(relayPipe[0])
+    inFlight.add(InFlightMerge(pid: pid, writeFv: writeFv,
+                               feederFv: feederFv, shardIdx: i))
+
+  # Wait for shard 0 feeder to detect format and capture header.
+  while not gMergeHeaderAvail: sleep(1)
+
+  # Build contig table from subprocess's output header (works for VCF and BCF pipelines).
+  let hdrSlice = @(gMergeHeaderBuf[0 ..< gMergeHeaderLen])
+  let contigTable = extractContigTable(hdrSlice)
+
+  # Open output fd.
+  let outFd: cint =
+    if toStdout: STDOUT_FILENO
+    else:
+      let fd = posix.open(outputPath.cstring,
+                          O_WRONLY or O_CREAT or O_TRUNC, 0o666.Mode)
+      if fd < 0:
+        stderr.writeLine "error: could not create output file: " & outputPath
+        quit(1)
+      fd
+
+  # Write the subprocess header to outFd (matches pipeline output format exactly).
+  var hw = 0
+  while hw < gMergeHeaderLen.int:
+    let n = posix.write(outFd, cast[pointer](addr gMergeHeaderBuf[hw]),
+                        gMergeHeaderLen.int - hw)
+    if n <= 0: break
+    hw += n
+
+  # k-way merge: reads from all N relay pipes concurrently, emits sorted records.
+  kWayMerge(relayReadFds, outFd, gMergeFormat, contigTable)
+
+  for fd in relayReadFds:
+    discard posix.close(fd)
+  if not toStdout: discard posix.close(outFd)
+
+  # Reap all subprocesses (all have exited since relay pipes are at EOF).
+  var anyFailed = false
+  while inFlight.len > 0:
+    waitOneMerge(inFlight, anyFailed)
+  if anyFailed: quit(1)

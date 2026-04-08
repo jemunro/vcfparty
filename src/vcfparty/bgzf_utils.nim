@@ -435,6 +435,38 @@ proc removeBcfHeaderBytes*(path: string): seq[byte] =
     cumUncomp += blockLen
   result = compressToBgzfMulti(@[])
 
+proc decompressBgzfBytes*(data: openArray[byte]): seq[byte] =
+  ## Decompress a sequence of concatenated BGZF blocks; return uncompressed bytes.
+  ## Stops at the first invalid or incomplete block.
+  result = @[]
+  var pos = 0
+  while pos + 18 <= data.len:
+    let blkSize = bgzfBlockSize(data.toOpenArray(pos, data.high))
+    if blkSize <= 0 or pos + blkSize > data.len: break
+    result.add(decompressBgzf(data.toOpenArray(pos, pos + blkSize - 1)))
+    pos += blkSize
+
+proc decompressCopyBytes*(srcPath: string; dst: File; start: int64; length: int64) =
+  ## Read BGZF blocks from [start, start+length) in srcPath, decompress each,
+  ## and write the raw uncompressed bytes to dst.
+  let src = open(srcPath, fmRead)
+  defer: src.close()
+  var cur = start
+  let endAt = start + length
+  var hdrBuf = newSeq[byte](18)
+  while cur + 18 <= endAt:
+    src.setFilePos(cur)
+    if readBytes(src, hdrBuf, 0, 18) < 18: break
+    let blkSize = bgzfBlockSize(hdrBuf)
+    if blkSize <= 0 or cur + blkSize.int64 > endAt: break
+    var blk = newSeq[byte](blkSize)
+    src.setFilePos(cur)
+    discard readBytes(src, blk, 0, blkSize)
+    let decompressed = decompressBgzf(blk)
+    if decompressed.len > 0:
+      discard dst.writeBytes(decompressed, 0, decompressed.len)
+    cur += blkSize.int64
+
 proc removeHeaderLines*(path: string; offset: int64; size: int64): seq[byte] =
   ## Read all BGZF blocks in [offset, offset+size) from path, decompress the
   ## entire range (may span multiple blocks), strip every line starting with

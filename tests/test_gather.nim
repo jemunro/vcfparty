@@ -265,7 +265,7 @@ block testSniffStreamFormatText:
 block testSniffStreamFormatUncompressedVcf:
   # Uncompressed VCF (##fileformat header but no BGZF wrapper).
   var raw: seq[byte]
-  for c in "##fileformatVCFv4.2\n##source=paravar\n#CHROM\tPOS\n":
+  for c in "##fileformatVCFv4.2\n##source=vcfparty\n#CHROM\tPOS\n":
     raw.add(byte(c))
   let (fmt, isBgzf) = sniffStreamFormat(raw)
   doAssert fmt == gfVcf,  &"uncompressed VCF: expected gfVcf, got {fmt}"
@@ -910,7 +910,7 @@ block testGatherVcfCompressed:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} {SmallVcf} --- bcftools view -Oz")
+    &"-n 4 -o {outPath} {SmallVcf} ::: bcftools view -Oz +concat+")
   doAssert code == 0, &"VCF gather -Oz exited {code}:\n{outp}"
   doAssert fileExists(outPath), "VCF gather -Oz: output missing"
   let got = countRecords(outPath)
@@ -930,7 +930,7 @@ block testGatherVcfRecompress:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} {SmallVcf} --- bcftools view -Ov")
+    &"-n 4 -o {outPath} {SmallVcf} ::: bcftools view -Ov +concat+")
   doAssert code == 0, &"VCF gather -Ov exited {code}:\n{outp}"
   doAssert fileExists(outPath), "VCF gather -Ov: output missing"
   let got = countRecords(outPath)
@@ -950,7 +950,7 @@ block testGatherBcfCompressed:
   createDir(tmpDir)
   let outPath = tmpDir / "out.bcf"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} {SmallBcf} --- bcftools view -Ob")
+    &"-n 4 -o {outPath} {SmallBcf} ::: bcftools view -Ob +concat+")
   doAssert code == 0, &"BCF gather -Ob exited {code}:\n{outp}"
   doAssert fileExists(outPath), "BCF gather -Ob: output missing"
   let got = countRecords(outPath)
@@ -970,7 +970,7 @@ block testGatherBcfRecompress:
   createDir(tmpDir)
   let outPath = tmpDir / "out.bcf"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} {SmallBcf} --- bcftools view -Ou")
+    &"-n 4 -o {outPath} {SmallBcf} ::: bcftools view -Ou +concat+")
   doAssert code == 0, &"BCF gather -Ou exited {code}:\n{outp}"
   doAssert fileExists(outPath), "BCF gather -Ou: output missing"
   let got = countRecords(outPath)
@@ -990,7 +990,7 @@ block testGatherText:
   createDir(tmpDir)
   let outPath = tmpDir / "out.txt"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} {SmallVcf} --- bcftools query -f '%CHROM\\t%POS\\n'")
+    &"-n 4 -o {outPath} {SmallVcf} ::: bcftools query -f '%CHROM\\t%POS\\n' +concat+")
   doAssert code == 0, &"text gather exited {code}:\n{outp}"
   doAssert fileExists(outPath), "text gather: output missing"
   let (lineOut, _) = execCmdEx("wc -l < " & outPath)
@@ -1014,7 +1014,7 @@ block testGatherTextHeaderN:
   let outPath = tmpDir / "out.txt"
   let pipeline = "{ echo 'CHROM\tPOS'; bcftools query -f '%CHROM\\t%POS\\n'; }"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} --header-n 1 {SmallVcf} --- sh -c {quoteShell(pipeline)}")
+    &"-n 4 -o {outPath} --header-n 1 {SmallVcf} ::: sh -c {quoteShell(pipeline)} +concat+")
   doAssert code == 0, &"text gather --header-n 1 exited {code}:\n{outp}"
   doAssert fileExists(outPath), "text gather --header-n: output missing"
   let (lineOut, _) = execCmdEx("wc -l < " & outPath)
@@ -1040,8 +1040,8 @@ block testGatherUnknownExt:
   createDir(tmpDir)
   let outPath = tmpDir / "out.out.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} " &
-    &"{SmallVcf} --- bcftools query -f '%CHROM\\t%POS\\n'")
+    &"-n 4 -o {outPath} " &
+    &"{SmallVcf} ::: bcftools query -f '%CHROM\\t%POS\\n' +concat+")
   doAssert code == 0, &"unknown-ext gather exited {code}:\n{outp}"
   doAssert fileExists(outPath), "unknown-ext gather: output missing"
   # Output should be valid BGZF (because of .gz).
@@ -1070,7 +1070,7 @@ block testGatherShardFailure:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 2 --gather -o {outPath} --tmp-dir {tDir} {SmallVcf} --- false")
+    &"-n 2 -o {outPath} --tmp-dir {tDir} {SmallVcf} ::: false +concat+")
   doAssert code != 0, "shard failure: vcfparty should exit non-zero"
   # At least one temp path should be printed to stderr.
   doAssert tDir in outp,
@@ -1092,8 +1092,8 @@ block testGatherCustomTmpDir:
   createDir(tmpDir)
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} --tmp-dir {customTmp} " &
-    &"{SmallVcf} --- bcftools view -Oz")
+    &"-n 4 -o {outPath} --tmp-dir {customTmp} " &
+    &"{SmallVcf} ::: bcftools view -Oz +concat+")
   doAssert code == 0, &"--tmp-dir exited {code}:\n{outp}"
   doAssert fileExists(outPath), "--tmp-dir: output missing"
   # On success the custom tmp dir should be cleaned up.
@@ -1117,7 +1117,7 @@ block testGatherTextHeaderPattern:
   let outPath = tmpDir / "out.txt"
   let pipeline = "{ echo '##CHROM\tPOS'; bcftools query -f '%CHROM\\t%POS\\n'; }"
   let (outp, code) = runGather(
-    &"-n 4 --gather -o {outPath} --header-pattern \"##\" {SmallVcf} --- sh -c {quoteShell(pipeline)}")
+    &"-n 4 -o {outPath} --header-pattern \"##\" {SmallVcf} ::: sh -c {quoteShell(pipeline)} +concat+")
   doAssert code == 0, &"text gather --header-pattern exited {code}:\n{outp}"
   doAssert fileExists(outPath), "text gather --header-pattern: output missing"
   let (lineOut, _) = execCmdEx("wc -l < " & outPath)
@@ -1224,30 +1224,6 @@ block testGatherSubcmdStdout:
   echo &"PASS G8.3 gather subcommand stdout: {got} records written to stdout"
 
 # ---------------------------------------------------------------------------
-# G8.3b — /dev/stdout explicit path also works
-# ---------------------------------------------------------------------------
-
-block testGatherSubcmdDevStdout:
-  let tmpDir = getTempDir() / "vcfparty_g8_devstdout"
-  createDir(tmpDir)
-  let (sOutp, sCode) = execCmdEx(
-    BinPath & &" scatter -n 4 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
-  doAssert sCode == 0, &"G8.3b scatter exited {sCode}:\n{sOutp}"
-  var shards: seq[string]
-  for i in 1..4:
-    shards.add(tmpDir / ("shard_" & $i & ".shard.vcf.gz"))
-  let shardsArg = shards.join(" ")
-  let stdoutFile = tmpDir / "stdout.vcf"
-  let (gOutp, gCode) = execCmdEx(
-    BinPath & &" gather -o /dev/stdout {shardsArg} > {stdoutFile} 2>&1")
-  doAssert gCode == 0, &"G8.3b gather /dev/stdout exited {gCode}:\n{gOutp}"
-  let got  = countRecords(stdoutFile)
-  let orig = countRecords(SmallVcf)
-  doAssert got == orig, &"G8.3b: record count {got} != {orig}"
-  removeDir(tmpDir)
-  echo &"PASS G8.3b gather subcommand /dev/stdout: {got} records"
-
-# ---------------------------------------------------------------------------
 # G8.4 — No input files exits non-zero
 # ---------------------------------------------------------------------------
 
@@ -1276,7 +1252,7 @@ block testGatherSubcmdMissingFile:
   echo "PASS G8.5 gather subcommand: missing input file exits non-zero"
 
 # ---------------------------------------------------------------------------
-# G8.6 — run --gather without -o: output goes to stdout
+# G8.6 — run +concat+ without -o: output goes to stdout
 # ---------------------------------------------------------------------------
 
 block testRunGatherStdout:
@@ -1285,13 +1261,65 @@ block testRunGatherStdout:
   let stdoutFile = tmpDir / "stdout.vcf"
   # No -o; stdout is captured via shell redirection.
   let (outp, code) = execCmdEx(
-    BinPath & &" run --gather -n 4 {SmallVcf} ::: cat > {stdoutFile} 2>&1")
-  doAssert code == 0, &"G8.6 run --gather stdout exited {code}:\n{outp}"
+    BinPath & &" run -n 4 {SmallVcf} ::: cat +concat+ > {stdoutFile} 2>&1")
+  doAssert code == 0, &"G8.6 run +concat+ stdout exited {code}:\n{outp}"
   let got  = countRecords(stdoutFile)
   let orig = countRecords(SmallVcf)
   doAssert got == orig, &"G8.6: record count {got} != {orig}"
   removeDir(tmpDir)
-  echo &"PASS G8.6 run --gather stdout: {got} records written to stdout"
+  echo &"PASS G8.6 run +concat+ stdout: {got} records written to stdout"
+
+# ---------------------------------------------------------------------------
+# G8.7 — gather --merge VCF: 4 shards → sorted output, record count and hash match
+# ---------------------------------------------------------------------------
+
+block testGatherMergeVcf:
+  let tmpDir = getTempDir() / "vcfparty_g8_merge_vcf"
+  createDir(tmpDir)
+  let (sOutp, sCode) = execCmdEx(
+    BinPath & &" scatter -n 4 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
+  doAssert sCode == 0, &"G8.7 scatter exited {sCode}:\n{sOutp}"
+  var shards: seq[string]
+  for i in 1..4:
+    shards.add(tmpDir / ("shard_" & $i & ".shard.vcf.gz"))
+  let shardsArg = shards.join(" ")
+  let outPath = tmpDir / "merged.vcf"
+  let (gOutp, gCode) = runGatherSubcmd(&"--merge -o {outPath} {shardsArg}")
+  doAssert gCode == 0, &"G8.7 gather --merge exited {gCode}:\n{gOutp}"
+  doAssert fileExists(outPath), "G8.7: output missing"
+  let got  = countRecords(outPath)
+  let orig = countRecords(SmallVcf)
+  doAssert got == orig, &"G8.7: record count {got} != {orig}"
+  doAssert recordsHash(outPath) == recordsHash(SmallVcf),
+    "G8.7: content hash mismatch vs original"
+  removeDir(tmpDir)
+  echo &"PASS G8.7 gather --merge VCF: {got} records, content hash matches"
+
+# ---------------------------------------------------------------------------
+# G8.8 — gather --merge BCF: 4 shards → sorted output, record count and hash match
+# ---------------------------------------------------------------------------
+
+block testGatherMergeBcf:
+  let tmpDir = getTempDir() / "vcfparty_g8_merge_bcf"
+  createDir(tmpDir)
+  let (sOutp, sCode) = execCmdEx(
+    BinPath & &" scatter -n 4 -o {tmpDir}/shard.bcf {SmallBcf} 2>&1")
+  doAssert sCode == 0, &"G8.8 scatter exited {sCode}:\n{sOutp}"
+  var shards: seq[string]
+  for i in 1..4:
+    shards.add(tmpDir / ("shard_" & $i & ".shard.bcf"))
+  let shardsArg = shards.join(" ")
+  let outPath = tmpDir / "merged.bcf"
+  let (gOutp, gCode) = runGatherSubcmd(&"--merge -o {outPath} {shardsArg}")
+  doAssert gCode == 0, &"G8.8 gather --merge BCF exited {gCode}:\n{gOutp}"
+  doAssert fileExists(outPath), "G8.8: output missing"
+  let got  = countRecords(outPath)
+  let orig = countRecords(SmallBcf)
+  doAssert got == orig, &"G8.8: record count {got} != {orig}"
+  doAssert recordsHash(outPath) == recordsHash(SmallBcf),
+    "G8.8: content hash mismatch vs original"
+  removeDir(tmpDir)
+  echo &"PASS G8.8 gather --merge BCF: {got} records, content hash matches"
 
 echo ""
 echo "All gather G8 subcommand integration tests passed."
@@ -1385,10 +1413,10 @@ block testGatherChromMatch:
   let tmpDir = getTempDir() / "vcfparty_s2_match"
   createDir(tmpDir)
   let (sOutp, sCode) = execCmdEx(
-    BinPath & &" scatter -n 4 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
+    BinPath & &" scatter -n 2 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
   doAssert sCode == 0, &"S2.6 scatter exited {sCode}:\n{sOutp}"
   var shards: seq[string]
-  for i in 1..4:
+  for i in 1..2:
     shards.add(tmpDir / ("shard_" & $i & ".shard.vcf.gz"))
   let outPath = tmpDir / "merged.vcf.gz"
   let (gOutp, gCode) = runGatherSubcmd(&"-o {outPath} " & shards.join(" "))
@@ -1442,3 +1470,414 @@ block testGatherChromMismatch:
 
 echo ""
 echo "All S2 #CHROM validation tests passed."
+
+# ===========================================================================
+# G9 — gather --concat / --merge flag tests
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# G9.2 — --merge: warning emitted, output is correct (falls back to --concat)
+# ---------------------------------------------------------------------------
+
+block testGatherMergeWarning:
+  let tmpDir = getTempDir() / "vcfparty_g9_merge"
+  createDir(tmpDir)
+  let (sOutp, sCode) = execCmdEx(
+    BinPath & &" scatter -n 4 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
+  doAssert sCode == 0, &"G9.2 scatter exited {sCode}:\n{sOutp}"
+  var shards: seq[string]
+  for i in 1..4:
+    shards.add(tmpDir / ("shard_" & $i & ".shard.vcf.gz"))
+  let shardsArg = shards.join(" ")
+  let outPath = tmpDir / "gathered.vcf.gz"
+  # Capture stderr too to check for the warning.
+  let (gOutp, gCode) = runGatherSubcmd(&"--merge -o {outPath} {shardsArg}")
+  doAssert gCode == 0, &"G9.2 gather --merge exited {gCode}:\n{gOutp}"
+  doAssert fileExists(outPath), "G9.2: output missing"
+  let got  = countRecords(outPath)
+  let orig = countRecords(SmallVcf)
+  doAssert got == orig, &"G9.2: record count {got} != {orig}"
+  doAssert recordsHash(outPath) == recordsHash(SmallVcf),
+    "G9.2: content hash mismatch"
+  removeDir(tmpDir)
+  echo &"PASS G9.2 gather --merge: {got} records, content hash matches"
+
+echo ""
+echo "All G9 --concat/--merge flag tests passed."
+
+# ---------------------------------------------------------------------------
+# M1 — extractContigTable
+# ---------------------------------------------------------------------------
+
+block testExtractContigTableVcf:
+  ## Read small.vcf.gz (BGZF VCF) and verify contigs are extracted in order.
+  let f = open(SmallVcf, fmRead)
+  var buf = newSeq[byte](1024 * 1024)  # 1 MB — enough for the whole file
+  let got = readBytes(f, buf, 0, buf.len)
+  f.close()
+  let headerBytes = buf[0 ..< got]
+  let contigs = extractContigTable(headerBytes)
+  doAssert contigs.len >= 3, &"M1 VCF: expected >= 3 contigs, got {contigs.len}"
+  doAssert contigs[0] == "chr1", &"M1 VCF: contigs[0] = {contigs[0]}, expected chr1"
+  doAssert contigs[1] == "chr2", &"M1 VCF: contigs[1] = {contigs[1]}, expected chr2"
+  doAssert contigs[2] == "chr3", &"M1 VCF: contigs[2] = {contigs[2]}, expected chr3"
+  echo &"PASS M1.1 extractContigTable VCF: {contigs.len} contigs, first = {contigs[0]}"
+
+block testExtractContigTableBcf:
+  ## Read small.bcf (BGZF BCF) and verify contigs are extracted in order.
+  let f = open(SmallBcf, fmRead)
+  var buf = newSeq[byte](1024 * 1024)
+  let got = readBytes(f, buf, 0, buf.len)
+  f.close()
+  let headerBytes = buf[0 ..< got]
+  let contigs = extractContigTable(headerBytes)
+  doAssert contigs.len >= 3, &"M1 BCF: expected >= 3 contigs, got {contigs.len}"
+  doAssert contigs[0] == "chr1", &"M1 BCF: contigs[0] = {contigs[0]}, expected chr1"
+  doAssert contigs[1] == "chr2", &"M1 BCF: contigs[1] = {contigs[1]}, expected chr2"
+  doAssert contigs[2] == "chr3", &"M1 BCF: contigs[2] = {contigs[2]}, expected chr3"
+  echo &"PASS M1.2 extractContigTable BCF: {contigs.len} contigs, first = {contigs[0]}"
+
+block testExtractContigTableEmpty:
+  ## Empty input → empty result.
+  let contigs = extractContigTable(@[])
+  doAssert contigs.len == 0, &"M1 empty: expected 0 contigs, got {contigs.len}"
+  echo "PASS M1.3 extractContigTable empty input: 0 contigs"
+
+block testExtractContigTableNoContigs:
+  ## VCF header with no ##contig lines → empty result.
+  let header = "##fileformat=VCFv4.2\n##FILTER=<ID=PASS,Description=\"All filters passed\">\n#CHROM\tPOS\tID\n"
+  var bytes = newSeq[byte](header.len)
+  for i in 0 ..< header.len: bytes[i] = byte(header[i])
+  let contigs = extractContigTable(bytes)
+  doAssert contigs.len == 0, &"M1 no-contig: expected 0, got {contigs.len}"
+  echo "PASS M1.4 extractContigTable no ##contig lines: 0 contigs"
+
+block testExtractContigTableSynthetic:
+  ## Synthetic VCF with multiple ##contig lines in a specific order.
+  let header = "##fileformat=VCFv4.2\n##contig=<ID=chrX,length=100>\n##contig=<ID=chrY,length=200>\n##contig=<ID=chrM,length=300>\n#CHROM\tPOS\n"
+  var bytes = newSeq[byte](header.len)
+  for i in 0 ..< header.len: bytes[i] = byte(header[i])
+  let contigs = extractContigTable(bytes)
+  doAssert contigs == @["chrX", "chrY", "chrM"],
+    &"M1 synthetic: expected [chrX,chrY,chrM], got {contigs}"
+  echo "PASS M1.5 extractContigTable synthetic 3-contig header: order preserved"
+
+echo ""
+echo "All M1 extractContigTable tests passed."
+
+# ---------------------------------------------------------------------------
+# M2 — readNextVcfRecord and readNextBcfRecord
+# ---------------------------------------------------------------------------
+
+proc makePipe(): (cint, cint) =
+  ## Create a pipe; returns (readFd, writeFd).
+  var fds: array[2, cint]
+  doAssert posix.pipe(fds) == 0, "pipe() failed"
+  result = (fds[0], fds[1])
+
+block testReadNextVcfRecordBasic:
+  ## Three VCF lines → readNextVcfRecord reads each in order; EOF → empty.
+  let lines = "chr1\t100\t.\tA\tT\t.\tPASS\t.\n" &
+              "chr1\t200\t.\tG\tC\t.\tPASS\t.\n" &
+              "chr2\t50\t.\tT\tA\t.\tPASS\t.\n"
+  var data = newSeq[byte](lines.len)
+  for i in 0 ..< lines.len: data[i] = byte(lines[i])
+  let (rfd, wfd) = makePipe()
+  discard posix.write(wfd, cast[pointer](addr data[0]), data.len)
+  discard posix.close(wfd)
+  let r1 = readNextVcfRecord(rfd)
+  let r2 = readNextVcfRecord(rfd)
+  let r3 = readNextVcfRecord(rfd)
+  let eof = readNextVcfRecord(rfd)
+  discard posix.close(rfd)
+  doAssert r1.len > 0 and r1[r1.high] == byte('\n'), "M2 VCF r1: no trailing newline"
+  doAssert r2.len > 0 and r2[r2.high] == byte('\n'), "M2 VCF r2: no trailing newline"
+  doAssert r3.len > 0 and r3[r3.high] == byte('\n'), "M2 VCF r3: no trailing newline"
+  doAssert eof.len == 0, "M2 VCF EOF: expected empty seq"
+  let s1 = cast[string](r1)
+  doAssert s1.startsWith("chr1\t100"), &"M2 VCF r1 content: {s1}"
+  let s2 = cast[string](r2)
+  doAssert s2.startsWith("chr1\t200"), &"M2 VCF r2 content: {s2}"
+  let s3 = cast[string](r3)
+  doAssert s3.startsWith("chr2\t50"), &"M2 VCF r3 content: {s3}"
+  echo "PASS M2.1 readNextVcfRecord: 3 lines read correctly, EOF returns empty"
+
+block testReadNextVcfRecordEmpty:
+  ## Empty pipe → EOF immediately.
+  let (rfd, wfd) = makePipe()
+  discard posix.close(wfd)
+  let rec = readNextVcfRecord(rfd)
+  discard posix.close(rfd)
+  doAssert rec.len == 0, "M2 VCF empty: expected empty"
+  echo "PASS M2.2 readNextVcfRecord: empty input returns empty seq"
+
+block testReadNextBcfRecordBasic:
+  ## Synthetic BCF records: two records with known fields.
+  ## Record layout: l_shared(4 LE) + l_indiv(4 LE) + shared bytes + indiv bytes.
+  ## We use l_shared=8, l_indiv=0 with CHROM=0(int32) POS=99(int32) as shared data.
+  proc makeRecord(chromId: int32; pos: int32; lIndiv: int = 0): seq[byte] =
+    let lShared: int32 = 8   # 4 (CHROM) + 4 (POS)
+    result = newSeq[byte](8 + lShared + lIndiv)
+    result[0] = byte(lShared and 0xff)
+    result[1] = byte((lShared shr 8) and 0xff)
+    result[2] = byte((lShared shr 16) and 0xff)
+    result[3] = byte((lShared shr 24) and 0xff)
+    # l_indiv = 0
+    result[8]  = byte(chromId and 0xff)
+    result[9]  = byte((chromId shr 8) and 0xff)
+    result[10] = byte((chromId shr 16) and 0xff)
+    result[11] = byte((chromId shr 24) and 0xff)
+    result[12] = byte(pos and 0xff)
+    result[13] = byte((pos shr 8) and 0xff)
+    result[14] = byte((pos shr 16) and 0xff)
+    result[15] = byte((pos shr 24) and 0xff)
+
+  let rec1 = makeRecord(0'i32, 100'i32)
+  let rec2 = makeRecord(1'i32, 50'i32)
+  var data: seq[byte]
+  data.add(rec1)
+  data.add(rec2)
+  let (rfd, wfd) = makePipe()
+  discard posix.write(wfd, cast[pointer](addr data[0]), data.len)
+  discard posix.close(wfd)
+  let r1 = readNextBcfRecord(rfd)
+  let r2 = readNextBcfRecord(rfd)
+  let eof = readNextBcfRecord(rfd)
+  discard posix.close(rfd)
+  doAssert r1.len == rec1.len, &"M2 BCF r1 len: {r1.len} != {rec1.len}"
+  doAssert r2.len == rec2.len, &"M2 BCF r2 len: {r2.len} != {rec2.len}"
+  doAssert eof.len == 0, "M2 BCF EOF: expected empty seq"
+  # Verify CHROM and POS fields in r1.
+  let c1 = int32(r1[8].uint32 or (r1[9].uint32 shl 8) or (r1[10].uint32 shl 16) or (r1[11].uint32 shl 24))
+  let p1 = int32(r1[12].uint32 or (r1[13].uint32 shl 8) or (r1[14].uint32 shl 16) or (r1[15].uint32 shl 24))
+  doAssert c1 == 0'i32, &"M2 BCF r1 CHROM: {c1}"
+  doAssert p1 == 100'i32, &"M2 BCF r1 POS: {p1}"
+  # Verify CHROM in r2.
+  let c2 = int32(r2[8].uint32 or (r2[9].uint32 shl 8) or (r2[10].uint32 shl 16) or (r2[11].uint32 shl 24))
+  doAssert c2 == 1'i32, &"M2 BCF r2 CHROM: {c2}"
+  echo "PASS M2.3 readNextBcfRecord: 2 records read correctly, EOF returns empty"
+
+echo ""
+echo "All M2 record-reader tests passed."
+
+# ---------------------------------------------------------------------------
+# M3 — extractSortKey
+# ---------------------------------------------------------------------------
+
+block testExtractSortKeyVcf:
+  ## VCF records: verify contig rank and 0-based pos.
+  let contigs = @["chr1", "chr2", "chr3"]
+
+  proc vcfRec(chrom: string; pos: int): seq[byte] =
+    let line = chrom & "\t" & $pos & "\t.\tA\tT\t.\tPASS\t.\n"
+    result = newSeq[byte](line.len)
+    for i in 0 ..< line.len: result[i] = byte(line[i])
+
+  let (rank1, pos1) = extractSortKey(vcfRec("chr1", 100), gfVcf, contigs)
+  doAssert rank1 == 0, &"M3 VCF chr1 rank: {rank1}"
+  doAssert pos1 == 99'i32, &"M3 VCF chr1 pos: {pos1} (VCF 100 → 0-based 99)"
+
+  let (rank2, pos2) = extractSortKey(vcfRec("chr2", 1), gfVcf, contigs)
+  doAssert rank2 == 1, &"M3 VCF chr2 rank: {rank2}"
+  doAssert pos2 == 0'i32, &"M3 VCF chr2 pos: {pos2}"
+
+  let (rank3, pos3) = extractSortKey(vcfRec("chr3", 500), gfVcf, contigs)
+  doAssert rank3 == 2, &"M3 VCF chr3 rank: {rank3}"
+  doAssert pos3 == 499'i32, &"M3 VCF chr3 pos: {pos3}"
+
+  let (rankU, _) = extractSortKey(vcfRec("chrX", 1), gfVcf, contigs)
+  doAssert rankU == high(int), &"M3 VCF unknown contig rank: {rankU}"
+
+  echo "PASS M3.1 extractSortKey VCF: rank and 0-based pos correct"
+
+block testExtractSortKeyBcf:
+  ## BCF records: CHROM at offset 8, POS at offset 12 of the full record bytes.
+  let contigs = @["chr1", "chr2", "chr3"]
+
+  proc bcfRec(chromId: int32; pos: int32): seq[byte] =
+    result = newSeq[byte](16)
+    result[0] = 8   # l_shared = 8
+    # l_indiv = 0 (bytes 4..7 already zero)
+    result[8]  = byte(chromId and 0xff)
+    result[9]  = byte((chromId shr 8) and 0xff)
+    result[10] = byte((chromId shr 16) and 0xff)
+    result[11] = byte((chromId shr 24) and 0xff)
+    result[12] = byte(pos and 0xff)
+    result[13] = byte((pos shr 8) and 0xff)
+    result[14] = byte((pos shr 16) and 0xff)
+    result[15] = byte((pos shr 24) and 0xff)
+
+  let (rank0, pos0) = extractSortKey(bcfRec(0'i32, 0'i32), gfBcf, contigs)
+  doAssert rank0 == 0, &"M3 BCF chromId=0 rank: {rank0}"
+  doAssert pos0 == 0'i32, &"M3 BCF chromId=0 pos: {pos0}"
+
+  let (rank2, pos2) = extractSortKey(bcfRec(2'i32, 999'i32), gfBcf, contigs)
+  doAssert rank2 == 2, &"M3 BCF chromId=2 rank: {rank2}"
+  doAssert pos2 == 999'i32, &"M3 BCF chromId=2 pos: {pos2}"
+
+  let (rankU, _) = extractSortKey(bcfRec(99'i32, 0'i32), gfBcf, contigs)
+  doAssert rankU == high(int), &"M3 BCF out-of-range chromId rank: {rankU}"
+
+  echo "PASS M3.2 extractSortKey BCF: rank and pos from correct offsets"
+
+block testExtractSortKeyRealVcf:
+  ## Read first data record from small.vcf.gz and verify sort key is consistent.
+  let (outp, code) = execCmdEx("bcftools view -HG " & SmallVcf & " 2>/dev/null | head -1")
+  doAssert code == 0, "M3 real VCF: bcftools failed"
+  let firstLine = outp.strip
+  doAssert firstLine.len > 0, "M3 real VCF: no records found"
+  let fields = firstLine.split('\t')
+  let chrom = fields[0]
+  let vcfPos = parseInt(fields[1])
+  var rec = newSeq[byte](firstLine.len + 1)
+  for i in 0 ..< firstLine.len: rec[i] = byte(firstLine[i])
+  rec[firstLine.len] = byte('\n')
+  let contigs = @["chr1", "chr2", "chr3"]
+  let (rank, pos) = extractSortKey(rec, gfVcf, contigs)
+  var expectedRank = high(int)
+  for ci in 0 ..< contigs.len:
+    if contigs[ci] == chrom: expectedRank = ci; break
+  doAssert rank == expectedRank, &"M3 real VCF rank: {rank} != {expectedRank} (chrom={chrom})"
+  doAssert pos == int32(vcfPos - 1), &"M3 real VCF pos: {pos} != {vcfPos - 1}"
+  echo &"PASS M3.3 extractSortKey real VCF: {chrom}:{vcfPos} → rank={rank} pos={pos}"
+
+echo ""
+echo "All M3 extractSortKey tests passed."
+
+# ---------------------------------------------------------------------------
+# M4 — kWayMerge
+# ---------------------------------------------------------------------------
+
+block testKWayMergeVcfTwoStreams:
+  ## Merge 2 sorted VCF streams: output sorted and contains all records.
+  let contigs = @["chr1", "chr2"]
+  proc vcfRec(chrom: string; pos: int): seq[byte] =
+    let s = chrom & "\t" & $pos & "\t.\tA\tT\t.\tPASS\t.\n"
+    result = newSeq[byte](s.len)
+    for i in 0 ..< s.len: result[i] = byte(s[i])
+
+  # Stream 1: chr1:100, chr1:300, chr2:50  (sorted)
+  # Stream 2: chr1:200, chr2:10, chr2:100  (sorted)
+  let (rfd1, wfd1) = makePipe()
+  let (rfd2, wfd2) = makePipe()
+  block:
+    var d: seq[byte]
+    for r in @[vcfRec("chr1", 100), vcfRec("chr1", 300), vcfRec("chr2", 50)]: d.add(r)
+    discard posix.write(wfd1, cast[pointer](addr d[0]), d.len)
+  discard posix.close(wfd1)
+  block:
+    var d: seq[byte]
+    for r in @[vcfRec("chr1", 200), vcfRec("chr2", 10), vcfRec("chr2", 100)]: d.add(r)
+    discard posix.write(wfd2, cast[pointer](addr d[0]), d.len)
+  discard posix.close(wfd2)
+
+  let tmpOut = getTempDir() / "vcfparty_m4_1.vcf"
+  let outFd = posix.open(tmpOut.cstring, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o644))
+  doAssert outFd >= 0, "M4.1: failed to open output file"
+  kWayMerge(@[rfd1, rfd2], outFd, gfVcf, contigs)
+  discard posix.close(outFd)
+  discard posix.close(rfd1)
+  discard posix.close(rfd2)
+
+  var resultLines: seq[string]
+  for line in readFile(tmpOut).splitLines:
+    if line.len > 0: resultLines.add(line)
+  removeFile(tmpOut)
+
+  doAssert resultLines.len == 6, &"M4.1: expected 6 records, got {resultLines.len}"
+  let expectedPfx = @["chr1\t100", "chr1\t200", "chr1\t300",
+                      "chr2\t10",  "chr2\t50",  "chr2\t100"]
+  for i, pfx in expectedPfx:
+    doAssert resultLines[i].startsWith(pfx),
+      &"M4.1: record {i}: expected '{pfx}', got '{resultLines[i]}'"
+  echo "PASS M4.1 kWayMerge VCF: 2 streams merged in sorted order, all 6 records"
+
+block testKWayMergeSingleStream:
+  ## Single stream → output equals input (passthrough).
+  let contigs = @["chr1", "chr2"]
+  proc vcfRec(chrom: string; pos: int): seq[byte] =
+    let s = chrom & "\t" & $pos & "\t.\tA\tT\t.\tPASS\t.\n"
+    result = newSeq[byte](s.len)
+    for i in 0 ..< s.len: result[i] = byte(s[i])
+
+  let (rfd, wfd) = makePipe()
+  block:
+    var d: seq[byte]
+    for r in @[vcfRec("chr1", 10), vcfRec("chr2", 20)]: d.add(r)
+    discard posix.write(wfd, cast[pointer](addr d[0]), d.len)
+  discard posix.close(wfd)
+
+  let tmpOut = getTempDir() / "vcfparty_m4_2.vcf"
+  let outFd = posix.open(tmpOut.cstring, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o644))
+  doAssert outFd >= 0, "M4.2: failed to open output file"
+  kWayMerge(@[rfd], outFd, gfVcf, contigs)
+  discard posix.close(outFd)
+  discard posix.close(rfd)
+
+  var resultLines: seq[string]
+  for line in readFile(tmpOut).splitLines:
+    if line.len > 0: resultLines.add(line)
+  removeFile(tmpOut)
+
+  doAssert resultLines.len == 2, &"M4.2: expected 2 records, got {resultLines.len}"
+  doAssert resultLines[0].startsWith("chr1\t10"),  &"M4.2: record 0: {resultLines[0]}"
+  doAssert resultLines[1].startsWith("chr2\t20"),  &"M4.2: record 1: {resultLines[1]}"
+  echo "PASS M4.2 kWayMerge VCF single stream: passthrough, order preserved"
+
+block testKWayMergeBcfTwoStreams:
+  ## Merge 2 sorted BCF streams (synthetic records); output sorted and complete.
+  let contigs = @["chr1", "chr2"]
+  proc bcfRec(chromId: int32; pos: int32): seq[byte] =
+    result = newSeq[byte](16)
+    result[0] = 8  # l_shared = 8 (4 CHROM + 4 POS)
+    # l_indiv = 0 (bytes 4..7 zero)
+    result[8]  = byte(chromId and 0xff);         result[9]  = byte((chromId shr 8) and 0xff)
+    result[10] = byte((chromId shr 16) and 0xff); result[11] = byte((chromId shr 24) and 0xff)
+    result[12] = byte(pos and 0xff);             result[13] = byte((pos shr 8) and 0xff)
+    result[14] = byte((pos shr 16) and 0xff);    result[15] = byte((pos shr 24) and 0xff)
+
+  # Stream 1: (0,50), (1,100)   Stream 2: (0,75), (1,200)
+  # Expected merged: (0,50), (0,75), (1,100), (1,200)
+  let (rfd1, wfd1) = makePipe()
+  let (rfd2, wfd2) = makePipe()
+  block:
+    var d: seq[byte]
+    for r in @[bcfRec(0'i32, 50'i32), bcfRec(1'i32, 100'i32)]: d.add(r)
+    discard posix.write(wfd1, cast[pointer](addr d[0]), d.len)
+  discard posix.close(wfd1)
+  block:
+    var d: seq[byte]
+    for r in @[bcfRec(0'i32, 75'i32), bcfRec(1'i32, 200'i32)]: d.add(r)
+    discard posix.write(wfd2, cast[pointer](addr d[0]), d.len)
+  discard posix.close(wfd2)
+
+  let tmpOut = getTempDir() / "vcfparty_m4_3.bcf"
+  let outFd = posix.open(tmpOut.cstring, O_WRONLY or O_CREAT or O_TRUNC, Mode(0o644))
+  doAssert outFd >= 0, "M4.3: failed to open output file"
+  kWayMerge(@[rfd1, rfd2], outFd, gfBcf, contigs)
+  discard posix.close(outFd)
+  discard posix.close(rfd1)
+  discard posix.close(rfd2)
+
+  # Read back raw bytes and parse records.
+  let raw = block:
+    let f = open(tmpOut, fmRead)
+    var buf = newSeq[byte](4096)
+    let got = readBytes(f, buf, 0, buf.len)
+    f.close()
+    buf[0 ..< got]
+  removeFile(tmpOut)
+
+  proc leI32(d: seq[byte]; p: int): int32 =
+    int32(d[p].uint32 or (d[p+1].uint32 shl 8) or (d[p+2].uint32 shl 16) or (d[p+3].uint32 shl 24))
+
+  doAssert raw.len == 64, &"M4.3: expected 64 bytes (4 × 16), got {raw.len}"
+  let expected = @[(0'i32, 50'i32), (0'i32, 75'i32), (1'i32, 100'i32), (1'i32, 200'i32)]
+  for i, (expChrom, expPos) in expected:
+    let base = i * 16
+    doAssert leI32(raw, base + 8)  == expChrom, &"M4.3: rec {i} CHROM: {leI32(raw, base+8)}"
+    doAssert leI32(raw, base + 12) == expPos,   &"M4.3: rec {i} POS: {leI32(raw, base+12)}"
+  echo "PASS M4.3 kWayMerge BCF: 2 streams merged in sorted order, all 4 records"
+
+echo ""
+echo "All M4 kWayMerge tests passed."

@@ -52,11 +52,50 @@ proc scatterUsage() =
   stderr.writeLine "Options:"
   stderr.writeLine "  -n, --n-shards <int>      number of output shards (required, >= 1)"
   stderr.writeLine "  -o, --output <str>        output file prefix (required)"
+  stderr.writeLine "  -s, --sequential          sequential (contiguous) scatter — default for indexed files"
+  stderr.writeLine "  -i, --interleave          interleaved scatter — not yet implemented; emits warning and uses sequential"
+  stderr.writeLine "  -O<fmt>                   output format: v=VCF, z=VCF BGZF, b=BCF BGZF, u=BCF uncompressed"
+  stderr.writeLine "  -d, --decompress          decompress BGZF blocks before writing shard files (uncompressed output)"
   stderr.writeLine "  -t, --max-threads <int>   max threads for scan/split/write (default: min(n-shards, 8))"
   stderr.writeLine "      --force-scan          always scan BGZF blocks (ignore index even if present)"
   stderr.writeLine "  -v, --verbose             print progress info to stderr (block offsets, boundaries, shards)"
   stderr.writeLine "  -h, --help                show this help"
   quit(1)
+
+proc parseOutputFmt(p: var OptParser): string =
+  ## Parse the -O flag value (bcftools-style: -Oz, -Ob, -Ov, -Ou).
+  ## Handles attached letters (-Oz) since parseopt splits them into two short options.
+  ## Returns "v", "z", "b", or "u"; exits 1 on invalid input.
+  var v = ""
+  if p.val != "":
+    v = p.val
+  else:
+    p.next()
+    if p.kind in {cmdShortOption, cmdLongOption} and p.key.len == 1 and
+       p.key[0] in {'v', 'z', 'b', 'u'}:
+      v = p.key
+    elif p.kind == cmdArgument and p.key.len == 1 and p.key[0] in {'v', 'z', 'b', 'u'}:
+      v = p.key
+    else:
+      stderr.writeLine "error: -O requires a format letter: v (VCF uncompressed), " &
+        "z (VCF BGZF), b (BCF BGZF), u (BCF uncompressed)"
+      quit(1)
+  v = v.toLowerAscii
+  if v notin ["v", "z", "b", "u"]:
+    stderr.writeLine "error: -O: invalid format '" & v & "' (expected v, z, b, or u)"
+    quit(1)
+  result = v
+
+proc outputFmtToGather(fmt: string): (GatherFormat, GatherCompression) =
+  ## Map -O format letter to (GatherFormat, GatherCompression).
+  case fmt
+  of "v": result = (gfVcf, gcUncompressed)
+  of "z": result = (gfVcf, gcBgzf)
+  of "b": result = (gfBcf, gcBgzf)
+  of "u": result = (gfBcf, gcUncompressed)
+  else:
+    stderr.writeLine "error: internal: unknown output format: " & fmt
+    quit(1)
 
 proc nextVal(p: var OptParser; flag: string): string =
   ## Return the value for a flag, consuming the next argv token if the value
@@ -83,6 +122,10 @@ proc runScatter(rawArgs: seq[string]) =
   var nThreads     = 0
   var nThreadsSet  = false
   var forceScan    = false
+  var interleave   = false
+  var decompress   = false
+  var outputFmt    = ""
+  var outputFmtSet = false
   var p = initOptParser(rawArgs)
   while true:
     p.next()
@@ -100,6 +143,15 @@ proc runScatter(rawArgs: seq[string]) =
         nShardsSet = true
       of "o", "output":
         outPrefix = nextVal(p, "o")
+      of "s", "sequential":
+        discard  # default; accepted and ignored
+      of "i", "interleave":
+        interleave = true
+      of "d", "decompress":
+        decompress = true
+      of "O":
+        outputFmt    = parseOutputFmt(p)
+        outputFmtSet = true
       of "t", "max-threads":
         let v = nextVal(p, "t")
         try:
@@ -146,61 +198,73 @@ proc runScatter(rawArgs: seq[string]) =
     quit(1)
   if not nThreadsSet:
     nThreads = min(nShards, 8)
+  if interleave:
+    stderr.writeLine "warning: -i/--interleave is not yet implemented; using sequential scatter"
   warnFormatMismatch(inputFile, outPrefix)
-  scatter(inputFile, nShards, outPrefix, nThreads, forceScan, fmt)
+  scatter(inputFile, nShards, outPrefix, nThreads, forceScan, fmt, decompress)
 
 proc runUsage() =
   ## Print run subcommand usage to stderr and exit 1.
   stderr.writeLine "Usage: vcfparty run -n <n_shards> -o <output> [options] <input.vcf.gz> (--- | :::) <cmd> [args...] [(--- | :::) <cmd2> ...]"
   stderr.writeLine ""
   stderr.writeLine "Options:"
-  stderr.writeLine "  -n, --n-shards <int>         number of shards (required, >= 1)"
-  stderr.writeLine "  -o, --output <str>           output path or prefix (required; optional with --gather, defaults to stdout)"
-  stderr.writeLine "  -j, --max-jobs <int>         max concurrent shard pipelines (default: n-shards)"
-  stderr.writeLine "  -t, --max-threads <int>      max threads for scatter/validation (default: min(max-jobs, 8))"
+  stderr.writeLine "  -n, --n-shards <int>         number of shards (required, >= 1); controls both shard count and concurrency"
+  stderr.writeLine "  -o, --output <str>           output path or prefix (required with +concat+; stdout if omitted)"
+  stderr.writeLine "  -s, --sequential             sequential (contiguous) scatter — default for indexed files"
+  stderr.writeLine "  -i, --interleave             interleaved scatter — not yet implemented; emits warning and uses sequential"
+  stderr.writeLine "  -O<fmt>                      output format: v=VCF, z=VCF BGZF, b=BCF BGZF, u=BCF uncompressed"
+  stderr.writeLine "  -d, --decompress             decompress BGZF blocks before piping to subprocess stdin"
+  stderr.writeLine "  -t, --max-threads <int>      max threads for scatter/validation (default: min(n-shards, 8))"
   stderr.writeLine "      --force-scan             always scan BGZF blocks (ignore index even if present)"
   stderr.writeLine "      --no-kill                on failure, let sibling shards finish (default: kill them)"
-  stderr.writeLine "      --gather                 gather shard outputs into single -o file"
   stderr.writeLine "      --header-pattern <pat>   strip lines starting with pat from shards 2..N (text format only)"
   stderr.writeLine "      --header-n <n>           strip the first n lines from shards 2..N (text format only)"
   stderr.writeLine "      --tmp-dir <dir>          temp dir for gather shard files (default: $TMPDIR/vcfparty)"
   stderr.writeLine "  -v, --verbose                print per-shard progress to stderr"
   stderr.writeLine "  -h, --help                   show this help"
   stderr.writeLine ""
-  stderr.writeLine "Separate pipeline stages with --- or ::::"
-  stderr.writeLine "  vcfparty run -n 8 -o out.vcf.gz input.vcf.gz --- bcftools view -i \"GT='alt'\" -Oz"
-  stderr.writeLine "  vcfparty run -n 8 --gather -o out.vcf.gz input.vcf.gz --- bcftools view -Oz"
+  stderr.writeLine "Separate pipeline stages with --- or :::. Append a terminal operator to gather output:"
+  stderr.writeLine "  vcfparty run -n 8 input.vcf.gz ::: bcftools view -i \"GT='alt'\" -Oz +concat+"
+  stderr.writeLine "  vcfparty run -n 8 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz +concat+"
+  stderr.writeLine "  vcfparty run -n 8 input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
+  stderr.writeLine ""
+  stderr.writeLine "Terminal operators (appended after last stage):"
+  stderr.writeLine "  +concat+    gather in genomic order via temp files (-o required)"
+  stderr.writeLine "  +merge+     k-way merge sort, interleaved scatter (-o required)"
+  stderr.writeLine "  +collect+   streaming gather in arrival order (-o required)"
+  stderr.writeLine "  (none)      tool manages output via {} substitution in command"
   quit(1)
 
 proc runRun(rawArgs: seq[string]) =
   ## Parse run subcommand arguments and call runShards() or runShardsGather().
-  ## Everything before the first --- is parsed as paravar options.
+  ## Everything before the first --- is parsed as vcfparty options.
   ## Everything from --- onward is the pipeline stage definition.
   var firstSep = -1
   for i, tok in rawArgs:
     if tok == "---" or tok == ":::":
       firstSep = i
       break
-  # Parse paravar options from the slice before --- (or all args if no --- found;
+  # Parse vcfparty options from the slice before --- (or all args if no --- found;
   # parseRunArgv will emit the appropriate error when called below).
-  let paravarPart = if firstSep < 0: rawArgs else: rawArgs[0 ..< firstSep]
+  let vcfpartyPart = if firstSep < 0: rawArgs else: rawArgs[0 ..< firstSep]
   var nShards         = 0
   var nShardsSet      = false
   var outPrefix       = ""
   var inputFile       = ""
-  var nJobs           = 0
-  var nJobsSet        = false
   var nThreads        = 0
   var nThreadsSet     = false
   var forceScan       = false
   var noKill          = false
-  var gatherMode      = false
   var headerPattern   = ""
   var headerPatternSet = false
   var headerN         = 0
   var headerNSet      = false
   var tmpDir          = ""
-  var p = initOptParser(paravarPart)
+  var interleave      = false
+  var decompress      = false
+  var outputFmt       = ""
+  var outputFmtSet    = false
+  var p = initOptParser(vcfpartyPart)
   while true:
     p.next()
     case p.kind
@@ -217,17 +281,15 @@ proc runRun(rawArgs: seq[string]) =
         nShardsSet = true
       of "o", "output":
         outPrefix = nextVal(p, "o")
-      of "j", "max-jobs":
-        let v = nextVal(p, "j")
-        try:
-          nJobs = v.parseInt
-        except ValueError:
-          stderr.writeLine "error: --max-jobs must be an integer, got: " & v
-          quit(1)
-        if nJobs < 0:
-          stderr.writeLine "error: --max-jobs must be >= 0, got: " & $nJobs
-          quit(1)
-        nJobsSet = true
+      of "s", "sequential":
+        discard  # default; accepted and ignored
+      of "i", "interleave":
+        interleave = true
+      of "d", "decompress":
+        decompress = true
+      of "O":
+        outputFmt    = parseOutputFmt(p)
+        outputFmtSet = true
       of "t", "max-threads":
         let v = nextVal(p, "t")
         try:
@@ -243,8 +305,6 @@ proc runRun(rawArgs: seq[string]) =
         forceScan = true
       of "no-kill":
         noKill = true
-      of "gather":
-        gatherMode = true
       of "header-pattern":
         headerPattern    = nextVal(p, "header-pattern")
         headerPatternSet = true
@@ -289,17 +349,38 @@ proc runRun(rawArgs: seq[string]) =
   if fmt == FileFormat.Bcf and forceScan:
     stderr.writeLine "error: vcfparty: --force-scan is not supported for BCF input"
     quit(1)
-  if not nJobsSet:
-    nJobs = nShards
   if not nThreadsSet:
-    nThreads = min(nJobs, 8)
-  let (_, stages) = parseRunArgv(rawArgs)
-  let hasBrace    = hasBracePlaceholder(stages)
-  let mode        = inferRunMode(outPrefix != "", hasBrace, gatherMode)
-  case mode
-  of rmGatherFile, rmGatherStdout, rmGatherTool:
+    nThreads = min(nShards, 8)
+  if interleave:
+    stderr.writeLine "warning: -i/--interleave is not yet implemented; using sequential scatter"
+  let (_, stages, termOp) = parseRunArgv(rawArgs)
+  let hasBrace             = hasBracePlaceholder(stages)
+
+  # Build finalStages: append bcftools view for cross-format -O conversion.
+  var finalStages = stages
+  var targetGFmt  = gfVcf
+  var targetGComp = gcBgzf
+  if outputFmtSet:
+    (targetGFmt, targetGComp) = outputFmtToGather(outputFmt)
+    let inputIsBcf  = (fmt == FileFormat.Bcf)
+    let targetIsBcf = (targetGFmt == gfBcf)
+    if inputIsBcf != targetIsBcf:
+      let bcftoolsExe = findExe("bcftools")
+      if bcftoolsExe == "":
+        stderr.writeLine "error: -O " & outputFmt & " requires format conversion " &
+          "but bcftools is not on PATH"
+        stderr.writeLine "  hint: add an explicit bcftools view stage, or install bcftools"
+        quit(1)
+      finalStages.add(@["bcftools", "view", "-O" & outputFmt])
+
+  case termOp
+  of topConcat:
     let isStdout = (outPrefix == "" or outPrefix == "/dev/stdout")
-    let (gFmt, gComp) = inferGatherFormat(outPrefix, "")
+    var (gFmt, gComp) = inferGatherFormat(outPrefix, "")
+    if outputFmtSet:
+      gFmt = targetGFmt
+      if not isStdout:
+        gComp = targetGComp
     let resolvedTmpDir =
       if tmpDir != "": tmpDir
       else: getEnv("TMPDIR", "/tmp") / "vcfparty"
@@ -317,22 +398,40 @@ proc runRun(rawArgs: seq[string]) =
     validateGatherConfig(cfg)
     if not isStdout:
       warnFormatMismatch(inputFile, outPrefix)
-    runShardsGather(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs,
-                    stages, noKill, cfg)
-  of rmToolManaged:
-    runShards(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs,
-              stages, noKill, toolManaged = true)
-  of rmNormal:
-    warnFormatMismatch(inputFile, outPrefix)
-    runShards(inputFile, nShards, outPrefix, nThreads, forceScan, nJobs,
-              stages, noKill)
+    runShardsGather(inputFile, nShards, outPrefix, nThreads, forceScan,
+                    finalStages, noKill, cfg, decompress)
+  of topCollect:
+    let isStdout = (outPrefix == "" or outPrefix == "/dev/stdout")
+    if not isStdout:
+      warnFormatMismatch(inputFile, outPrefix)
+    runShardsCollect(inputFile, nShards, outPrefix, nThreads, forceScan,
+                     finalStages, noKill, isStdout, decompress)
+  of topMerge:
+    let isStdout = (outPrefix == "" or outPrefix == "/dev/stdout")
+    if not isStdout:
+      warnFormatMismatch(inputFile, outPrefix)
+    runShardsMerge(inputFile, nShards, outPrefix, nThreads, forceScan,
+                   finalStages, noKill, isStdout, decompress)
+  of topNone:
+    let mode = inferRunMode(outPrefix != "", hasBrace)
+    case mode
+    of rmToolManaged:
+      runShards(inputFile, nShards, outPrefix, nThreads, forceScan,
+                finalStages, noKill, toolManaged = true, decompress)
+    of rmNormal:
+      warnFormatMismatch(inputFile, outPrefix)
+      runShards(inputFile, nShards, outPrefix, nThreads, forceScan,
+                finalStages, noKill, decompress = decompress)
 
 proc gatherUsage() =
   ## Print gather subcommand usage to stderr and exit 1.
   stderr.writeLine "Usage: vcfparty gather [-o <output>] [options] <shard1> [<shard2> ...]"
   stderr.writeLine ""
+  stderr.writeLine ""
   stderr.writeLine "Options:"
   stderr.writeLine "  -o, --output <str>           gather output path (default: stdout)"
+  stderr.writeLine "      --concat                 concatenate shards in genomic order (default)"
+  stderr.writeLine "      --merge                  k-way merge sort output in genomic order"
   stderr.writeLine "      --header-pattern <pat>   strip lines starting with pat from shards 2..N (text format only)"
   stderr.writeLine "      --header-n <n>           strip the first n lines from shards 2..N (text format only)"
   stderr.writeLine "  -v, --verbose                print progress to stderr"
@@ -346,6 +445,7 @@ proc runGather(rawArgs: seq[string]) =
   var headerPatternSet = false
   var headerN          = 0
   var headerNSet       = false
+  var useMerge         = false
   var inputFiles: seq[string]
   var p = initOptParser(rawArgs)
   while true:
@@ -356,6 +456,10 @@ proc runGather(rawArgs: seq[string]) =
       case p.key
       of "o", "output":
         outPath = nextVal(p, "o")
+      of "concat":
+        discard  # default; accepted and ignored
+      of "merge":
+        useMerge = true
       of "header-pattern":
         headerPattern    = nextVal(p, "header-pattern")
         headerPatternSet = true
@@ -403,7 +507,10 @@ proc runGather(rawArgs: seq[string]) =
     let outDir = outPath.parentDir
     if outDir != "":
       createDir(outDir)
-  gatherFiles(cfg, inputFiles)
+  if useMerge:
+    gatherFilesMerge(cfg, inputFiles)
+  else:
+    gatherFiles(cfg, inputFiles)
 
 proc mainEntry*() =
   ## Top-level entry point: dispatch to the appropriate subcommand.

@@ -455,6 +455,7 @@ type ShardTask* = object
   boundaryHead: seq[byte]   ## head half of boundary split; empty for last shard
   eofSeq:       seq[byte]   ## BGZF EOF block (same 28 bytes for every shard)
   logLine:      string      ## pre-formatted info line; printed when writing begins
+  decompress*:  bool        ## if true, decompress BGZF blocks before writing
 
 proc doWriteShard*(task: ShardTask): int {.gcsafe.} =
   ## Write one shard to its output fd.  Returns 0.  Designed for use with
@@ -462,17 +463,30 @@ proc doWriteShard*(task: ShardTask): int {.gcsafe.} =
   ## IOError (broken pipe) is caught silently: when writing to a pipe whose
   ## read-end has been closed by an early-exiting child, the failure is
   ## detected via waitpid's exit code rather than via a write error.
+  ## When task.decompress is true, BGZF blocks are decompressed before writing
+  ## so the receiver gets a raw uncompressed byte stream.
   if task.logLine.len > 0:
     stderr.writeLine "info: " & task.logLine
   var f: File
   discard open(f, FileHandle(task.outFd), fmWrite)
   try:
-    discard f.writeBytes(task.prepend, 0, task.prepend.len)
-    if task.rawEnd > task.rawStart:
-      rawCopyBytes(task.vcfPath, f, task.rawStart, task.rawEnd - task.rawStart)
-    if task.boundaryHead.len > 0:
-      discard f.writeBytes(task.boundaryHead, 0, task.boundaryHead.len)
-    discard f.writeBytes(task.eofSeq, 0, task.eofSeq.len)
+    if task.decompress:
+      let prependRaw = decompressBgzfBytes(task.prepend)
+      discard f.writeBytes(prependRaw, 0, prependRaw.len)
+      if task.rawEnd > task.rawStart:
+        decompressCopyBytes(task.vcfPath, f, task.rawStart,
+                            task.rawEnd - task.rawStart)
+      if task.boundaryHead.len > 0:
+        let headRaw = decompressBgzfBytes(task.boundaryHead)
+        discard f.writeBytes(headRaw, 0, headRaw.len)
+      # No BGZF EOF block — the receiver gets a plain byte stream.
+    else:
+      discard f.writeBytes(task.prepend, 0, task.prepend.len)
+      if task.rawEnd > task.rawStart:
+        rawCopyBytes(task.vcfPath, f, task.rawStart, task.rawEnd - task.rawStart)
+      if task.boundaryHead.len > 0:
+        discard f.writeBytes(task.boundaryHead, 0, task.boundaryHead.len)
+      discard f.writeBytes(task.eofSeq, 0, task.eofSeq.len)
   except IOError:
     discard  # broken pipe — child exited early; failure detected via waitpid
   try: f.close() except IOError: discard
@@ -653,11 +667,12 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
 
 proc scatter*(vcfPath: string; nShards: int; outputTemplate: string;
               nThreads: int = 1; forceScan: bool = false;
-              format: FileFormat = Vcf) =
+              format: FileFormat = Vcf; decompress: bool = false) =
   ## Split vcfPath into nShards bgzipped files.
   ## outputTemplate may contain {} (replaced with zero-padded shard number)
   ## or not (shard_NN. is prepended to the basename). mkdir -p is applied.
   ## nThreads controls parallelism; pass 0 to use all CPUs.
+  ## When decompress is true, shard files are written as uncompressed VCF/BCF.
   let actualThreads = if nThreads == 0: countProcessors() else: nThreads
   setMaxPoolSize(actualThreads)
   info(&"scatter: using {actualThreads} thread(s)")
@@ -671,6 +686,7 @@ proc scatter*(vcfPath: string; nShards: int; outputTemplate: string;
     if tasks[i].outFd < 0:
       stderr.writeLine &"error: could not create output file: {outPath}"
       quit(1)
+    tasks[i].decompress = decompress
     if verbose:
       let rs = tasks[i].rawStart; let re = tasks[i].rawEnd
       let bn = if i < nShards - 1: &", boundary head {tasks[i].boundaryHead.len} bytes"

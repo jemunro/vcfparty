@@ -92,7 +92,7 @@ for name in "${NAMES[@]}"; do
 
   echo "--- ${name} ---"
   perf record -o "${perf_data}" \
-    "${BINARY}" run -n "${N}" -j "${J}" --gather \
+    "${BINARY}" run -n "${N}" --gather \
       -o "${outfile}" "${infile}" \
       ::: bcftools view "${outflag}" \
     2>/dev/null

@@ -3,8 +3,11 @@
 ## Implements the gather pipeline:
 ##   inferGatherFormat → GatherConfig → runInterceptor (per shard) → concatenateShards
 
-import std/[options, os, strformat, strutils]
+import std/[heapqueue, options, os, strformat, strutils]
 import std/posix
+{.warning[Deprecated]: off.}
+import std/threadpool
+{.warning[Deprecated]: on.}
 import bgzf_utils
 
 # ---------------------------------------------------------------------------
@@ -147,6 +150,13 @@ const gChromLineCap* = 131072   ## 128 KB — enough for any practical sample li
 var gChromLineBuf*: array[gChromLineCap, byte]
 var gChromLineLen*: int32 = 0
 
+## M5 merge globals — set by shard 0 feeder, read by main thread.
+var gMergeFormat*:      GatherFormat = gfVcf
+var gMergeHeaderAvail*: bool = false
+const gMergeHeaderCap* = 4 * 1024 * 1024  ## 4 MB — enough for any practical VCF header.
+var gMergeHeaderBuf*: array[gMergeHeaderCap, byte]
+var gMergeHeaderLen*: int32 = 0
+
 # ---------------------------------------------------------------------------
 # G3 — Header stripping helpers
 # ---------------------------------------------------------------------------
@@ -246,6 +256,189 @@ proc findBcfHeaderEnd*(data: seq[byte]): int =
   return -1
 
 # ---------------------------------------------------------------------------
+# M1 — Contig table extraction
+# ---------------------------------------------------------------------------
+
+proc extractContigTable*(headerBytes: seq[byte]): seq[string] =
+  ## Return ordered contig names from a VCF or BCF header byte sequence.
+  ## headerBytes may be BGZF-compressed (auto-detected) or raw uncompressed.
+  ## For VCF: extracts ID values from ##contig=<ID=...> lines.
+  ## For BCF: reads the embedded text header blob and applies the same parsing.
+  result = @[]
+
+  # Decompress if BGZF.
+  var text: seq[byte]
+  if isBgzfStream(headerBytes):
+    text = decompressAllBgzfBlocks(headerBytes)
+  else:
+    text = headerBytes
+
+  # For BCF: skip the binary preamble (5 magic + 4 l_text) to reach the text blob.
+  if text.len >= 9 and
+     text[0] == byte('B') and text[1] == byte('C') and text[2] == byte('F') and
+     text[3] == 0x02'u8 and text[4] == 0x02'u8:
+    let lText = leU32At(text, 5).int
+    let endPos = min(9 + lText, text.len)
+    text = text[9 ..< endPos]
+
+  # Parse ##contig=<ID=...> lines.
+  const prefix = "##contig=<ID="
+  var i = 0
+  while i < text.len:
+    var j = i
+    while j < text.len and text[j] != byte('\n'): j += 1
+    let lineLen = j - i
+    if lineLen >= prefix.len:
+      var match = true
+      for k in 0 ..< prefix.len:
+        if text[i + k] != byte(prefix[k]):
+          match = false; break
+      if match:
+        var idStart = i + prefix.len
+        var idEnd = idStart
+        while idEnd < j and text[idEnd] != byte(',') and text[idEnd] != byte('>'):
+          idEnd += 1
+        var name = newString(idEnd - idStart)
+        for k in 0 ..< (idEnd - idStart): name[k] = char(text[idStart + k])
+        result.add(name)
+    i = j + 1
+
+# ---------------------------------------------------------------------------
+# M2 — Single-record readers from raw (uncompressed) file descriptors
+# ---------------------------------------------------------------------------
+
+proc readNextVcfRecord*(fd: cint): seq[byte] =
+  ## Read exactly one VCF record (a single `\n`-terminated line) from fd.
+  ## Returns the bytes including the trailing newline.
+  ## Returns an empty seq on EOF or read error.
+  result = @[]
+  var b: byte
+  while true:
+    let n = posix.read(fd, addr b, 1)
+    if n <= 0: return  # EOF or error
+    result.add(b)
+    if b == byte('\n'): return
+
+proc readNextBcfRecord*(fd: cint): seq[byte] =
+  ## Read exactly one BCF binary record from fd.
+  ## BCF record layout: l_shared(4) + l_indiv(4) + shared(l_shared) + indiv(l_indiv).
+  ## Returns all 8 + l_shared + l_indiv bytes.
+  ## Returns an empty seq on EOF or read error.
+  result = @[]
+  var hdr: array[8, byte]
+  var got = 0
+  while got < 8:
+    let n = posix.read(fd, addr hdr[got], 8 - got)
+    if n <= 0: return  # EOF or error on header read
+    got += n
+  let lShared = (hdr[0].uint32 or (hdr[1].uint32 shl 8) or
+                 (hdr[2].uint32 shl 16) or (hdr[3].uint32 shl 24)).int
+  let lIndiv  = (hdr[4].uint32 or (hdr[5].uint32 shl 8) or
+                 (hdr[6].uint32 shl 16) or (hdr[7].uint32 shl 24)).int
+  let total = lShared + lIndiv
+  result = newSeq[byte](8 + total)
+  for i in 0 ..< 8: result[i] = hdr[i]
+  var pos = 8
+  while pos < result.len:
+    let n = posix.read(fd, addr result[pos], result.len - pos)
+    if n <= 0: return @[]  # partial read → treat as error
+    pos += n
+
+# ---------------------------------------------------------------------------
+# M3 — Sort key extraction from a single record
+# ---------------------------------------------------------------------------
+
+proc extractSortKey*(record: seq[byte]; fmt: GatherFormat;
+                     contigTable: seq[string]): (int, int32) =
+  ## Return (contig_rank, pos) for a single uncompressed record.
+  ## contig_rank is the 0-based index of CHROM in contigTable, or high(int) if not found.
+  ## pos is 0-based (VCF POS is 1-based; we subtract 1).
+  ## For BCF: CHROM is int32 at offset 8, POS is int32 at offset 12 of the full record.
+  ## For VCF: CHROM is the first tab-delimited field; POS is the second field.
+  ## Returns (high(int), 0) on parse error or empty record.
+  if record.len == 0: return (high(int), 0'i32)
+  if fmt == gfBcf:
+    if record.len < 16: return (high(int), 0'i32)
+    let chromId = int32(record[8].uint32 or (record[9].uint32 shl 8) or
+                        (record[10].uint32 shl 16) or (record[11].uint32 shl 24))
+    let pos     = int32(record[12].uint32 or (record[13].uint32 shl 8) or
+                        (record[14].uint32 shl 16) or (record[15].uint32 shl 24))
+    let rank = if chromId >= 0 and chromId < contigTable.len: chromId.int else: high(int)
+    result = (rank, pos)
+  else:
+    # VCF: parse CHROM (field 0) and POS (field 1) from tab-delimited text.
+    var tab0 = -1
+    var tab1 = -1
+    for i in 0 ..< record.len:
+      if record[i] == byte('\t'):
+        if tab0 < 0: tab0 = i
+        elif tab1 < 0: tab1 = i; break
+    if tab0 < 0 or tab1 < 0: return (high(int), 0'i32)
+    var chrom = newString(tab0)
+    for i in 0 ..< tab0: chrom[i] = char(record[i])
+    var rank = high(int)
+    for ci in 0 ..< contigTable.len:
+      if contigTable[ci] == chrom: rank = ci; break
+    # Parse POS (1-based in VCF; stored 0-based internally).
+    var pos: int32 = 0
+    for i in (tab0 + 1) ..< tab1:
+      let d = record[i].int - '0'.int
+      if d < 0 or d > 9: return (high(int), 0'i32)
+      pos = pos * 10 + d.int32
+    pos -= 1
+    result = (rank, pos)
+
+# ---------------------------------------------------------------------------
+# M4 — k-way merge from sorted fd streams
+# ---------------------------------------------------------------------------
+
+type
+  MergeEntry = object
+    rank:  int
+    pos:   int32
+    fdIdx: int
+    rec:   seq[byte]
+
+proc `<`(a, b: MergeEntry): bool {.inline.} =
+  if a.rank != b.rank: return a.rank < b.rank
+  a.pos < b.pos
+
+proc kWayMerge*(fds: seq[cint]; outFd: cint; fmt: GatherFormat;
+                contigTable: seq[string]) =
+  ## k-way priority-queue merge of N sorted, uncompressed, header-stripped record
+  ## streams. Each fd must produce VCF lines (\n-terminated) or raw BCF binary
+  ## records in sorted (contig_rank, pos) order.
+  ## Records are emitted to outFd in merged genomic order.
+  ## fds may be any POSIX file descriptors (pipes, files, etc.).
+  var heap = initHeapQueue[MergeEntry]()
+
+  template nextRec(fd: cint): seq[byte] =
+    if fmt == gfBcf: readNextBcfRecord(fd)
+    else:            readNextVcfRecord(fd)
+
+  # Seed the heap with the first record from each stream.
+  for i in 0 ..< fds.len:
+    let rec = nextRec(fds[i])
+    if rec.len > 0:
+      let (rank, pos) = extractSortKey(rec, fmt, contigTable)
+      heap.push(MergeEntry(rank: rank, pos: pos, fdIdx: i, rec: rec))
+
+  # Merge loop: always emit the minimum-key record.
+  while heap.len > 0:
+    var entry = heap.pop()
+    var written = 0
+    while written < entry.rec.len:
+      let n = posix.write(outFd, cast[pointer](addr entry.rec[written]),
+                          entry.rec.len - written)
+      if n <= 0: return
+      written += n
+    # Refill from the same stream.
+    let rec = nextRec(fds[entry.fdIdx])
+    if rec.len > 0:
+      let (rank, pos) = extractSortKey(rec, fmt, contigTable)
+      heap.push(MergeEntry(rank: rank, pos: pos, fdIdx: entry.fdIdx, rec: rec))
+
+# ---------------------------------------------------------------------------
 # S2 — #CHROM line extraction helpers
 # ---------------------------------------------------------------------------
 
@@ -323,9 +516,87 @@ proc chromLineFromFile*(path: string; fmt: GatherFormat; isBgzf: bool): string =
       return extractChromLine(decompBuf[0 ..< hEnd])
   return extractChromLine(decompBuf)
 
+proc extractInputHeaderBytes*(path: string): seq[byte] =
+  ## Read and return the decompressed header bytes (up to first data record)
+  ## from a VCF.gz or BCF input file.  BGZF blocks are decompressed in chunks.
+  let fmt = if path.endsWith(".bcf"): gfBcf else: gfVcf
+  let f = open(path, fmRead)
+  defer: f.close()
+  const BufSize = 65536
+  var buf      = newSeq[byte](BufSize)
+  var rawBuf:    seq[byte]
+  var decompBuf: seq[byte]
+  var blockPos = 0
+  while decompBuf.len < 10 * 1024 * 1024:
+    let got = readBytes(f, buf, 0, BufSize)
+    if got <= 0: break
+    rawBuf.add(buf[0 ..< got])
+    while blockPos + 18 <= rawBuf.len:
+      let blkSize = bgzfBlockSize(rawBuf.toOpenArray(blockPos, rawBuf.high))
+      if blkSize <= 0 or blockPos + blkSize > rawBuf.len: break
+      decompBuf.add(decompressBgzf(rawBuf.toOpenArray(blockPos, blockPos + blkSize - 1)))
+      blockPos += blkSize
+    let hEnd =
+      if fmt == gfBcf: findBcfHeaderEnd(decompBuf)
+      else:            findVcfHeaderEnd(decompBuf)
+    if hEnd >= 0: return decompBuf[0 ..< hEnd]
+  result = decompBuf
+
 # ---------------------------------------------------------------------------
 # Shared shard-writing helpers (used by both runInterceptor and gatherFiles)
 # ---------------------------------------------------------------------------
+
+proc computeZeroBytes*(bytes: seq[byte]; isBgzf: bool;
+                       compression: GatherCompression): seq[byte] =
+  ## Compute bytes to write for shard 0 (no header stripping, recompress as needed).
+  ## bytes must have the trailing BGZF EOF block already stripped.
+  if isBgzf and compression == gcUncompressed: decompressAllBgzfBlocks(bytes)
+  elif not isBgzf and compression == gcBgzf:   compressToBgzfMulti(bytes)
+  else: bytes
+
+proc computeDataBytes*(bytes: seq[byte]; fmt: GatherFormat; isBgzf: bool;
+                       cfg: GatherConfig): seq[byte] =
+  ## Compute bytes to write for shards 1..N (header stripped, recompressed as needed).
+  ## bytes must have the trailing BGZF EOF block already stripped.
+  if isBgzf and fmt in {gfVcf, gfBcf}:
+    var blockPos = 0
+    var decompAccum = newSeqOfCap[byte](2 * 1024 * 1024)
+    var headerEnd = -1
+    while blockPos < bytes.len and headerEnd < 0:
+      let blkSize = bgzfBlockSize(bytes.toOpenArray(blockPos, bytes.high))
+      if blkSize <= 0: break
+      decompAccum.add(decompressBgzf(bytes.toOpenArray(blockPos, blockPos + blkSize - 1)))
+      blockPos += blkSize
+      headerEnd =
+        if fmt == gfBcf: findBcfHeaderEnd(decompAccum)
+        else:            findVcfHeaderEnd(decompAccum)
+    if headerEnd < 0: headerEnd = decompAccum.len
+    let tail = decompAccum[headerEnd ..< decompAccum.len]
+    var res: seq[byte]
+    if tail.len > 0:
+      let chunk = if cfg.compression == gcBgzf: compressToBgzfMulti(tail) else: tail
+      res.add(chunk)
+    while blockPos < bytes.len:
+      let blkSize = bgzfBlockSize(bytes.toOpenArray(blockPos, bytes.high))
+      if blkSize <= 0: break
+      if cfg.compression == gcBgzf:
+        res.add(bytes[blockPos ..< blockPos + blkSize])
+      else:
+        res.add(decompressBgzf(bytes.toOpenArray(blockPos, blockPos + blkSize - 1)))
+      blockPos += blkSize
+    result = res
+  else:
+    let data: seq[byte] =
+      if isBgzf: decompressAllBgzfBlocks(bytes) else: bytes
+    let stripped: seq[byte] =
+      case fmt
+      of gfBcf:  stripBcfHeader(data)
+      of gfVcf:  stripLinesByPattern(data, "#")
+      of gfText:
+        if cfg.headerPattern.isSome:   stripLinesByPattern(data, cfg.headerPattern.get)
+        elif cfg.headerN.isSome:       stripFirstNLines(data, cfg.headerN.get)
+        else:                          data
+    result = if cfg.compression == gcBgzf: compressToBgzfMulti(stripped) else: stripped
 
 proc stripTrailingEof*(bytes: seq[byte]): seq[byte] =
   ## Return bytes with the 28-byte BGZF EOF block stripped from the end, if present.
@@ -587,3 +858,167 @@ proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
   if cfg.compression == gcBgzf:
     discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
   if not cfg.toStdout: outFile.close()
+
+# ---------------------------------------------------------------------------
+# M6 — gather --merge: k-way merge of existing shard files
+# ---------------------------------------------------------------------------
+
+proc doFileFeeder(shardIdx: int; path: string; relayWriteFd: cint): int {.gcsafe.} =
+  ## Open path, strip VCF/BCF header, decompress if BGZF, relay raw record
+  ## bytes to relayWriteFd. Shard 0 also captures the header into
+  ## gMergeHeaderBuf and signals gMergeHeaderAvail. Closes relayWriteFd.
+  const ReadSize = 65536
+  var raw     = newSeq[byte](ReadSize)
+  var pending: seq[byte]
+  var isBgzf  = false
+  var fmt     = gfVcf
+  var rawAccum: seq[byte]
+  var bgzfPos = 0
+
+  template flushBgzf() =
+    while bgzfPos + 18 <= rawAccum.len:
+      let blkSize = bgzfBlockSize(rawAccum.toOpenArray(bgzfPos, rawAccum.high))
+      if blkSize <= 0 or bgzfPos + blkSize > rawAccum.len: break
+      pending.add(decompressBgzf(rawAccum.toOpenArray(bgzfPos, bgzfPos + blkSize - 1)))
+      bgzfPos += blkSize
+
+  template appendRead(n: int) =
+    if isBgzf:
+      rawAccum.add(raw[0 ..< n])
+      flushBgzf()
+    else:
+      let base = pending.len
+      pending.setLen(base + n)
+      copyMem(addr pending[base], addr raw[0], n)
+
+  let fileFd = posix.open(path.cstring, O_RDONLY)
+  if fileFd < 0:
+    discard posix.close(relayWriteFd)
+    if shardIdx == 0:
+      gMergeFormat      = gfVcf
+      gMergeHeaderAvail = true
+    return 1
+
+  let n0 = posix.read(fileFd, cast[pointer](addr raw[0]), ReadSize)
+  if n0 <= 0:
+    discard posix.close(fileFd)
+    discard posix.close(relayWriteFd)
+    if shardIdx == 0:
+      gMergeFormat      = gfVcf
+      gMergeHeaderAvail = true
+    return 0
+
+  let (detFmt, detBgzf) = sniffStreamFormat(raw[0 ..< n0])
+  fmt    = detFmt
+  isBgzf = detBgzf
+  appendRead(n0.int)
+
+  var hEnd = -1
+  while hEnd < 0:
+    hEnd =
+      case fmt
+      of gfBcf:  findBcfHeaderEnd(pending)
+      of gfVcf:  findVcfHeaderEnd(pending)
+      of gfText: 0
+    if hEnd >= 0: break
+    let n = posix.read(fileFd, cast[pointer](addr raw[0]), ReadSize)
+    if n <= 0: break
+    appendRead(n.int)
+  if hEnd < 0: hEnd = pending.len
+
+  if shardIdx == 0:
+    let sz = min(hEnd, gMergeHeaderCap)
+    if sz > 0:
+      copyMem(addr gMergeHeaderBuf[0], unsafeAddr pending[0], sz)
+    gMergeHeaderLen   = sz.int32
+    gMergeFormat      = fmt
+    gMergeHeaderAvail = true
+
+  template relayBytes(data: openArray[byte]) =
+    var w = 0
+    while w < data.len:
+      let nw = posix.write(relayWriteFd, cast[pointer](unsafeAddr data[w]),
+                           data.len - w)
+      if nw <= 0:
+        discard posix.close(relayWriteFd)
+        discard posix.close(fileFd)
+        return 0
+      w += nw
+
+  if hEnd < pending.len:
+    relayBytes(pending.toOpenArray(hEnd, pending.high))
+  pending = @[]
+
+  while true:
+    let n = posix.read(fileFd, cast[pointer](addr raw[0]), ReadSize)
+    if n <= 0: break
+    if isBgzf:
+      rawAccum.add(raw[0 ..< n])
+      flushBgzf()
+      if pending.len > 0:
+        relayBytes(pending.toOpenArray(0, pending.high))
+        pending = @[]
+    else:
+      relayBytes(raw.toOpenArray(0, n - 1))
+
+  discard posix.close(relayWriteFd)
+  discard posix.close(fileFd)
+  result = 0
+
+proc gatherFilesMerge*(cfg: GatherConfig; inputPaths: seq[string]) =
+  ## k-way merge of sorted shard files into cfg.outputPath (or stdout).
+  ## Each shard file is opened, decompressed if BGZF, header stripped,
+  ## and records merged in genomic order via kWayMerge. No temp files.
+  if inputPaths.len == 0:
+    stderr.writeLine "error: gather: no input files provided"
+    quit(1)
+
+  let nShards = inputPaths.len
+  setMaxPoolSize(max(4, nShards))
+
+  gMergeHeaderAvail = false
+  gMergeHeaderLen   = 0
+  gMergeFormat      = gfVcf
+
+  var relayReadFds: seq[cint]
+  var feederFvs:   seq[FlowVar[int]]
+
+  for i in 0 ..< nShards:
+    var relayPipe: array[2, cint]
+    if posix.pipe(relayPipe) != 0:
+      stderr.writeLine &"error: pipe() failed for shard {i + 1}"
+      quit(1)
+    relayReadFds.add(relayPipe[0])
+    feederFvs.add(spawn doFileFeeder(i, inputPaths[i], relayPipe[1]))
+
+  while not gMergeHeaderAvail: sleep(1)
+
+  let hdrSlice    = @(gMergeHeaderBuf[0 ..< gMergeHeaderLen])
+  let contigTable = extractContigTable(hdrSlice)
+
+  let outFd: cint =
+    if cfg.toStdout: STDOUT_FILENO
+    else:
+      let fd = posix.open(cfg.outputPath.cstring,
+                          O_WRONLY or O_CREAT or O_TRUNC, 0o666.Mode)
+      if fd < 0:
+        stderr.writeLine "error: could not create output file: " & cfg.outputPath
+        quit(1)
+      fd
+
+  var hw = 0
+  while hw < gMergeHeaderLen.int:
+    let n = posix.write(outFd, cast[pointer](addr gMergeHeaderBuf[hw]),
+                        gMergeHeaderLen.int - hw)
+    if n <= 0: break
+    hw += n
+
+  kWayMerge(relayReadFds, outFd, gMergeFormat, contigTable)
+
+  for fd in relayReadFds: discard posix.close(fd)
+  if not cfg.toStdout: discard posix.close(outFd)
+
+  var anyFailed = false
+  for fv in feederFvs:
+    if (^fv) != 0: anyFailed = true
+  if anyFailed: quit(1)

@@ -21,12 +21,13 @@ const SmallBcf = DataDir / "small.bcf"
 block testSingleStage:
   let argv = @["--shards", "4", "-o", "out", "input.vcf.gz",
                "---", "bcftools", "view", "-Oz"]
-  let (pArgs, stages) = parseRunArgv(argv)
+  let (pArgs, stages, termOp) = parseRunArgv(argv)
   doAssert pArgs == @["--shards", "4", "-o", "out", "input.vcf.gz"],
     "single stage: wrong vcfparty args"
   doAssert stages.len == 1, "single stage: expected 1 stage, got " & $stages.len
   doAssert stages[0] == @["bcftools", "view", "-Oz"],
     "single stage: wrong stage tokens"
+  doAssert termOp == topNone, "single stage: expected topNone terminal op"
   echo "PASS parseRunArgv: single stage"
 
 # ---------------------------------------------------------------------------
@@ -37,7 +38,7 @@ block testMultiStage:
                "bcftools", "+split-vep", "-Ou", "--", "-f", "%SYMBOL",
                "---",
                "bcftools", "view", "-s", "Sample", "-Oz"]
-  let (pArgs, stages) = parseRunArgv(argv)
+  let (pArgs, stages, _) = parseRunArgv(argv)
   doAssert pArgs == @["-n", "10"], "multi-stage: wrong vcfparty args"
   doAssert stages.len == 2, "multi-stage: expected 2 stages, got " & $stages.len
   doAssert stages[0] == @["bcftools", "+split-vep", "-Ou", "--", "-f", "%SYMBOL"],
@@ -47,22 +48,22 @@ block testMultiStage:
   echo "PASS parseRunArgv: multi-stage pipeline"
 
 # ---------------------------------------------------------------------------
-# R3 — testSepFirst: --- at argv[0]; empty paravar args, one stage
+# R3 — testSepFirst: --- at argv[0]; empty partyvcf args, one stage
 # ---------------------------------------------------------------------------
 block testSepFirst:
   let argv = @["---", "cat"]
-  let (pArgs, stages) = parseRunArgv(argv)
+  let (pArgs, stages, _) = parseRunArgv(argv)
   doAssert pArgs.len == 0, "sep-first: vcfparty args should be empty"
   doAssert stages.len == 1, "sep-first: expected 1 stage"
   doAssert stages[0] == @["cat"], "sep-first: wrong stage tokens"
-  echo "PASS parseRunArgv: --- first, no paravar args"
+  echo "PASS parseRunArgv: --- first, no partyvcf args"
 
 # ---------------------------------------------------------------------------
 # R4 — testDashDashPassthrough: -- inside stage is a plain token, not a separator
 # ---------------------------------------------------------------------------
 block testDashDashPassthrough:
   let argv = @["---", "bcftools", "+fill-tags", "-Ou", "--", "-t", "AF"]
-  let (_, stages) = parseRunArgv(argv)
+  let (_, stages, _) = parseRunArgv(argv)
   doAssert stages.len == 1, "dash-dash: expected 1 stage"
   doAssert stages[0] == @["bcftools", "+fill-tags", "-Ou", "--", "-t", "AF"],
     "dash-dash: -- should be a plain token"
@@ -73,7 +74,7 @@ block testDashDashPassthrough:
 # ---------------------------------------------------------------------------
 block testColonColonSep:
   let argv = @["-n", "4", ":::", "bcftools", "view", "-Oz"]
-  let (pArgs, stages) = parseRunArgv(argv)
+  let (pArgs, stages, _) = parseRunArgv(argv)
   doAssert pArgs == @["-n", "4"], "::: sep: wrong vcfparty args"
   doAssert stages.len == 1, "::: sep: expected 1 stage"
   doAssert stages[0] == @["bcftools", "view", "-Oz"], "::: sep: wrong stage tokens"
@@ -84,12 +85,119 @@ block testColonColonSep:
 # ---------------------------------------------------------------------------
 block testMixedSeparators:
   let argv = @["---", "cmd1", "a", ":::", "cmd2", "b", "---", "cmd3", "c"]
-  let (_, stages) = parseRunArgv(argv)
+  let (_, stages, _) = parseRunArgv(argv)
   doAssert stages.len == 3, "mixed seps: expected 3 stages, got " & $stages.len
   doAssert stages[0] == @["cmd1", "a"], "mixed: wrong stage 0"
   doAssert stages[1] == @["cmd2", "b"], "mixed: wrong stage 1"
   doAssert stages[2] == @["cmd3", "c"], "mixed: wrong stage 2"
   echo "PASS parseRunArgv: ::: and --- may be mixed"
+
+# ===========================================================================
+# I2 — terminal operator parsing
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# I2-1: +concat+ recognised, stage tokens stop before it
+# ---------------------------------------------------------------------------
+block testTermOpConcat:
+  let argv = @["---", "bcftools", "view", "-Oz", "+concat+"]
+  let (_, stages, termOp) = parseRunArgv(argv)
+  doAssert termOp == topConcat, "concat: expected topConcat, got " & $termOp
+  doAssert stages.len == 1, "concat: expected 1 stage"
+  doAssert stages[0] == @["bcftools", "view", "-Oz"],
+    "concat: +concat+ must not appear in stage tokens"
+  echo "PASS parseRunArgv: +concat+ terminal operator"
+
+# ---------------------------------------------------------------------------
+# I2-2: +merge+ recognised
+# ---------------------------------------------------------------------------
+block testTermOpMerge:
+  let argv = @["---", "cat", "+merge+"]
+  let (_, stages, termOp) = parseRunArgv(argv)
+  doAssert termOp == topMerge, "merge: expected topMerge"
+  doAssert stages[0] == @["cat"], "merge: stage should be just [cat]"
+  echo "PASS parseRunArgv: +merge+ terminal operator"
+
+# ---------------------------------------------------------------------------
+# I2-3: +collect+ recognised
+# ---------------------------------------------------------------------------
+block testTermOpCollect:
+  let argv = @["---", "cat", "+collect+"]
+  let (_, stages, termOp) = parseRunArgv(argv)
+  doAssert termOp == topCollect, "collect: expected topCollect"
+  doAssert stages[0] == @["cat"], "collect: stage should be just [cat]"
+  echo "PASS parseRunArgv: +collect+ terminal operator"
+
+# ---------------------------------------------------------------------------
+# I2-4: terminal op after multi-stage pipeline
+# ---------------------------------------------------------------------------
+block testTermOpMultiStage:
+  let argv = @["---", "cmd1", "---", "cmd2", "+concat+"]
+  let (_, stages, termOp) = parseRunArgv(argv)
+  doAssert termOp == topConcat, "multi+concat: expected topConcat"
+  doAssert stages.len == 2, "multi+concat: expected 2 stages"
+  doAssert stages[0] == @["cmd1"], "multi+concat: wrong stage 0"
+  doAssert stages[1] == @["cmd2"], "multi+concat: wrong stage 1"
+  echo "PASS parseRunArgv: terminal op after multi-stage pipeline"
+
+# ---------------------------------------------------------------------------
+# I2-5: no terminal op → topNone (backward compat)
+# ---------------------------------------------------------------------------
+block testTermOpNone:
+  let argv = @["---", "cat"]
+  let (_, _, termOp) = parseRunArgv(argv)
+  doAssert termOp == topNone, "no-op: expected topNone"
+  echo "PASS parseRunArgv: no terminal operator → topNone"
+
+# ---------------------------------------------------------------------------
+# I2-6: toTerminalOp helper
+# ---------------------------------------------------------------------------
+block testToTerminalOp:
+  doAssert toTerminalOp("+concat+")  == topConcat,  "toTerminalOp +concat+"
+  doAssert toTerminalOp("+merge+")   == topMerge,   "toTerminalOp +merge+"
+  doAssert toTerminalOp("+collect+") == topCollect, "toTerminalOp +collect+"
+  doAssert toTerminalOp("cat")       == topNone,    "toTerminalOp plain token"
+  doAssert toTerminalOp("+CONCAT+")  == topNone,    "toTerminalOp case sensitive"
+  doAssert toTerminalOp("")          == topNone,    "toTerminalOp empty"
+  echo "PASS toTerminalOp: all cases"
+
+const BinPathEarly = "./vcfparty"
+
+# ---------------------------------------------------------------------------
+# I2-7: multiple terminal operators → exit 1
+# ---------------------------------------------------------------------------
+block testTermOpMultipleError:
+  let (outp, code) = execCmdEx(
+    BinPathEarly & " run -n 1 " & SmallVcf &
+    " ::: cat +concat+ +merge+ 2>&1")
+  doAssert code != 0, "multiple terminal ops should exit non-zero"
+  doAssert "multiple terminal operators" in outp,
+    "expected 'multiple terminal operators' in output, got:\n" & outp
+  echo "PASS parseRunArgv: multiple terminal operators → error"
+
+# ---------------------------------------------------------------------------
+# I2-8: tokens after terminal operator → exit 1
+# ---------------------------------------------------------------------------
+block testTermOpTrailingTokenError:
+  let (outp, code) = execCmdEx(
+    BinPathEarly & " run -n 1 " & SmallVcf &
+    " ::: cat +concat+ extra 2>&1")
+  doAssert code != 0, "tokens after terminal op should exit non-zero"
+  doAssert "unexpected tokens after" in outp,
+    "expected 'unexpected tokens after' in output, got:\n" & outp
+  echo "PASS parseRunArgv: tokens after terminal operator → error"
+
+# ---------------------------------------------------------------------------
+# I2-9: topNone with no -o and no {} → exit 1 (no output specified)
+# ---------------------------------------------------------------------------
+block testTopNoneNoOutputError:
+  let (outp, code) = execCmdEx(
+    BinPathEarly & " run -n 1 " & SmallVcf &
+    " ::: cat 2>&1")
+  doAssert code != 0, "no -o and no {} should exit non-zero"
+  doAssert "no output" in outp.toLowerAscii or "output" in outp.toLowerAscii,
+    "expected output-related error, got:\n" & outp
+  echo "PASS CLI run: no -o and no {} → error"
 
 # ===========================================================================
 # R7–R9 — buildShellCmd: stage list to shell command string
@@ -152,7 +260,7 @@ block testRunSingle1Shard:
   let tmpDir = getTempDir() / "vcfparty_run_r10_1shard"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 1, tmpl, 1, false, 1, @[@["cat"]])
+  runShards(SmallVcf, 1, tmpl, 1, false, @[@["cat"]])
   let outPath = shardOutputPath(tmpl, 0, 1)
   doAssert fileExists(outPath), "output missing: " & outPath
   let (_, bcCode) = execCmdEx("bcftools view -HG " & outPath & " > /dev/null 2>&1")
@@ -164,14 +272,14 @@ block testRunSingle1Shard:
   echo &"PASS runShards: 1 shard, cat stage, {orig} records"
 
 # ---------------------------------------------------------------------------
-# R11 — testRun4Shards: 4 shards, -j 4; all valid, record count + content hash match
+# R11 — testRun4Shards: 4 shards concurrent; all valid, record count + content hash match
 # ---------------------------------------------------------------------------
 block testRun4Shards:
   doAssert fileExists(SmallVcf), "fixture missing"
   let tmpDir = getTempDir() / "vcfparty_run_r11_4shards"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 4, tmpl, 1, false, 4, @[@["cat"]])
+  runShards(SmallVcf, 4, tmpl, 1, false, @[@["cat"]])
   var total = 0
   var shardPaths: seq[string]
   for i in 0..3:
@@ -186,42 +294,7 @@ block testRun4Shards:
   doAssert recordsHash(shardPaths) == recordsHash(@[SmallVcf]),
     "4-shard content hash mismatch: record corruption or reordering detected"
   removeDir(tmpDir)
-  echo &"PASS runShards: 4 shards, --jobs 4, {total} records, content hash matches"
-
-# ---------------------------------------------------------------------------
-# R12 — testRunJobs1Serial: 4 shards, -j 1; serial execution, record count matches
-# ---------------------------------------------------------------------------
-block testRunJobs1Serial:
-  doAssert fileExists(SmallVcf), "fixture missing"
-  let tmpDir = getTempDir() / "vcfparty_run_r12_jobs1"
-  createDir(tmpDir)
-  let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 4, tmpl, 1, false, 1, @[@["cat"]])  # maxJobs = 1
-  var total = 0
-  for i in 0..3:
-    let p = shardOutputPath(tmpl, i, 4)
-    doAssert fileExists(p), &"serial shard {i+1} missing"
-    let (_, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
-    doAssert bc == 0, &"bcftools rejected serial shard {i+1}"
-    total += countRecords(p)
-  let orig = countRecords(SmallVcf)
-  doAssert total == orig, &"serial record count mismatch: {total} vs {orig}"
-  removeDir(tmpDir)
-  echo &"PASS runShards: 4 shards, --jobs 1 (serial), {total} records"
-
-# ---------------------------------------------------------------------------
-# R13 — testRunJobsMoreThanShards: maxJobs > nShards; completes without hang
-# ---------------------------------------------------------------------------
-block testRunJobsMoreThanShards:
-  doAssert fileExists(SmallVcf), "fixture missing"
-  let tmpDir = getTempDir() / "vcfparty_run_r13_jobsover"
-  createDir(tmpDir)
-  let tmpl = tmpDir / "out.{}.vcf.gz"
-  runShards(SmallVcf, 2, tmpl, 1, false, 10, @[@["cat"]])  # 10 jobs for 2 shards
-  for i in 0..1:
-    doAssert fileExists(shardOutputPath(tmpl, i, 2)), &"over-jobs shard {i+1} missing"
-  removeDir(tmpDir)
-  echo "PASS runShards: maxJobs > nShards, no hang"
+  echo &"PASS runShards: 4 shards concurrent, {total} records, content hash matches"
 
 # ---------------------------------------------------------------------------
 # R14 — testBcfRun4Shards: BCF runShards 4 shards, bcftools view -Ob; hash matches
@@ -231,7 +304,7 @@ block testBcfRun4Shards:
   let tmpDir = getTempDir() / "vcfparty_run_r14_bcf4"
   createDir(tmpDir)
   let tmpl = tmpDir / "out.{}.bcf"
-  runShards(SmallBcf, 4, tmpl, 1, false, 4, @[@["bcftools", "view", "-Ob"]])
+  runShards(SmallBcf, 4, tmpl, 1, false, @[@["bcftools", "view", "-Ob"]])
   var total = 0
   var bcfShardPaths: seq[string]
   for i in 0..3:
@@ -332,56 +405,47 @@ block testCliRunMultiStage:
   echo "PASS CLI run: multi-stage pipeline (cat | cat), records match"
 
 # ---------------------------------------------------------------------------
-# R19 — testCliRunJobs1: run -j 1 (serial); 4 shards, record count matches
+# R19 — testCliRunJError: -j is unknown, exits non-zero
 # ---------------------------------------------------------------------------
-block testCliRunJobs1:
-  let tmpDir = getTempDir() / "vcfparty_r9_jobs1"
+block testCliRunJError:
+  let tmpDir = getTempDir() / "vcfparty_r19_jerror"
   createDir(tmpDir)
   let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 4 -j 1 -o {outp_template} {SmallVcf} --- cat")
-  doAssert code == 0, &"run -j 1 exited {code}:\n{outp}"
+  let (_, code) = runBin(&"-n 4 -j 1 -o {outp_template} {SmallVcf} --- cat")
+  doAssert code != 0, "-j should cause a non-zero exit (unknown option)"
+  removeDir(tmpDir)
+  echo "PASS CLI run: -j exits non-zero (unknown option)"
+
+# ---------------------------------------------------------------------------
+# R20 — testCliRunAttachedN: -n4 (attached, no space) parsed correctly
+# ---------------------------------------------------------------------------
+block testCliRunAttachedN:
+  # Nim's parseopt splits -n4 correctly; verify attached-value still works without -j.
+  let tmpDir = getTempDir() / "vcfparty_r20_attached"
+  createDir(tmpDir)
+  let outp_template = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n4 -o {outp_template} {SmallVcf} --- cat")
+  doAssert code == 0, &"run -n4 exited {code}:\n{outp}"
   var total = 0
   for i in 1..4:
     let p = tmpDir / ("shard_" & $i & ".out.vcf.gz")
-    doAssert fileExists(p), &"-j 1 shard {i} missing"
+    doAssert fileExists(p), &"-n4 shard {i} missing"
     total += countRecords(p)
-  doAssert total == countRecords(SmallVcf), "-j 1 record count mismatch"
+  doAssert total == countRecords(SmallVcf), "-n4 record count mismatch"
   removeDir(tmpDir)
-  echo "PASS CLI run: -j 1 (serial), records match"
+  echo "PASS CLI run: -n4 attached-value flag works"
 
 # ---------------------------------------------------------------------------
-# R20 — testCliRunAttachedFlags: -n4 -j2 (no space) parsed correctly
+# R21 — testCliRunMaxJobsError: --max-jobs is unknown, exits non-zero
 # ---------------------------------------------------------------------------
-block testCliRunAttachedFlags:
-  # Nim's parseopt splits -j2 into two short options; nextVal must recover the
-  # digit value when the next token is all-digit.
-  let tmpDir = getTempDir() / "vcfparty_r0_attached"
+block testCliRunMaxJobsError:
+  let tmpDir = getTempDir() / "vcfparty_r21_maxjobserror"
   createDir(tmpDir)
   let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n4 -j2 -o {outp_template} {SmallVcf} --- cat")
-  doAssert code == 0, &"run -n4 -j2 exited {code}:\n{outp}"
-  var total = 0
-  for i in 1..4:
-    let p = tmpDir / ("shard_" & $i & ".out.vcf.gz")
-    doAssert fileExists(p), &"-n4 -j2 shard {i} missing"
-    total += countRecords(p)
-  doAssert total == countRecords(SmallVcf), "-n4 -j2 record count mismatch"
+  let (_, code) = runBin(&"-n 2 --max-jobs 10 -o {outp_template} {SmallVcf} --- cat")
+  doAssert code != 0, "--max-jobs should cause a non-zero exit (unknown option)"
   removeDir(tmpDir)
-  echo "PASS CLI run: -n4 -j2 attached-value flags work"
-
-# ---------------------------------------------------------------------------
-# R21 — testCliRunJobsOver: -j > nShards; completes without hang
-# ---------------------------------------------------------------------------
-block testCliRunJobsOver:
-  let tmpDir = getTempDir() / "vcfparty_r1_jobsover"
-  createDir(tmpDir)
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 2 -j 10 -o {outp_template} {SmallVcf} --- cat")
-  doAssert code == 0, &"run -j 10 -n 2 exited {code}:\n{outp}"
-  for i in 1..2:
-    doAssert fileExists(tmpDir / ("shard_" & $i & ".out.vcf.gz")), &"over-jobs shard {i} missing"
-  removeDir(tmpDir)
-  echo "PASS CLI run: -j > nShards, no hang"
+  echo "PASS CLI run: --max-jobs exits non-zero (unknown option)"
 
 # ---------------------------------------------------------------------------
 # R22 — testCliRunNonZeroExit: non-zero stage exit → vcfparty exits 1, shard mentioned
@@ -444,47 +508,54 @@ block testCliRunNoKill:
   removeDir(tmpDir)
   echo "PASS CLI run: --no-kill flag accepted, all shards complete normally"
 
-# ===========================================================================
-# T1 — inferRunMode: 7 non-error cases from the inference table
-# (The error case — no output, no {}, no --gather — calls quit(1) so it is
-#  covered by R15/testCliRunMissingSep at the CLI level rather than here.)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# R26 — testCliRunConcat: +concat+ gathers N shards into a single output file
+# ---------------------------------------------------------------------------
+block testCliRunConcat:
+  let tmpDir = getTempDir() / "vcfparty_r26_concat"
+  createDir(tmpDir)
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n 4 -o {outFile} {SmallVcf} ::: cat +concat+")
+  doAssert code == 0, &"+concat+ exited {code}:\n{outp}"
+  doAssert fileExists(outFile), "+concat+ output file missing"
+  let orig = countRecords(SmallVcf)
+  doAssert countRecords(outFile) == orig, "+concat+ record count mismatch"
+  removeDir(tmpDir)
+  echo &"PASS CLI run: +concat+ gathers 4 shards into single file, {orig} records"
 
-block testInferGatherStdout:
-  let m = inferRunMode(false, false, true)
-  doAssert m == rmGatherStdout, "expected rmGatherStdout, got " & $m
-  echo "PASS inferRunMode: no-o / no-{} / gather → rmGatherStdout"
+# ---------------------------------------------------------------------------
+# R27 — testCliRunConcatStdout: +concat+ without -o writes all records to stdout
+# ---------------------------------------------------------------------------
+block testCliRunConcatStdout:
+  let (outp, code) = execCmdEx(
+    BinPath & " run -n 2 " & SmallVcf & " ::: cat +concat+ 2>/dev/null | bcftools view -H | wc -l")
+  doAssert code == 0, &"+concat+ stdout exited {code}"
+  let nRecs = outp.strip().parseInt
+  let orig  = countRecords(SmallVcf)
+  doAssert nRecs == orig, &"+concat+ stdout record count {nRecs} != {orig}"
+  echo &"PASS CLI run: +concat+ stdout, {nRecs} records"
 
-block testInferGatherFile:
-  let m = inferRunMode(true, false, true)
-  doAssert m == rmGatherFile, "expected rmGatherFile, got " & $m
-  echo "PASS inferRunMode: o / no-{} / gather → rmGatherFile"
+# ===========================================================================
+# T1 — inferRunMode: non-error cases
+# (The error case — no output, no {} — calls quit(1) and is covered at the
+#  CLI level by testCliRunMissingSep.)
+# ===========================================================================
 
 block testInferNormal:
-  let m = inferRunMode(true, false, false)
+  let m = inferRunMode(true, false)
   doAssert m == rmNormal, "expected rmNormal, got " & $m
-  echo "PASS inferRunMode: o / no-{} / no-gather → rmNormal"
+  echo "PASS inferRunMode: o / no-{} → rmNormal"
 
 block testInferToolManaged:
-  let m = inferRunMode(false, true, false)
+  let m = inferRunMode(false, true)
   doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
-  echo "PASS inferRunMode: no-o / {} / no-gather → rmToolManaged"
+  echo "PASS inferRunMode: no-o / {} → rmToolManaged"
 
 block testInferToolManagedWithO:
   # -o present but {} in cmd: -o ignored, still tool-managed (warning emitted)
-  let m = inferRunMode(true, true, false)
+  let m = inferRunMode(true, true)
   doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
-  echo "PASS inferRunMode: o / {} / no-gather → rmToolManaged (warning: -o ignored)"
-
-block testInferGatherToolNoO:
-  let m = inferRunMode(false, true, true)
-  doAssert m == rmGatherTool, "expected rmGatherTool, got " & $m
-  echo "PASS inferRunMode: no-o / {} / gather → rmGatherTool"
-
-block testInferGatherToolWithO:
-  let m = inferRunMode(true, true, true)
-  doAssert m == rmGatherTool, "expected rmGatherTool, got " & $m
-  echo "PASS inferRunMode: o / {} / gather → rmGatherTool"
+  echo "PASS inferRunMode: o / {} → rmToolManaged (warning: -o ignored)"
 
 # ===========================================================================
 # T2 — hasBracePlaceholder and substituteToken / buildShellCmdForShard
@@ -567,7 +638,7 @@ block testToolManagedApiDirect:
   # Tool writes its own output using {} substitution.
   # We use bcftools view -Oz -o <path> rather than stdout.
   let stages = @[@["bcftools", "view", "-Oz", "-o", outTemplate]]
-  runShards(SmallVcf, 2, "", 1, false, 2, stages, toolManaged = true)
+  runShards(SmallVcf, 2, "", 1, false, stages, toolManaged = true)
   var total = 0
   for i in 0..1:
     let p = shardOutputPath(outTemplate, i, 2)

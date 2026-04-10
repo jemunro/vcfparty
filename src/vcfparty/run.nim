@@ -415,7 +415,7 @@ proc doCollectInterceptor*(shardIdx: int; inputFd: cint; outFd: cint): int {.gcs
   ## Shard 0 writes the header then records; shards 1..N strip the header.
   ## Returns 0 on success.
   const ReadSize = 65536
-  var raw     = newSeq[byte](ReadSize)
+  var raw     = newSeqUninit[byte](ReadSize)
   var fmt:    FileFormat
   var isBgzf: bool
   var pending:  seq[byte]   ## accumulated decompressed bytes not yet written
@@ -429,7 +429,7 @@ proc doCollectInterceptor*(shardIdx: int; inputFd: cint; outFd: cint): int {.gcs
       discard posix.close(inputFd)
       gChromLine.ready = true   # unblock shards 1..N even on empty shard 0
       return 0
-    let (detFmt, detBgzf) = sniffStreamFormat(raw[0 ..< n])
+    let (detFmt, detBgzf) = sniffStreamFormat(raw.toOpenArray(0, n.int - 1))
     fmt    = detFmt
     isBgzf = detBgzf
     appendReadToAccum(raw, n.int, isBgzf, rawAccum, bgzfPos, pending)
@@ -571,7 +571,7 @@ proc doMergeFeeder(shardIdx: int; srcFd: cint; relayWriteFd: cint): int {.gcsafe
   ## Shard 0: sets gMergeFormat and gMergeHeader.ready when header is found.
   ## Closes relayWriteFd and srcFd before returning.
   const ReadSize = 65536
-  var raw      = newSeq[byte](ReadSize)
+  var raw      = newSeqUninit[byte](ReadSize)
   var pending: seq[byte]
   var isBgzf   = false
   var fmt      = ffVcf
@@ -588,7 +588,7 @@ proc doMergeFeeder(shardIdx: int; srcFd: cint; relayWriteFd: cint): int {.gcsafe
     discard posix.close(srcFd)
     return 0
 
-  let (detFmt, detBgzf) = sniffStreamFormat(raw[0 ..< n0])
+  let (detFmt, detBgzf) = sniffStreamFormat(raw.toOpenArray(0, n0.int - 1))
   fmt    = detFmt
   isBgzf = detBgzf
   if isBgzf and not gMergeBgzfWarned:
@@ -641,7 +641,7 @@ proc doMergeFeeder(shardIdx: int; srcFd: cint; relayWriteFd: cint): int {.gcsafe
     let n = posix.read(srcFd, cast[pointer](addr raw[0]), ReadSize)
     if n <= 0: break
     if isBgzf:
-      rawAccum.add(raw[0 ..< n])
+      rawAccum.add(raw.toOpenArray(0, n.int - 1))
       flushBgzfAccum(rawAccum, bgzfPos, pending)
       if pending.len > 0:
         relayBytes(pending.toOpenArray(0, pending.high))

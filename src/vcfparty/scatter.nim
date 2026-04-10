@@ -198,6 +198,33 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
   let eofSeq: seq[byte] = @BGZF_EOF
   info(&"computeShards: {effN} shards, file size {fileSize} bytes, EOF at {eofStart}")
 
+  # Precompute every boundary-block split exactly once.  Each boundary is
+  # shared between shard i (uses .head as its boundaryHead) and shard i+1
+  # (uses .tail as the start of its prepend), so doing it once per boundary
+  # halves decompress + compress work at scatter boundaries.
+  # Also compute the first-shard tail split here if needed.
+  type BoundarySplit = object
+    head:    seq[byte]   # BGZF for bytes [0 ..< uOff]
+    tail:    seq[byte]   # BGZF for bytes [uOff ..< len]
+    blkSize: int64       # total BGZF block size at this offset
+  let fBoundary = open(vcfPath, fmRead)
+  defer: fBoundary.close()
+  var splits = newSeq[BoundarySplit](boundaryVoffs.len)
+  for bi, voff in boundaryVoffs:
+    let (off, uOff) = voff
+    if uOff == 0:
+      splits[bi].blkSize = readBgzfBlockSize(fBoundary, off)
+    else:
+      let (h, t, sz) = splitBgzfBlockBothSides(fBoundary, off, uOff)
+      splits[bi] = BoundarySplit(head: h, tail: t, blkSize: sz)
+  # First-shard tail split (used only when firstUOff > 0 — typical for BCF).
+  var firstShardTail: seq[byte]
+  var firstBlkSize: int64
+  if firstUOff > 0:
+    let (_, t, sz) = splitBgzfBlockBothSides(fBoundary, firstBlockOff, firstUOff)
+    firstShardTail = t
+    firstBlkSize = sz
+
   result = newSeq[ShardTask](effN)
   for i in 0 ..< effN:
     var prepend: seq[byte]
@@ -207,32 +234,30 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
     let (startBlockOff, startUOff) =
       if i == 0: (firstBlockOff, firstUOff) else: boundaryVoffs[i - 1]
 
-    # If start block is mid-record (startUOff > 0), prepend the tail of
-    # that block (bytes [startUOff, end]).  If startUOff == 0, the block
-    # starts cleanly and is included in the raw-copy region.
+    # If start block is mid-record (startUOff > 0), prepend the precomputed
+    # tail of that block.  Otherwise the block is included cleanly in the
+    # raw-copy region and no prepend is needed.
     if startUOff > 0:
-      let (_, tail) = splitBgzfBlockAtUOffset(vcfPath, startBlockOff, startUOff)
-      prepend.add(tail)
+      if i == 0:
+        prepend.add(firstShardTail)
+      else:
+        prepend.add(splits[i - 1].tail)
 
     # rawStart: if startUOff > 0, skip past the split block; if 0, include it.
-    var hdrBuf = newSeq[byte](18)
-    block getSize:
-      let fTmp = open(vcfPath, fmRead)
-      fTmp.setFilePos(startBlockOff)
-      discard readBytes(fTmp, hdrBuf, 0, 18)
-      fTmp.close()
-    let startBlkSize = bgzfBlockSize(hdrBuf).int64
     let rawStart: int64 =
-      if startUOff > 0: startBlockOff + startBlkSize else: startBlockOff
+      if startUOff == 0:
+        startBlockOff
+      elif i == 0:
+        startBlockOff + firstBlkSize
+      else:
+        startBlockOff + splits[i - 1].blkSize
 
     var rawEnd: int64
     var boundaryHead: seq[byte]
     if i < effN - 1:
-      let (endBlockOff, endUOff) = boundaryVoffs[i]
+      let (endBlockOff, _) = boundaryVoffs[i]
       rawEnd = endBlockOff
-      if endUOff > 0:
-        let (head, _) = splitBgzfBlockAtUOffset(vcfPath, endBlockOff, endUOff)
-        boundaryHead = head
+      boundaryHead = splits[i].head    # empty when endUOff == 0
     else:
       rawEnd = eofStart
 
@@ -341,19 +366,18 @@ type InterleavedTask* = object
   chunkSize*:    int              ## blocks per chunk (for chunkOwner calculation)
   inboxes*:      ptr InboxArray   ## shared inbox array
 
-proc readAndDecompressBlocks(vcfPath: string; starts: ptr seq[int64];
+proc readAndDecompressBlocks(f: File; starts: ptr seq[int64];
                               sizes: ptr seq[int64];
                               slice: Slice[int]): seq[byte] {.gcsafe.} =
-  ## Read and decompress all BGZF blocks in starts[slice] from vcfPath.
-  ## Each starts[i]..starts[i]+sizes[i] range may contain multiple BGZF blocks
-  ## (when index entries span multiple blocks); decompress each one in sequence.
-  let f = open(vcfPath, fmRead)
-  defer: f.close()
+  ## Read and decompress all BGZF blocks in starts[slice] from the already-open
+  ## file f.  Each starts[i]..starts[i]+sizes[i] range may contain multiple
+  ## BGZF blocks (when index entries span multiple blocks); decompress each one
+  ## in sequence.  f is not closed — the caller owns the handle.
   result = @[]
   for i in slice:
     let offset = starts[][i]
     let sz     = sizes[][i].int
-    var raw = newSeq[byte](sz)
+    var raw = newSeqUninit[byte](sz)
     f.setFilePos(offset)
     discard readBytes(f, raw, 0, sz)
     var pos = 0
@@ -418,6 +442,8 @@ proc writeInterleavedShard*(task: InterleavedTask): int {.gcsafe.} =
   let nTotalBlocks = task.blockStarts[].len
   var f: File
   discard open(f, FileHandle(task.outFd), fmWrite)
+  # Open the input file once and reuse it across every chunk in this shard.
+  let inF = open(task.vcfPath, fmRead)
   var completedChunks = 0
   try:
     # Write header
@@ -425,7 +451,7 @@ proc writeInterleavedShard*(task: InterleavedTask): int {.gcsafe.} =
       discard f.writeBytes(task.headerBytes, 0, task.headerBytes.len)
 
     for ci, slice in task.chunkIndices:
-      let buf = readAndDecompressBlocks(task.vcfPath, task.blockStarts,
+      let buf = readAndDecompressBlocks(inF, task.blockStarts,
                                         task.blockSizes, slice)
 
       # --- Head split: bytes before first record boundary ---
@@ -498,6 +524,7 @@ proc writeInterleavedShard*(task: InterleavedTask): int {.gcsafe.} =
         discard task.inboxes[].drain(task.shardIdx)
 
   try: f.close() except IOError: discard
+  try: inF.close() except IOError: discard
   return 0
 
 proc scatter*(vcfPath: string; nShards: int; outputTemplate: string;

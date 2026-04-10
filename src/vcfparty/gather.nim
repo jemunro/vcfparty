@@ -353,7 +353,8 @@ proc readNextBcfRecord*(r: var BufferedFdReader): seq[byte] =
   let lIndiv  = (hdr[4].uint32 or (hdr[5].uint32 shl 8) or
                  (hdr[6].uint32 shl 16) or (hdr[7].uint32 shl 24)).int
   let payloadLen = lShared + lIndiv
-  result = newSeq[byte](8 + payloadLen)
+  # Uninit alloc — every byte is overwritten below (8 header + payloadLen from fd).
+  result = newSeqUninit[byte](8 + payloadLen)
   copyMem(addr result[0], addr hdr[0], 8)
   # Read payload directly into result[8..].
   var written = 0
@@ -421,7 +422,8 @@ proc readNextBcfRecord*(fd: cint): seq[byte] =
   let lIndiv  = (hdr[4].uint32 or (hdr[5].uint32 shl 8) or
                  (hdr[6].uint32 shl 16) or (hdr[7].uint32 shl 24)).int
   let total = lShared + lIndiv
-  result = newSeq[byte](8 + total)
+  # Uninit alloc — every byte is overwritten below.
+  result = newSeqUninit[byte](8 + total)
   for i in 0 ..< 8: result[i] = hdr[i]
   var pos = 8
   while pos < result.len:
@@ -597,14 +599,14 @@ proc chromLineFromFile*(path: string; fmt: FileFormat; isBgzf: bool): string =
   let f = open(path, fmRead)
   defer: f.close()
   const BufSize = 65536
-  var buf = newSeq[byte](BufSize)
+  var buf = newSeqUninit[byte](BufSize)
   var rawBuf: seq[byte]
   var decompBuf: seq[byte]
   var blockPos = 0
   while decompBuf.len < 10 * 1024 * 1024:  # 10 MB safety limit
     let got = readBytes(f, buf, 0, BufSize)
     if got <= 0: break
-    rawBuf.add(buf[0 ..< got])
+    rawBuf.add(buf.toOpenArray(0, got.int - 1))
     while blockPos + 18 <= rawBuf.len:
       let blkSize = bgzfBlockSize(rawBuf.toOpenArray(blockPos, rawBuf.high))
       if blkSize <= 0 or blockPos + blkSize > rawBuf.len: break
@@ -624,14 +626,14 @@ proc extractInputHeaderBytes*(path: string): seq[byte] =
   let f = open(path, fmRead)
   defer: f.close()
   const BufSize = 65536
-  var buf      = newSeq[byte](BufSize)
+  var buf      = newSeqUninit[byte](BufSize)
   var rawBuf:    seq[byte]
   var decompBuf: seq[byte]
   var blockPos = 0
   while decompBuf.len < 10 * 1024 * 1024:
     let got = readBytes(f, buf, 0, BufSize)
     if got <= 0: break
-    rawBuf.add(buf[0 ..< got])
+    rawBuf.add(buf.toOpenArray(0, got.int - 1))
     while blockPos + 18 <= rawBuf.len:
       let blkSize = bgzfBlockSize(rawBuf.toOpenArray(blockPos, rawBuf.high))
       if blkSize <= 0 or blockPos + blkSize > rawBuf.len: break
@@ -782,7 +784,7 @@ proc runInterceptor*(cfg: GatherConfig; shardIdx: int; inputFd: cint; tmpPath: s
   try:
     const ChunkSize = 65536
     const FlushThresh = 1 * 1024 * 1024
-    var buf = newSeq[byte](ChunkSize)
+    var buf = newSeqUninit[byte](ChunkSize)
     var fmt: FileFormat
     var isBgzf: bool
     var rawAccum: seq[byte]
@@ -800,8 +802,8 @@ proc runInterceptor*(cfg: GatherConfig; shardIdx: int; inputFd: cint; tmpPath: s
         gChromLine.ready = true
       return 0
     if shardIdx == 0:
-      let head = buf[0 ..< initRead]
-      let (detFmt, detBgzf) = sniffStreamFormat(head)
+      let (detFmt, detBgzf) =
+        sniffStreamFormat(buf.toOpenArray(0, initRead.int - 1))
       fmt = detFmt
       isBgzf = detBgzf
       if fmt != cfg.format and not cfg.toStdout:
@@ -819,7 +821,7 @@ proc runInterceptor*(cfg: GatherConfig; shardIdx: int; inputFd: cint; tmpPath: s
     # match `gatherFiles` exactly when we delegate to writeShardZero/Data.
     if fmt == ffText:
       var allBytes = newSeqOfCap[byte](4 * 1024 * 1024)
-      allBytes.add(buf[0 ..< initRead])
+      allBytes.add(buf.toOpenArray(0, initRead.int - 1))
       while true:
         let got = posix.read(inputFd, cast[pointer](addr buf[0]), ChunkSize)
         if got <= 0: break
@@ -1059,7 +1061,7 @@ proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
 
   # ── Phase 1: read shard 0, detect format, validate #CHROM ──────────────────
   let s0Size = getFileSize(inputPaths[0]).int
-  var s0Bytes = newSeq[byte](s0Size)
+  var s0Bytes = newSeqUninit[byte](s0Size)
   block:
     let fs0 = open(inputPaths[0], fmRead)
     discard readBytes(fs0, s0Bytes, 0, s0Size)
@@ -1092,7 +1094,7 @@ proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
   # Write shards 1..N: read fresh from disk, strip headers.
   for j in 1 ..< inputPaths.len:
     let jSize = getFileSize(inputPaths[j]).int
-    var allBytes = newSeq[byte](jSize)
+    var allBytes = newSeqUninit[byte](jSize)
     block:
       let fj = open(inputPaths[j], fmRead)
       discard readBytes(fj, allBytes, 0, jSize)
@@ -1113,7 +1115,7 @@ proc doFileFeeder(shardIdx: int; path: string; relayWriteFd: cint): int {.gcsafe
   ## bytes to relayWriteFd. Shard 0 also captures the header into
   ## gMergeHeader.buf and signals gMergeHeader.ready. Closes relayWriteFd.
   const ReadSize = 65536
-  var raw     = newSeq[byte](ReadSize)
+  var raw     = newSeqUninit[byte](ReadSize)
   var pending: seq[byte]
   var isBgzf  = false
   var fmt     = ffVcf
@@ -1137,7 +1139,7 @@ proc doFileFeeder(shardIdx: int; path: string; relayWriteFd: cint): int {.gcsafe
       gMergeHeader.ready = true
     return 0
 
-  let (detFmt, detBgzf) = sniffStreamFormat(raw[0 ..< n0])
+  let (detFmt, detBgzf) = sniffStreamFormat(raw.toOpenArray(0, n0.int - 1))
   fmt    = detFmt
   isBgzf = detBgzf
   appendReadToAccum(raw, n0.int, isBgzf, rawAccum, bgzfPos, pending)
@@ -1182,7 +1184,7 @@ proc doFileFeeder(shardIdx: int; path: string; relayWriteFd: cint): int {.gcsafe
     let n = posix.read(fileFd, cast[pointer](addr raw[0]), ReadSize)
     if n <= 0: break
     if isBgzf:
-      rawAccum.add(raw[0 ..< n])
+      rawAccum.add(raw.toOpenArray(0, n.int - 1))
       flushBgzfAccum(rawAccum, bgzfPos, pending)
       if pending.len > 0:
         relayBytes(pending.toOpenArray(0, pending.high))

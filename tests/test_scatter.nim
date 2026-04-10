@@ -172,20 +172,6 @@ proc checkShards(vcfPath: string; tmpl: string; n: int) =
     "shard records do not match original"
 
 # ---------------------------------------------------------------------------
-# SC11 — testScanAllBlockStarts: scanAllBlockStarts returns non-empty, increasing, valid BGZF offsets
-# ---------------------------------------------------------------------------
-timed("SC4.1", "scanAllBlockStarts: valid BGZF offsets"):
-  let (_, firstBlock) = getHeaderAndFirstBlock(SmallVcf)
-  let starts = scanAllBlockStarts(SmallVcf, firstBlock)
-  doAssert starts.len > 0, "scanAllBlockStarts: no data blocks found"
-  for off in starts:
-    let magic = readMagic(SmallVcf, off)
-    doAssert magic[0] == 0x1f and magic[1] == 0x8b,
-      &"scanAllBlockStarts: bad BGZF magic at offset {off}"
-  for i in 1 ..< starts.len:
-    doAssert starts[i] > starts[i-1], "scanAllBlockStarts: not strictly increasing"
-
-# ---------------------------------------------------------------------------
 # SC12 — testScatter4ShardsTbi: 4 shards (TBI); BGZF structure, completeness, order, size balance
 # ---------------------------------------------------------------------------
 timed("SC5.1", "scatter TBI: 4 shards, completeness, order, balance"):
@@ -492,9 +478,8 @@ proc writeInterleavedShards(vcfPath: string; nShards, chunkSize: int;
   if fmt == ffBcf:
     headerBytes = decompressBgzfBytes(extractBcfHeader(vcfPath))
     let (firstDataBlockOff, uOff) = bcfFirstDataVirtualOffset(vcfPath)
-    starts = scanBgzfBlockStarts(vcfPath, startAt = firstDataBlockOff)
-    if starts.len > 0 and fileSize - starts[^1] == 28:
-      starts.setLen(starts.len - 1)
+    starts = scanBgzfBlockStarts(vcfPath, startAt = firstDataBlockOff,
+                                 endAt = fileSize - 28)
     let csi = vcfPath & ".csi"
     csiVoffs = parseCsiVirtualOffsets(csi)
     let firstVO = (firstDataBlockOff, uOff)
@@ -504,7 +489,7 @@ proc writeInterleavedShards(vcfPath: string; nShards, chunkSize: int;
   else:
     let (hb, fb) = getHeaderAndFirstBlock(vcfPath)
     headerBytes = decompressBgzfBytes(hb)
-    starts = scanAllBlockStarts(vcfPath, fb)
+    starts = scanBgzfBlockStarts(vcfPath, startAt = fb, endAt = fileSize - 28)
 
   var sizes = getLengths(starts, fileSize)
   let assignment = interleavedBlockAssignment(starts.len, nShards, chunkSize)

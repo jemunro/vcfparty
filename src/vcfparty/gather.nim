@@ -9,7 +9,6 @@ import std/posix
 import std/threadpool
 {.warning[Deprecated]: on.}
 import vcf_utils
-export vcf_utils
 
 # ---------------------------------------------------------------------------
 # Types
@@ -734,86 +733,282 @@ proc writeShardData*(outFile: File; bytes: seq[byte]; fmt: FileFormat;
 # Interceptor thread proc
 # ---------------------------------------------------------------------------
 
+## Maximum size `pending` reaches inside `runInterceptor`, recorded per-thread
+## for the streaming-property regression test (G3.6).  Production overhead is
+## a single int compare per flush; the value is read after the interceptor
+## returns by tests that drive `runInterceptor` directly.
+var gMaxPendingBytes* {.threadvar.}: int
+
+## Total bytes re-encoded by `runInterceptor` via `compressToBgzfMulti` on the
+## BGZF→BGZF raw-forwarding fast path.  Tests assert this is 0 for shard 0 and
+## ≤ one BGZF block (65536 bytes) for shards 1..N — proof that the fast path
+## is forwarding raw blocks rather than re-encoding everything.
+var gReencodedBytes* {.threadvar.}: int
+
+proc isBgzfEofBlock(buf: openArray[byte]; pos, blkSize: int): bool {.inline.} =
+  ## Return true if the BGZF block at buf[pos ..< pos+blkSize] is the
+  ## canonical 28-byte BGZF EOF marker.
+  if blkSize != BGZF_EOF.len: return false
+  for i in 0 ..< BGZF_EOF.len:
+    if buf[pos + i] != BGZF_EOF[i]: return false
+  return true
+
 proc runInterceptor*(cfg: GatherConfig; shardIdx: int; inputFd: cint; tmpPath: string): int =
-  ## Per-shard interceptor thread proc. Reads from inputFd, strips headers for
-  ## shards 2..N, recompresses if needed, writes to tmpPath (or stdout for
-  ## shard 0 when cfg.toStdout). Returns 0 on success.
-  ## G2: format sniffing on shard 0.
-  ## G3: header stripping for shards 1..N.
-  ## G4: recompression (uncompressed↔BGZF) for all shards.
+  ## Per-shard interceptor thread proc.  Streams subprocess stdout to a temp
+  ## file (or stdout for shard 0 when `cfg.toStdout`) without ever holding the
+  ## entire shard in memory.
+  ##
+  ## Phase A — read first chunk; sniff format on shard 0; shards 1..N spinwait
+  ##           on `gChromLine.ready` then read the format from globals.
+  ## Phase B — accumulate uncompressed `pending` (via `appendReadToAccum`) until
+  ##           `findVcfHeaderEnd` / `findBcfHeaderEnd` succeeds.  Shard 0 sets
+  ##           `gChromLine`/`gChromLine.ready`; shards 1..N validate `#CHROM`
+  ##           and bail out cleanly on mismatch (no record bytes written).
+  ## Phase C — flush `pending` (recompressed if `cfg.compression == compBgzf`,
+  ##           otherwise raw).  Continue reading: each iteration accumulates
+  ##           into `pending`, flushes when it crosses `FlushThresh`, and trims
+  ##           the consumed prefix of `rawAccum` so memory stays bounded.
+  ##
+  ## The trailing BGZF EOF block from the input naturally vanishes because
+  ## `decompressBgzf(EOF_block)` returns 0 bytes.  `concatenateShards` writes
+  ## exactly one EOF at the very end of the merged output (see G5 contract).
+  ##
+  ## Text format takes a buffered fallback path: text inputs in practice are
+  ## tiny, the streaming win is on BGZF VCF/BCF, and reusing
+  ## `writeShardZero`/`writeShardData` keeps `--header-n` / `--header-pattern`
+  ## semantics byte-identical to `gatherFiles`.
   let isStdout = (shardIdx == 0 and cfg.toStdout)
   let outFile: File = if isStdout: stdout else: open(tmpPath, fmWrite)
+  gMaxPendingBytes = 0
+  gReencodedBytes  = 0
   try:
     const ChunkSize = 65536
+    const FlushThresh = 1 * 1024 * 1024
     var buf = newSeq[byte](ChunkSize)
+    var fmt: FileFormat
+    var isBgzf: bool
+    var rawAccum: seq[byte]
+    var bgzfPos  = 0
+    var pending:  seq[byte]
 
-    # Read the first chunk; used for format sniffing on shard 0.
+    # ── Phase A: first read + format detection ───────────────────────
     let initRead = posix.read(inputFd, cast[pointer](addr buf[0]), ChunkSize)
     if initRead <= 0:
+      # Empty shard.  Shard 0 must still release shards 1..N.
+      if shardIdx == 0:
+        gDetectedFormat = ffText
+        gStreamIsBgzf   = false
+        gChromLine.len   = 0
+        gChromLine.ready = true
       return 0
-    let head = buf[0 ..< initRead]
-
     if shardIdx == 0:
-      let (fmt, isBgzf) = sniffStreamFormat(head)
-      gDetectedFormat = fmt
-      gStreamIsBgzf   = isBgzf
-      # gChromLine.ready is NOT set here — set after gChromLine is extracted below,
-      # so that shards 1..N see both globals atomically when they stop waiting.
+      let head = buf[0 ..< initRead]
+      let (detFmt, detBgzf) = sniffStreamFormat(head)
+      fmt = detFmt
+      isBgzf = detBgzf
       if fmt != cfg.format and not cfg.toStdout:
         stderr.writeLine &"warning: stream format detected as {fmt} " &
           &"but --gather expects {cfg.format}; proceeding"
+    else:
+      # Wait until shard 0 has detected the format.
+      while not gChromLine.ready:
+        sleep(1)
+      fmt = gDetectedFormat
+      isBgzf = gStreamIsBgzf
 
-    # Buffer the full stream (head + remainder).
-    # Pre-allocate to avoid doubling reallocations and eliminate per-read
-    # slice temporaries from allBytes.add(buf[0..<got]).
-    var allBytes = newSeqOfCap[byte](4 * 1024 * 1024)
-    allBytes.add(head)
+    # ── Text fallback: buffer the whole shard, reuse the existing helpers.
+    # Text inputs are tiny in practice; --header-n / --header-pattern semantics
+    # match `gatherFiles` exactly when we delegate to writeShardZero/Data.
+    if fmt == ffText:
+      var allBytes = newSeqOfCap[byte](4 * 1024 * 1024)
+      allBytes.add(buf[0 ..< initRead])
+      while true:
+        let got = posix.read(inputFd, cast[pointer](addr buf[0]), ChunkSize)
+        if got <= 0: break
+        let base = allBytes.len
+        allBytes.setLen(base + got)
+        copyMem(addr allBytes[base], addr buf[0], got)
+      if shardIdx == 0:
+        gDetectedFormat = fmt
+        gStreamIsBgzf   = isBgzf
+        gChromLine.len   = 0
+        gChromLine.ready = true
+        let cleaned = if isBgzf: stripTrailingEof(allBytes) else: allBytes
+        writeShardZero(outFile, cleaned, isBgzf, cfg.compression)
+      else:
+        let cleaned = if isBgzf: stripTrailingEof(allBytes) else: allBytes
+        writeShardData(outFile, cleaned, fmt, isBgzf, cfg)
+      return 0
+
+    # ── Phase B: streaming VCF/BCF — accumulate header ──────────────
+    appendReadToAccum(buf, initRead.int, isBgzf, rawAccum, bgzfPos, pending)
+    if pending.len > gMaxPendingBytes: gMaxPendingBytes = pending.len
+
+    var hEnd = -1
     while true:
-      let got = posix.read(inputFd, cast[pointer](addr buf[0]), ChunkSize)
-      if got <= 0: break
-      let base = allBytes.len
-      allBytes.setLen(base + got)
-      copyMem(addr allBytes[base], addr buf[0], got)
+      hEnd =
+        if fmt == ffBcf: findBcfHeaderEnd(pending)
+        else:            findVcfHeaderEnd(pending)
+      if hEnd >= 0: break
+      let n = posix.read(inputFd, cast[pointer](addr buf[0]), ChunkSize)
+      if n <= 0: break
+      appendReadToAccum(buf, n.int, isBgzf, rawAccum, bgzfPos, pending)
+      if pending.len > gMaxPendingBytes: gMaxPendingBytes = pending.len
+    if hEnd < 0: hEnd = pending.len  # short stream — header runs to EOF
 
+    # Set or validate #CHROM before any record byte is written.
     if shardIdx == 0:
-      # Extract #CHROM line into the raw byte buffer, then release shards 1..N.
-      # Using a non-GC-managed global (byte array) so this proc stays GC-safe.
-      let chromStr = chromLineFromBytes(allBytes, gDetectedFormat, gStreamIsBgzf)
+      let chromStr = extractChromLine(pending[0 ..< hEnd])
+      gDetectedFormat = fmt
+      gStreamIsBgzf   = isBgzf
       gChromLine.len = min(chromStr.len, gChromLine.buf.len).int32
       for k in 0 ..< gChromLine.len.int:
         gChromLine.buf[k] = byte(chromStr[k])
       gChromLine.ready = true
-      # Shard 0: no header stripping; apply recompression only.
-      # Strip the terminal EOF block appended by the pipeline —
-      # concatenateShards writes a single EOF block once at the very end.
-      let cleaned0 = if gStreamIsBgzf: stripTrailingEof(allBytes) else: allBytes
-      writeShardZero(outFile, cleaned0, gStreamIsBgzf, cfg.compression)
     else:
-      # Shards 1..N: wait until shard 0 has extracted its #CHROM line and set
-      # gChromLine.ready = true.  Small shards may buffer all output before shard 0
-      # reads its first chunk — spin-wait (1 ms per iteration) until ready.
-      while not gChromLine.ready:
-        sleep(1)
-      let fmt = gDetectedFormat
-      # Validate #CHROM before writing anything.
-      if fmt in {ffVcf, ffBcf}:
-        let myChromLine = chromLineFromBytes(allBytes, fmt, gStreamIsBgzf)
-        let glen = gChromLine.len.int
-        var match = (myChromLine.len == glen)
-        if match:
-          for k in 0 ..< glen:
-            if byte(myChromLine[k]) != gChromLine.buf[k]:
-              match = false; break
-        if not match:
-          # Reconstruct shard 0's line as string for the error message.
-          var shard0Line = newString(glen)
-          for k in 0 ..< glen: shard0Line[k] = char(gChromLine.buf[k])
-          stderr.writeLine &"error: gather: #CHROM line mismatch at shard {shardIdx + 1}:"
-          stderr.writeLine &"  shard 1: {shard0Line}"
-          stderr.writeLine &"  shard {shardIdx + 1}: {myChromLine}"
-          return 1
-      let cleanedN = if gStreamIsBgzf: stripTrailingEof(allBytes) else: allBytes
-      writeShardData(outFile, cleanedN, fmt, gStreamIsBgzf, cfg)
+      let myChromLine = extractChromLine(pending[0 ..< hEnd])
+      let glen = gChromLine.len.int
+      var match = (myChromLine.len == glen)
+      if match:
+        for k in 0 ..< glen:
+          if byte(myChromLine[k]) != gChromLine.buf[k]:
+            match = false; break
+      if not match:
+        var shard0Line = newString(glen)
+        for k in 0 ..< glen: shard0Line[k] = char(gChromLine.buf[k])
+        stderr.writeLine &"error: gather: #CHROM line mismatch at shard {shardIdx + 1}:"
+        stderr.writeLine &"  shard 1: {shard0Line}"
+        stderr.writeLine &"  shard {shardIdx + 1}: {myChromLine}"
+        return 1
+
+    # ── Phase C: stream the rest of the shard to outFile ────────────
+    if isBgzf and cfg.compression == compBgzf:
+      # ── BGZF → BGZF fast path: forward raw BGZF blocks ─────────────
+      # Identify the split block (the BGZF block whose decompressed contents
+      # straddle the header boundary) by walking rawAccum and summing each
+      # block's ISIZE field (last 4 bytes).
+      var splitBlockRawStart    = -1
+      var splitBlockRawEnd      = -1
+      var splitBlockUncompStart = 0
+      block findSplit:
+        var p = 0
+        while p < bgzfPos:
+          let blkSize  = bgzfBlockSize(rawAccum.toOpenArray(p, bgzfPos - 1))
+          if blkSize <= 0 or p + blkSize > bgzfPos: break
+          let blkIsize = leU32(rawAccum.toOpenArray(p, p + blkSize - 1),
+                               blkSize - 4).int
+          if splitBlockUncompStart + blkIsize > hEnd:
+            splitBlockRawStart = p
+            splitBlockRawEnd   = p + blkSize
+            break findSplit
+          splitBlockUncompStart += blkIsize
+          p += blkSize
+
+      # Compute the initial bytes to forward.
+      var rawWriteStart: int
+      var splitTail: seq[byte]
+      if shardIdx == 0:
+        # Shard 0 keeps the header — forward every raw block from the start.
+        rawWriteStart = 0
+      elif splitBlockRawStart < 0:
+        # Header consumed every block phase B saw — nothing to write yet.
+        rawWriteStart = bgzfPos
+      elif hEnd == splitBlockUncompStart:
+        # Header ends exactly at a BGZF block boundary — no re-encode needed.
+        rawWriteStart = splitBlockRawStart
+      else:
+        # Header ends mid-block: re-encode the post-header tail of the split
+        # block as one fresh BGZF block, then forward subsequent blocks raw.
+        let splitBlkSize  = splitBlockRawEnd - splitBlockRawStart
+        let splitBlkIsize = leU32(
+          rawAccum.toOpenArray(splitBlockRawStart, splitBlockRawEnd - 1),
+          splitBlkSize - 4).int
+        let splitBlockUncompEnd = splitBlockUncompStart + splitBlkIsize
+        splitTail = pending[hEnd ..< splitBlockUncompEnd]
+        rawWriteStart = splitBlockRawEnd
+
+      # Write re-encoded split tail (if any) + raw-forward remaining phase-B
+      # blocks, walking block-by-block to skip any embedded BGZF EOF block.
+      if splitTail.len > 0:
+        let z = compressToBgzfMulti(splitTail)
+        discard outFile.writeBytes(z, 0, z.len)
+        gReencodedBytes += splitTail.len
+      var fp = rawWriteStart
+      while fp + 18 <= bgzfPos:
+        let blkSize = bgzfBlockSize(rawAccum.toOpenArray(fp, bgzfPos - 1))
+        if blkSize <= 0 or fp + blkSize > bgzfPos: break
+        if not isBgzfEofBlock(rawAccum, fp, blkSize):
+          discard outFile.writeBytes(rawAccum, fp, blkSize)
+        fp += blkSize
+
+      # Free phase-B buffers; switch to a small carry buffer for streaming.
+      # Phase B's last appendReadToAccum may have left a partial BGZF block
+      # in rawAccum[bgzfPos..^1] (bytes that haven't yet formed a complete
+      # block); preserve them as the initial carry — dropping them would
+      # lose records that fall just past the header boundary.
+      var carry: seq[byte] =
+        if bgzfPos < rawAccum.len: rawAccum[bgzfPos ..< rawAccum.len]
+        else: @[]
+      rawAccum.setLen(0); pending.setLen(0); bgzfPos = 0
+
+      while true:
+        let n = posix.read(inputFd, cast[pointer](addr buf[0]), ChunkSize)
+        if n <= 0: break
+        let base = carry.len
+        carry.setLen(base + n)
+        copyMem(addr carry[base], addr buf[0], n)
+        var p = 0
+        while p + 18 <= carry.len:
+          let blkSize = bgzfBlockSize(carry.toOpenArray(p, carry.high))
+          if blkSize <= 0: break               # corrupt frame — bail
+          if p + blkSize > carry.len: break    # incomplete — wait for next read
+          if not isBgzfEofBlock(carry, p, blkSize):
+            discard outFile.writeBytes(carry, p, blkSize)
+          p += blkSize
+        if p > 0:
+          carry = if p < carry.len: carry[p ..< carry.len] else: @[]
+      # At EOF a non-empty carry indicates a truncated subprocess output —
+      # silently drop it (the previous decompress path would also have lost
+      # the trailing partial block).
+
+      result = 0
+      return
+
+    # ── Phase C (other modes): decompress / recompress flush loop ───
+    # Shards 1..N drop the header bytes; shard 0 keeps them (header + records).
+    if shardIdx > 0:
+      pending = if hEnd < pending.len: pending[hEnd ..< pending.len] else: @[]
+
+    template flushPending() =
+      if pending.len > 0:
+        if cfg.compression == compBgzf:
+          let z = compressToBgzfMulti(pending)
+          discard outFile.writeBytes(z, 0, z.len)
+        else:
+          discard outFile.writeBytes(pending, 0, pending.len)
+        pending.setLen(0)
+
+    template trimRawAccum() =
+      if isBgzf and bgzfPos > 0:
+        # Drop the already-decompressed prefix of rawAccum so it stays bounded.
+        rawAccum = if bgzfPos < rawAccum.len: rawAccum[bgzfPos ..< rawAccum.len]
+                   else: @[]
+        bgzfPos = 0
+
+    flushPending()
+    trimRawAccum()
+
+    while true:
+      let n = posix.read(inputFd, cast[pointer](addr buf[0]), ChunkSize)
+      if n <= 0: break
+      appendReadToAccum(buf, n.int, isBgzf, rawAccum, bgzfPos, pending)
+      if pending.len > gMaxPendingBytes: gMaxPendingBytes = pending.len
+      if pending.len >= FlushThresh:
+        flushPending()
+        trimRawAccum()
+
+    flushPending()
+
     result = 0
   finally:
     if not isStdout: outFile.close()

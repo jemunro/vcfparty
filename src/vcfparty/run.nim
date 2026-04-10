@@ -710,7 +710,10 @@ proc runShardsMerge*(vcfPath: string; nShards: int; outputPath: string;
   else:
     # No index: scan all BGZF blocks. VCF only — BCF without CSI is rejected
     # earlier in main.nim.
-    starts = scanAllBlockStarts(vcfPath, firstDataBlockOff)
+    starts = scanBgzfBlockStarts(vcfPath, startAt = firstDataBlockOff,
+                                 endAt = fileSize - 28)
+    if scatter.verbose:
+      stderr.writeLine &"info: scan: found {starts.len} data blocks"
 
   # Compute sizes; exclude the 28-byte BGZF EOF block from the last entry.
   var sizes = getLengths(starts, fileSize - 28)

@@ -1,10 +1,13 @@
-## scatter — split a bgzipped VCF into N roughly equal shards.
+## scatter — split a bgzipped VCF/BCF into N shards.
 ##
-## Algorithm phases:
-##   1. Read TBI/CSI index for coarse BGZF block offsets.
-##   2. Extract VCF header via hts-nim; record first-data-block offset.
-##   3. Optimise shard boundaries using weighted bisection + block validation.
-##   4. Write shards: header + raw middle blocks + recompressed boundary blocks + EOF.
+## This module is focused on the sharding algorithm itself:
+##   - sequential scatter (`computeShards`, `doWriteShard`, `scatter`)
+##   - interleaved scatter (`interleavedBlockAssignment`, `writeInterleavedShard`,
+##     the inbox handoff primitive for partial-record exchange between workers)
+##
+## VCF/BCF format knowledge — BGZF I/O, TBI/CSI index parsing, header
+## extraction (`extractBcfHeader`, `getHeaderAndFirstBlock`), block-length
+## maths and BCF record walking — lives in `vcf_utils`.
 
 import std/[algorithm, atomics, cpuinfo, os, posix, sequtils, strformat, strutils]
 {.warning[Deprecated]: off.}
@@ -40,261 +43,7 @@ proc shardOutputPath*(tmpl: string; shardIdx: int; nShards: int): string =
 # FileFormat and Compression are imported from vcf_utils.
 
 # ---------------------------------------------------------------------------
-# Internal binary-reader helpers (little-endian reads that advance a cursor)
-# ---------------------------------------------------------------------------
-
-proc readLeU32(data: openArray[byte]; pos: var int): uint32 =
-  ## Read a little-endian uint32 from data at pos, then advance pos by 4.
-  result = data[pos].uint32 or (data[pos+1].uint32 shl 8) or
-           (data[pos+2].uint32 shl 16) or (data[pos+3].uint32 shl 24)
-  pos += 4
-
-proc readLeI32(data: openArray[byte]; pos: var int): int32 =
-  ## Read a little-endian int32 from data at pos, then advance pos by 4.
-  cast[int32](readLeU32(data, pos))
-
-proc readLeU64(data: openArray[byte]; pos: var int): uint64 =
-  ## Read a little-endian uint64 from data at pos, then advance pos by 8.
-  let lo = readLeU32(data, pos).uint64   # advances pos by 4
-  let hi = readLeU32(data, pos).uint64   # advances pos by 4 again
-  result = lo or (hi shl 32)
-
-# ---------------------------------------------------------------------------
-# Index parsing — TBI
-# ---------------------------------------------------------------------------
-
-proc parseTbiVirtualOffsets*(tbiPath: string): seq[(int64, int)] =
-  ## Parse a .tbi index and return sorted unique virtual offsets as
-  ## (block_file_offset, within_block_offset) pairs for all chunk starts.
-  let raw = decompressBgzfFile(tbiPath)
-  if raw.len < 8 or raw[0] != byte('T') or raw[1] != byte('B') or
-     raw[2] != byte('I') or raw[3] != 0x01:
-    quit(&"parseTbiVirtualOffsets: not a valid TBI index: {tbiPath}", 1)
-  var pos = 4
-  let nRef = readLeI32(raw, pos).int
-  pos += 24                            # skip 6 int32s
-  let lNm = readLeI32(raw, pos).int
-  pos += lNm                          # skip sequence-name block
-  var offsets: seq[(int64, int)]
-  for _ in 0 ..< nRef:
-    let nBin = readLeU32(raw, pos).int
-    for _ in 0 ..< nBin:
-      pos += 4  # skip bin_id
-      let nChunk = readLeU32(raw, pos).int
-      for _ in 0 ..< nChunk:
-        let beg    = readLeU64(raw, pos)
-        let endOff = readLeU64(raw, pos)
-        if endOff > beg:
-          offsets.add(((beg shr 16).int64, (beg and 0xFFFF).int))
-    let nIntv = readLeU32(raw, pos).int
-    pos += 8 * nIntv  # skip linear index intervals
-  offsets.sort(proc(a, b: (int64, int)): int =
-    if a[0] != b[0]: cmp(a[0], b[0]) else: cmp(a[1], b[1]))
-  var deduped: seq[(int64, int)]
-  for i, v in offsets:
-    if i == 0 or v != offsets[i - 1]:
-      deduped.add(v)
-  result = deduped
-
-# ---------------------------------------------------------------------------
-# Index parsing — CSI
-# ---------------------------------------------------------------------------
-
-proc parseCsiVirtualOffsets*(csiPath: string): seq[(int64, int)] =
-  ## Parse a .csi index and return sorted unique virtual offsets as
-  ## (block_file_offset, within_block_offset) pairs for all chunk starts.
-  let raw = decompressBgzfFile(csiPath)
-  if raw.len < 8 or raw[0] != byte('C') or raw[1] != byte('S') or
-     raw[2] != byte('I') or raw[3] != 0x01:
-    quit(&"parseCsiVirtualOffsets: not a valid CSI index: {csiPath}", 1)
-  var pos = 4
-  pos += 8               # skip min_shift (int32) + depth (int32)
-  let lAux = readLeI32(raw, pos).int
-  pos += lAux
-  let nRef = readLeI32(raw, pos).int
-  var offsets: seq[(int64, int)]
-  for _ in 0 ..< nRef:
-    let nBin = readLeI32(raw, pos).int
-    for _ in 0 ..< nBin:
-      pos += 4   # skip bin (uint32)
-      pos += 8   # skip loffset (uint64)
-      let nChunk = readLeI32(raw, pos).int
-      for _ in 0 ..< nChunk:
-        let beg    = readLeU64(raw, pos)
-        let endOff = readLeU64(raw, pos)
-        if endOff > beg:
-          offsets.add(((beg shr 16).int64, (beg and 0xFFFF).int))
-  offsets.sort(proc(a, b: (int64, int)): int =
-    if a[0] != b[0]: cmp(a[0], b[0]) else: cmp(a[1], b[1]))
-  var deduped: seq[(int64, int)]
-  for i, v in offsets:
-    if i == 0 or v != offsets[i - 1]:
-      deduped.add(v)
-  result = deduped
-
-# ---------------------------------------------------------------------------
-# Public entry point — detect index type and parse virtual offsets
-# ---------------------------------------------------------------------------
-
-proc readIndexVirtualOffsets*(vcfPath: string): seq[(int64, int)] =
-  ## Detect a .csi or .tbi index and return sorted unique virtual offsets as
-  ## (block_file_offset, within_block_offset) pairs. Returns @[] if no index.
-  let csi = vcfPath & ".csi"
-  let tbi = vcfPath & ".tbi"
-  if fileExists(csi):
-    result = parseCsiVirtualOffsets(csi)
-  elif fileExists(tbi):
-    result = parseTbiVirtualOffsets(tbi)
-  else:
-    result = @[]
-
-proc scanAllBlockStarts*(vcfPath: string; firstDataBlock: int64): seq[int64] =
-  ## Scan the entire BGZF file and return file offsets of all data blocks
-  ## (offset >= firstDataBlock, EOF block excluded).
-  ## Used when no .tbi or .csi index is available.
-  let fileSize  = getFileSize(vcfPath)
-  let eofOffset = fileSize - 28
-  let all = scanBgzfBlockStarts(vcfPath)
-  result = all.filterIt(it >= firstDataBlock and it < eofOffset)
-  info(&"scan: found {result.len} data blocks (scanned {all.len} total)")
-
-# ---------------------------------------------------------------------------
-# Phase 2 — extract header and first-data-block offset
-# ---------------------------------------------------------------------------
-
-proc extractBcfHeader*(path: string): seq[byte] =
-  ## Extract the BCF header blob (5-byte magic + 4-byte l_text + l_text bytes)
-  ## from path, recompressed as BGZF.  Verifies the BCF magic and calls quit(1)
-  ## on any format error.  Uses compressToBgzfMulti to handle headers > 65536 bytes.
-  let starts = scanBgzfBlockStarts(path)
-  let f = open(path, fmRead)
-  defer: f.close()
-  var accum: seq[byte]
-  var lText = -1'i64
-  var headerSize = -1'i64   # 5 + 4 + l_text
-  for off in starts:
-    var hdr = newSeq[byte](18)
-    f.setFilePos(off)
-    if readBytes(f, hdr, 0, 18) < 18: break
-    let blkSize = bgzfBlockSize(hdr)
-    if blkSize <= 0: break
-    var blk = newSeq[byte](blkSize)
-    f.setFilePos(off)
-    discard readBytes(f, blk, 0, blkSize)
-    accum.add(decompressBgzf(blk))
-    if lText < 0 and accum.len >= 9:
-      for i in 0 ..< 5:
-        if accum[i] != BCF_MAGIC[i]:
-          quit(&"extractBcfHeader: {path}: invalid BCF magic", 1)
-      var p = 5
-      lText = readLeU32(accum, p).int64
-      headerSize = 5'i64 + 4'i64 + lText
-    if headerSize >= 0 and accum.len.int64 >= headerSize:
-      return compressToBgzfMulti(accum[0 ..< headerSize.int])
-  if headerSize < 0:
-    quit(&"extractBcfHeader: {path}: file too short to read BCF header", 1)
-  quit(&"extractBcfHeader: {path}: header claims l_text={lText} but file " &
-       &"only provides {accum.len} bytes", 1)
-
-proc blockHasData(content: openArray[byte]; prevEndedWithNewline: bool): bool =
-  ## Return true if content contains at least one complete line not starting
-  ## with '#'.  prevEndedWithNewline must be true if the previous BGZF block
-  ## ended with '\n' (i.e. the first byte of content is the start of a new
-  ## line); if false, the first partial line is a continuation from the
-  ## previous block and is skipped.
-  var lineStart = 0
-  # Skip the partial first line when we are mid-line from the previous block.
-  if not prevEndedWithNewline:
-    var found = false
-    for i in 0 ..< content.len:
-      if content[i] == byte('\n'):
-        lineStart = i + 1
-        found = true
-        break
-    if not found:
-      return false   # entire block is a line continuation — no complete lines
-  # Check each complete line (terminated by '\n').
-  for i in lineStart ..< content.len:
-    if content[i] == byte('\n'):
-      if i > lineStart and content[lineStart] != byte('#'):
-        return true
-      lineStart = i + 1
-  # Do NOT check the partial last line: it may be the start of a header line
-  # whose '#' character lives in the next block.
-  return false
-
-proc getHeaderAndFirstBlock*(vcfPath: string): (seq[byte], int64) =
-  ## Scan BGZF blocks to collect all VCF header lines ('#' lines) and locate
-  ## the first block containing data.  No htslib dependency — reads raw bytes.
-  ## Returns (header recompressed as BGZF, first-data-block file offset).
-  ## Handles long header lines spanning BGZF block boundaries correctly.
-  let f = open(vcfPath, fmRead)
-  defer: f.close()
-  var hdrBuf = newSeq[byte](18)
-  if readBytes(f, hdrBuf, 0, 18) < 18 or bgzfBlockSize(hdrBuf) < 0:
-    stderr.writeLine &"error: no BGZF blocks found in {vcfPath}"
-    quit(1)
-  var headerBytes: seq[byte]
-  var pos = 0'i64
-  var prevEndedWithNewline = true   # start of file is always a line boundary
-  while true:
-    f.setFilePos(pos)
-    if readBytes(f, hdrBuf, 0, 18) < 18: break
-    let blkSize = bgzfBlockSize(hdrBuf)
-    if blkSize <= 0: break
-    var blk = newSeq[byte](blkSize)
-    f.setFilePos(pos)
-    discard readBytes(f, blk, 0, blkSize)
-    let content = decompressBgzf(blk)
-    if content.len > 0:
-      if blockHasData(content, prevEndedWithNewline):
-        # First data block — extract any leading '#' lines to complete the header.
-        # If the previous block ended mid-line, the continuation bytes here are
-        # part of a '#' line already started in headerBytes; include them up to '\n'.
-        var i = 0
-        if not prevEndedWithNewline:
-          while i < content.len:
-            headerBytes.add(content[i])
-            if content[i] == byte('\n'):
-              i += 1
-              break
-            i += 1
-        var lineStart = i
-        while i < content.len:
-          if content[i] == byte('\n'):
-            if i > lineStart and content[lineStart] == byte('#'):
-              for j in lineStart .. i: headerBytes.add(content[j])
-            lineStart = i + 1
-          i += 1
-        let compressedHeader = compressToBgzfMulti(headerBytes)
-        info(&"header: {headerBytes.len} bytes uncompressed, " &
-             &"{compressedHeader.len} bytes as BGZF")
-        info(&"first data block at file offset {pos}")
-        return (compressedHeader, pos)
-      else:
-        # Pure header block — collect all decompressed bytes.
-        headerBytes.add(content)
-        prevEndedWithNewline = content[^1] == byte('\n')
-    pos += blkSize.int64
-  # Edge case: file has no data records (header only).
-  let compressedHeader = compressToBgzfMulti(headerBytes)
-  result = (compressedHeader, pos)
-
-# ---------------------------------------------------------------------------
-# Phase 3 — shard boundary optimisation
-# ---------------------------------------------------------------------------
-
-proc getLengths*(starts: seq[int64]; fileSize: int64): seq[int64] =
-  ## Compute the byte length of each BGZF block: starts[i+1] - starts[i],
-  ## with the last block running to fileSize.
-  result = newSeq[int64](starts.len)
-  for i in 0 ..< starts.len - 1:
-    result[i] = starts[i + 1] - starts[i]
-  if starts.len > 0:
-    result[^1] = fileSize - starts[^1]
-
-# ---------------------------------------------------------------------------
-# Phase 4 — shard writing helpers
+# Shard writing helpers
 # ---------------------------------------------------------------------------
 
 type ShardTask* = object
@@ -394,7 +143,10 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
   var voffs: seq[(int64, int)]
   if forceScan and format == ffVcf:
     info("--force-scan: ignoring index, scanning all BGZF blocks")
-    for off in scanAllBlockStarts(vcfPath, firstBlockOff):
+    let starts = scanBgzfBlockStarts(vcfPath, startAt = firstBlockOff,
+                                     endAt = fileSize - 28)
+    info(&"scan: found {starts.len} data blocks")
+    for off in starts:
       voffs.add((off, 0))
   else:
     voffs = readIndexVirtualOffsets(vcfPath)
@@ -403,7 +155,10 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
       # No index for VCF — fall back to scanning all blocks.
       stderr.writeLine &"warning: no index found for {vcfPath} — scanning BGZF blocks directly"
       stderr.writeLine "  (create an index with 'tabix -p vcf' for faster operation)"
-      for off in scanAllBlockStarts(vcfPath, firstBlockOff):
+      let starts = scanBgzfBlockStarts(vcfPath, startAt = firstBlockOff,
+                                       endAt = fileSize - 28)
+      info(&"scan: found {starts.len} data blocks")
+      for off in starts:
         voffs.add((off, 0))
 
   # Ensure the first data virtual offset is in the list, then sort + dedupe.

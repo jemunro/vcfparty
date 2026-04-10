@@ -2,6 +2,7 @@
 ## Entry point is src/vcfparty.nim which includes this file.
 
 import std/[options, os, parseopt, strutils, tempfiles]
+import vcf_utils
 import scatter
 import run
 import gather
@@ -130,7 +131,7 @@ proc runScatter(rawArgs: seq[string]) =
   if not fileExists(inputFile):
     stderr.writeLine "error: input file not found: " & inputFile
     quit(1)
-  let (fmt, _) = sniffFileFormat(inputFile)
+  let fmt = inferInputFormat(inputFile)
   if fmt == ffBcf and forceScan:
     stderr.writeLine "error: vcfparty: --force-scan is not supported for BCF input"
     quit(1)
@@ -268,7 +269,7 @@ proc runRun(rawArgs: seq[string]) =
   if not fileExists(inputFile):
     stderr.writeLine "error: input file not found: " & inputFile
     quit(1)
-  let (fmt, _) = sniffFileFormat(inputFile)
+  let fmt = inferInputFormat(inputFile)
   if fmt == ffBcf and forceScan:
     stderr.writeLine "error: vcfparty: --force-scan is not supported for BCF input"
     quit(1)

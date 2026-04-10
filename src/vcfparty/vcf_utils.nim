@@ -3,7 +3,7 @@
 ## Only external dependency: libdeflate (-ldeflate), no htslib required.
 ## All proc signatures use explicit types per project style guide.
 
-import std/[strformat]
+import std/[algorithm, os, strformat, strutils]
 
 # ---------------------------------------------------------------------------
 # Format types
@@ -85,6 +85,22 @@ proc leU32*(buf: openArray[byte]; pos: int): uint32 {.inline.} =
   ## Read a little-endian uint32 from buf at pos.
   buf[pos].uint32 or (buf[pos+1].uint32 shl 8) or
   (buf[pos+2].uint32 shl 16) or (buf[pos+3].uint32 shl 24)
+
+proc readLeU32(data: openArray[byte]; pos: var int): uint32 =
+  ## Read a little-endian uint32 from data at pos, then advance pos by 4.
+  result = data[pos].uint32 or (data[pos+1].uint32 shl 8) or
+           (data[pos+2].uint32 shl 16) or (data[pos+3].uint32 shl 24)
+  pos += 4
+
+proc readLeI32(data: openArray[byte]; pos: var int): int32 =
+  ## Read a little-endian int32 from data at pos, then advance pos by 4.
+  cast[int32](readLeU32(data, pos))
+
+proc readLeU64(data: openArray[byte]; pos: var int): uint64 =
+  ## Read a little-endian uint64 from data at pos, then advance pos by 8.
+  let lo = readLeU32(data, pos).uint64   # advances pos by 4
+  let hi = readLeU32(data, pos).uint64   # advances pos by 4 again
+  result = lo or (hi shl 32)
 
 proc putLeU16(buf: var seq[byte]; pos: int; v: uint16) {.inline.} =
   ## Write a little-endian uint16 into buf at pos.
@@ -182,24 +198,6 @@ proc decompressBgzf*(data: openArray[byte]): seq[byte] =
   libdeflateFreeDecompressor(dcmp)
   if ret != LIBDEFLATE_SUCCESS:
     quit(&"decompressBgzf: deflate_decompress returned {ret}", 1)
-
-proc decompressBgzfFile*(path: string): seq[byte] =
-  ## Decompress an entire BGZF file into a single contiguous byte sequence.
-  ## Iterates all blocks in order; EOF blocks (ISIZE=0) contribute nothing.
-  result = @[]
-  let starts = scanBgzfBlockStarts(path)
-  let f = open(path, fmRead)
-  defer: f.close()
-  var buf = newSeq[byte](18)
-  for off in starts:
-    f.setFilePos(off)
-    discard readBytes(f, buf, 0, 18)
-    let blkSize = bgzfBlockSize(buf)
-    if blkSize <= 0: break
-    var blk = newSeq[byte](blkSize)
-    f.setFilePos(off)
-    discard readBytes(f, blk, 0, blkSize)
-    result.add(decompressBgzf(blk))
 
 proc compressToBgzf*(data: openArray[byte]; level: int = 6): seq[byte] =
   ## Compress data into a single valid BGZF block using raw deflate.
@@ -321,6 +319,12 @@ proc decompressBgzfBytes*(data: openArray[byte]): seq[byte] =
     result.add(decompressBgzf(data.toOpenArray(pos, pos + blkSize - 1)))
     pos += blkSize
 
+proc decompressBgzfFile*(path: string): seq[byte] =
+  ## Decompress an entire BGZF file into a single contiguous byte sequence.
+  ## Reads the whole file once and walks concatenated BGZF blocks in memory.
+  let raw = readFile(path)
+  result = decompressBgzfBytes(raw.toOpenArrayByte(0, raw.len - 1))
+
 proc decompressCopyBytes*(srcPath: string; dst: File; start: int64; length: int64) =
   ## Read BGZF blocks from [start, start+length) in srcPath, decompress each,
   ## and write the raw uncompressed bytes to dst.
@@ -341,6 +345,239 @@ proc decompressCopyBytes*(srcPath: string; dst: File; start: int64; length: int6
     if decompressed.len > 0:
       discard dst.writeBytes(decompressed, 0, decompressed.len)
     cur += blkSize.int64
+
+# ---------------------------------------------------------------------------
+# Index parsing — TBI / CSI virtual offsets
+# ---------------------------------------------------------------------------
+
+proc parseTbiVirtualOffsets*(tbiPath: string): seq[(int64, int)] =
+  ## Parse a .tbi index and return sorted unique virtual offsets as
+  ## (block_file_offset, within_block_offset) pairs for all chunk starts.
+  let raw = decompressBgzfFile(tbiPath)
+  if raw.len < 8 or raw[0] != byte('T') or raw[1] != byte('B') or
+     raw[2] != byte('I') or raw[3] != 0x01:
+    quit(&"parseTbiVirtualOffsets: not a valid TBI index: {tbiPath}", 1)
+  var pos = 4
+  let nRef = readLeI32(raw, pos).int
+  pos += 24                            # skip 6 int32s
+  let lNm = readLeI32(raw, pos).int
+  pos += lNm                          # skip sequence-name block
+  var offsets: seq[(int64, int)]
+  for _ in 0 ..< nRef:
+    let nBin = readLeU32(raw, pos).int
+    for _ in 0 ..< nBin:
+      pos += 4  # skip bin_id
+      let nChunk = readLeU32(raw, pos).int
+      for _ in 0 ..< nChunk:
+        let beg    = readLeU64(raw, pos)
+        let endOff = readLeU64(raw, pos)
+        if endOff > beg:
+          offsets.add(((beg shr 16).int64, (beg and 0xFFFF).int))
+    let nIntv = readLeU32(raw, pos).int
+    pos += 8 * nIntv  # skip linear index intervals
+  offsets.sort(proc(a, b: (int64, int)): int =
+    if a[0] != b[0]: cmp(a[0], b[0]) else: cmp(a[1], b[1]))
+  var deduped: seq[(int64, int)]
+  for i, v in offsets:
+    if i == 0 or v != offsets[i - 1]:
+      deduped.add(v)
+  result = deduped
+
+proc parseCsiVirtualOffsets*(csiPath: string): seq[(int64, int)] =
+  ## Parse a .csi index and return sorted unique virtual offsets as
+  ## (block_file_offset, within_block_offset) pairs for all chunk starts.
+  let raw = decompressBgzfFile(csiPath)
+  if raw.len < 8 or raw[0] != byte('C') or raw[1] != byte('S') or
+     raw[2] != byte('I') or raw[3] != 0x01:
+    quit(&"parseCsiVirtualOffsets: not a valid CSI index: {csiPath}", 1)
+  var pos = 4
+  pos += 8               # skip min_shift (int32) + depth (int32)
+  let lAux = readLeI32(raw, pos).int
+  pos += lAux
+  let nRef = readLeI32(raw, pos).int
+  var offsets: seq[(int64, int)]
+  for _ in 0 ..< nRef:
+    let nBin = readLeI32(raw, pos).int
+    for _ in 0 ..< nBin:
+      pos += 4   # skip bin (uint32)
+      pos += 8   # skip loffset (uint64)
+      let nChunk = readLeI32(raw, pos).int
+      for _ in 0 ..< nChunk:
+        let beg    = readLeU64(raw, pos)
+        let endOff = readLeU64(raw, pos)
+        if endOff > beg:
+          offsets.add(((beg shr 16).int64, (beg and 0xFFFF).int))
+  offsets.sort(proc(a, b: (int64, int)): int =
+    if a[0] != b[0]: cmp(a[0], b[0]) else: cmp(a[1], b[1]))
+  var deduped: seq[(int64, int)]
+  for i, v in offsets:
+    if i == 0 or v != offsets[i - 1]:
+      deduped.add(v)
+  result = deduped
+
+proc readIndexVirtualOffsets*(vcfPath: string): seq[(int64, int)] =
+  ## Detect a .csi or .tbi index and return sorted unique virtual offsets as
+  ## (block_file_offset, within_block_offset) pairs. Returns @[] if no index.
+  let csi = vcfPath & ".csi"
+  let tbi = vcfPath & ".tbi"
+  if fileExists(csi):
+    result = parseCsiVirtualOffsets(csi)
+  elif fileExists(tbi):
+    result = parseTbiVirtualOffsets(tbi)
+  else:
+    result = @[]
+
+# ---------------------------------------------------------------------------
+# Header extraction — BCF and VCF
+# ---------------------------------------------------------------------------
+
+proc extractBcfHeader*(path: string): seq[byte] =
+  ## Extract the BCF header blob (5-byte magic + 4-byte l_text + l_text bytes)
+  ## from path, recompressed as BGZF.  Verifies the BCF magic and calls quit(1)
+  ## on any format error.  Uses compressToBgzfMulti to handle headers > 65536 bytes.
+  ## Walks BGZF blocks sequentially from offset 0 — no full-file scan needed
+  ## because the BCF header lives at the very start of the file.
+  let f = open(path, fmRead)
+  defer: f.close()
+  var accum: seq[byte]
+  var lText = -1'i64
+  var headerSize = -1'i64   # 5 + 4 + l_text
+  var off = 0'i64
+  var hdr = newSeq[byte](18)
+  while true:
+    f.setFilePos(off)
+    if readBytes(f, hdr, 0, 18) < 18: break
+    let blkSize = bgzfBlockSize(hdr)
+    if blkSize <= 0: break
+    var blk = newSeq[byte](blkSize)
+    f.setFilePos(off)
+    discard readBytes(f, blk, 0, blkSize)
+    accum.add(decompressBgzf(blk))
+    if lText < 0 and accum.len >= 9:
+      for i in 0 ..< 5:
+        if accum[i] != BCF_MAGIC[i]:
+          quit(&"extractBcfHeader: {path}: invalid BCF magic", 1)
+      var p = 5
+      lText = readLeU32(accum, p).int64
+      headerSize = 5'i64 + 4'i64 + lText
+    if headerSize >= 0 and accum.len.int64 >= headerSize:
+      return compressToBgzfMulti(accum[0 ..< headerSize.int])
+    off += blkSize.int64
+  if headerSize < 0:
+    quit(&"extractBcfHeader: {path}: file too short to read BCF header", 1)
+  quit(&"extractBcfHeader: {path}: header claims l_text={lText} but file " &
+       &"only provides {accum.len} bytes", 1)
+
+proc blockHasData(content: openArray[byte]; prevEndedWithNewline: bool): bool =
+  ## Return true if content contains at least one complete line not starting
+  ## with '#'.  prevEndedWithNewline must be true if the previous BGZF block
+  ## ended with '\n' (i.e. the first byte of content is the start of a new
+  ## line); if false, the first partial line is a continuation from the
+  ## previous block and is skipped.
+  var lineStart = 0
+  # Skip the partial first line when we are mid-line from the previous block.
+  if not prevEndedWithNewline:
+    var found = false
+    for i in 0 ..< content.len:
+      if content[i] == byte('\n'):
+        lineStart = i + 1
+        found = true
+        break
+    if not found:
+      return false   # entire block is a line continuation — no complete lines
+  # Check each complete line (terminated by '\n').
+  for i in lineStart ..< content.len:
+    if content[i] == byte('\n'):
+      if i > lineStart and content[lineStart] != byte('#'):
+        return true
+      lineStart = i + 1
+  # Do NOT check the partial last line: it may be the start of a header line
+  # whose '#' character lives in the next block.
+  return false
+
+proc getHeaderAndFirstBlock*(vcfPath: string): (seq[byte], int64) =
+  ## Scan BGZF blocks to collect all VCF header lines ('#' lines) and locate
+  ## the first block containing data.  No htslib dependency — reads raw bytes.
+  ## Returns (header recompressed as BGZF, first-data-block file offset).
+  ## Handles long header lines spanning BGZF block boundaries correctly.
+  let f = open(vcfPath, fmRead)
+  defer: f.close()
+  var hdrBuf = newSeq[byte](18)
+  if readBytes(f, hdrBuf, 0, 18) < 18 or bgzfBlockSize(hdrBuf) < 0:
+    stderr.writeLine &"error: no BGZF blocks found in {vcfPath}"
+    quit(1)
+  var headerBytes: seq[byte]
+  var pos = 0'i64
+  var prevEndedWithNewline = true   # start of file is always a line boundary
+  while true:
+    f.setFilePos(pos)
+    if readBytes(f, hdrBuf, 0, 18) < 18: break
+    let blkSize = bgzfBlockSize(hdrBuf)
+    if blkSize <= 0: break
+    var blk = newSeq[byte](blkSize)
+    f.setFilePos(pos)
+    discard readBytes(f, blk, 0, blkSize)
+    let content = decompressBgzf(blk)
+    if content.len > 0:
+      if blockHasData(content, prevEndedWithNewline):
+        # First data block — extract any leading '#' lines to complete the header.
+        # If the previous block ended mid-line, the continuation bytes here are
+        # part of a '#' line already started in headerBytes; include them up to '\n'.
+        var i = 0
+        if not prevEndedWithNewline:
+          while i < content.len:
+            headerBytes.add(content[i])
+            if content[i] == byte('\n'):
+              i += 1
+              break
+            i += 1
+        var lineStart = i
+        while i < content.len:
+          if content[i] == byte('\n'):
+            if i > lineStart and content[lineStart] == byte('#'):
+              for j in lineStart .. i: headerBytes.add(content[j])
+            lineStart = i + 1
+          i += 1
+        let compressedHeader = compressToBgzfMulti(headerBytes)
+        return (compressedHeader, pos)
+      else:
+        # Pure header block — collect all decompressed bytes.
+        headerBytes.add(content)
+        prevEndedWithNewline = content[^1] == byte('\n')
+    pos += blkSize.int64
+  # Edge case: file has no data records (header only).
+  let compressedHeader = compressToBgzfMulti(headerBytes)
+  result = (compressedHeader, pos)
+
+# ---------------------------------------------------------------------------
+# Block-length utilities
+# ---------------------------------------------------------------------------
+
+proc getLengths*(starts: seq[int64]; fileSize: int64): seq[int64] =
+  ## Compute the byte length of each BGZF block: starts[i+1] - starts[i],
+  ## with the last block running to fileSize.
+  result = newSeq[int64](starts.len)
+  for i in 0 ..< starts.len - 1:
+    result[i] = starts[i + 1] - starts[i]
+  if starts.len > 0:
+    result[^1] = fileSize - starts[^1]
+
+# ---------------------------------------------------------------------------
+# BCF record walking
+# ---------------------------------------------------------------------------
+
+proc findBcfRecordEnd*(data: openArray[byte]): int =
+  ## Walk BCF records from the start of data.  Return the index just past the
+  ## last complete record, or 0 if not even one complete record fits.
+  var pos = 0
+  while pos + 8 <= data.len:
+    let lShared = cast[ptr uint32](unsafeAddr data[pos])[]
+    let lIndiv  = cast[ptr uint32](unsafeAddr data[pos + 4])[]
+    let recLen  = 8 + lShared.int + lIndiv.int
+    if pos + recLen > data.len:
+      break  # incomplete record
+    pos += recLen
+  return pos
 
 # ---------------------------------------------------------------------------
 # Format sniffing
@@ -395,3 +632,15 @@ proc sniffFileFormat*(path: string): (FileFormat, bool) =
     stderr.writeLine "error: file is empty: " & path
     quit(1)
   result = sniffStreamFormat(head[0 ..< nRead])
+
+proc inferInputFormat*(path: string): FileFormat =
+  ## Infer the format of a scatter/run input file.
+  ## Fast path: recognised extensions (.bcf, .vcf.gz, .vcf.bgz, .vcf).
+  ## Fallback: sniff the file's magic bytes. Exits 1 on I/O error.
+  if path.endsWith(".bcf"):
+    return ffBcf
+  if path.endsWith(".vcf.gz") or path.endsWith(".vcf.bgz") or
+     path.endsWith(".vcf"):
+    return ffVcf
+  let (fmt, _) = sniffFileFormat(path)
+  return fmt

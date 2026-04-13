@@ -24,13 +24,12 @@ const SmallBcf = DataDir / "small.bcf"
 timed("R1.1", "parseRunArgv: single stage"):
   let argv = @["--shards", "4", "-o", "out", "input.vcf.gz",
                "---", "bcftools", "view", "-Oz"]
-  let (pArgs, stages, termOp) = parseRunArgv(argv)
+  let (pArgs, stages) = parseRunArgv(argv)
   doAssert pArgs == @["--shards", "4", "-o", "out", "input.vcf.gz"],
     "single stage: wrong vcfparty args"
   doAssert stages.len == 1, "single stage: expected 1 stage, got " & $stages.len
   doAssert stages[0] == @["bcftools", "view", "-Oz"],
     "single stage: wrong stage tokens"
-  doAssert termOp == topNone, "single stage: expected topNone terminal op"
 
 # ---------------------------------------------------------------------------
 # R2 — testMultiStage: multi-stage pipeline; inner -- is a plain token
@@ -40,7 +39,7 @@ timed("R1.2", "parseRunArgv: multi-stage pipeline"):
                "bcftools", "+split-vep", "-Ou", "--", "-f", "%SYMBOL",
                "---",
                "bcftools", "view", "-s", "Sample", "-Oz"]
-  let (pArgs, stages, _) = parseRunArgv(argv)
+  let (pArgs, stages) = parseRunArgv(argv)
   doAssert pArgs == @["-n", "10"], "multi-stage: wrong vcfparty args"
   doAssert stages.len == 2, "multi-stage: expected 2 stages, got " & $stages.len
   doAssert stages[0] == @["bcftools", "+split-vep", "-Ou", "--", "-f", "%SYMBOL"],
@@ -53,7 +52,7 @@ timed("R1.2", "parseRunArgv: multi-stage pipeline"):
 # ---------------------------------------------------------------------------
 timed("R1.3", "parseRunArgv: --- first, no vcfparty args"):
   let argv = @["---", "cat"]
-  let (pArgs, stages, _) = parseRunArgv(argv)
+  let (pArgs, stages) = parseRunArgv(argv)
   doAssert pArgs.len == 0, "sep-first: vcfparty args should be empty"
   doAssert stages.len == 1, "sep-first: expected 1 stage"
   doAssert stages[0] == @["cat"], "sep-first: wrong stage tokens"
@@ -63,7 +62,7 @@ timed("R1.3", "parseRunArgv: --- first, no vcfparty args"):
 # ---------------------------------------------------------------------------
 timed("R1.4", "parseRunArgv: -- inside stage is a plain token"):
   let argv = @["---", "bcftools", "+fill-tags", "-Ou", "--", "-t", "AF"]
-  let (_, stages, _) = parseRunArgv(argv)
+  let (_, stages) = parseRunArgv(argv)
   doAssert stages.len == 1, "dash-dash: expected 1 stage"
   doAssert stages[0] == @["bcftools", "+fill-tags", "-Ou", "--", "-t", "AF"],
     "dash-dash: -- should be a plain token"
@@ -73,7 +72,7 @@ timed("R1.4", "parseRunArgv: -- inside stage is a plain token"):
 # ---------------------------------------------------------------------------
 timed("R1.5", "parseRunArgv: ::: is alias for ---"):
   let argv = @["-n", "4", ":::", "bcftools", "view", "-Oz"]
-  let (pArgs, stages, _) = parseRunArgv(argv)
+  let (pArgs, stages) = parseRunArgv(argv)
   doAssert pArgs == @["-n", "4"], "::: sep: wrong vcfparty args"
   doAssert stages.len == 1, "::: sep: expected 1 stage"
   doAssert stages[0] == @["bcftools", "view", "-Oz"], "::: sep: wrong stage tokens"
@@ -83,105 +82,18 @@ timed("R1.5", "parseRunArgv: ::: is alias for ---"):
 # ---------------------------------------------------------------------------
 timed("R1.6", "parseRunArgv: ::: and --- may be mixed"):
   let argv = @["---", "cmd1", "a", ":::", "cmd2", "b", "---", "cmd3", "c"]
-  let (_, stages, _) = parseRunArgv(argv)
+  let (_, stages) = parseRunArgv(argv)
   doAssert stages.len == 3, "mixed seps: expected 3 stages, got " & $stages.len
   doAssert stages[0] == @["cmd1", "a"], "mixed: wrong stage 0"
   doAssert stages[1] == @["cmd2", "b"], "mixed: wrong stage 1"
   doAssert stages[2] == @["cmd3", "c"], "mixed: wrong stage 2"
 
-# ===========================================================================
-# R1.7–R1.15 — terminal operator parsing
-# ===========================================================================
-
 # ---------------------------------------------------------------------------
-# R1.7: +concat+ recognised, stage tokens stop before it
+# R1.7: no -o and no {} → exit 1 (no output specified)
 # ---------------------------------------------------------------------------
-timed("R1.7", "parseRunArgv: +concat+ terminal operator"):
-  let argv = @["---", "bcftools", "view", "-Oz", "+concat+"]
-  let (_, stages, termOp) = parseRunArgv(argv)
-  doAssert termOp == topConcat, "concat: expected topConcat, got " & $termOp
-  doAssert stages.len == 1, "concat: expected 1 stage"
-  doAssert stages[0] == @["bcftools", "view", "-Oz"],
-    "concat: +concat+ must not appear in stage tokens"
-
-# ---------------------------------------------------------------------------
-# R1.8: +merge+ recognised
-# ---------------------------------------------------------------------------
-timed("R1.8", "parseRunArgv: +merge+ terminal operator"):
-  let argv = @["---", "cat", "+merge+"]
-  let (_, stages, termOp) = parseRunArgv(argv)
-  doAssert termOp == topMerge, "merge: expected topMerge"
-  doAssert stages[0] == @["cat"], "merge: stage should be just [cat]"
-
-# ---------------------------------------------------------------------------
-# R1.9: +collect+ recognised
-# ---------------------------------------------------------------------------
-timed("R1.9", "parseRunArgv: +collect+ terminal operator"):
-  let argv = @["---", "cat", "+collect+"]
-  let (_, stages, termOp) = parseRunArgv(argv)
-  doAssert termOp == topCollect, "collect: expected topCollect"
-  doAssert stages[0] == @["cat"], "collect: stage should be just [cat]"
-
-# ---------------------------------------------------------------------------
-# R1.10: terminal op after multi-stage pipeline
-# ---------------------------------------------------------------------------
-timed("R1.10", "parseRunArgv: terminal op after multi-stage pipeline"):
-  let argv = @["---", "cmd1", "---", "cmd2", "+concat+"]
-  let (_, stages, termOp) = parseRunArgv(argv)
-  doAssert termOp == topConcat, "multi+concat: expected topConcat"
-  doAssert stages.len == 2, "multi+concat: expected 2 stages"
-  doAssert stages[0] == @["cmd1"], "multi+concat: wrong stage 0"
-  doAssert stages[1] == @["cmd2"], "multi+concat: wrong stage 1"
-
-# ---------------------------------------------------------------------------
-# R1.11: no terminal op → topNone (backward compat)
-# ---------------------------------------------------------------------------
-timed("R1.11", "parseRunArgv: no terminal operator -> topNone"):
-  let argv = @["---", "cat"]
-  let (_, _, termOp) = parseRunArgv(argv)
-  doAssert termOp == topNone, "no-op: expected topNone"
-
-# ---------------------------------------------------------------------------
-# R1.12: toTerminalOp helper
-# ---------------------------------------------------------------------------
-timed("R1.12", "toTerminalOp: all cases"):
-  doAssert toTerminalOp("+concat+")  == topConcat,  "toTerminalOp +concat+"
-  doAssert toTerminalOp("+merge+")   == topMerge,   "toTerminalOp +merge+"
-  doAssert toTerminalOp("+collect+") == topCollect, "toTerminalOp +collect+"
-  doAssert toTerminalOp("cat")       == topNone,    "toTerminalOp plain token"
-  doAssert toTerminalOp("+CONCAT+")  == topNone,    "toTerminalOp case sensitive"
-  doAssert toTerminalOp("")          == topNone,    "toTerminalOp empty"
-
-const BinPathEarly = "./vcfparty"
-
-# ---------------------------------------------------------------------------
-# R1.13: multiple terminal operators → exit 1
-# ---------------------------------------------------------------------------
-timed("R1.13", "parseRunArgv: multiple terminal operators -> error"):
+timed("R1.7", "CLI run: no -o and no {} -> error"):
   let (outp, code) = execCmdEx(
-    BinPathEarly & " run -n 1 " & SmallVcf &
-    " ::: cat +concat+ +merge+ 2>&1")
-  doAssert code != 0, "multiple terminal ops should exit non-zero"
-  doAssert "multiple terminal operators" in outp,
-    "expected 'multiple terminal operators' in output, got:\n" & outp
-
-# ---------------------------------------------------------------------------
-# R1.14: tokens after terminal operator → exit 1
-# ---------------------------------------------------------------------------
-timed("R1.14", "parseRunArgv: tokens after terminal operator -> error"):
-  let (outp, code) = execCmdEx(
-    BinPathEarly & " run -n 1 " & SmallVcf &
-    " ::: cat +concat+ extra 2>&1")
-  doAssert code != 0, "tokens after terminal op should exit non-zero"
-  doAssert "unexpected tokens after" in outp,
-    "expected 'unexpected tokens after' in output, got:\n" & outp
-
-# ---------------------------------------------------------------------------
-# R1.15: topNone with no -o and no {} → exit 1 (no output specified)
-# ---------------------------------------------------------------------------
-timed("R1.15", "CLI run: no -o and no {} -> error"):
-  let (outp, code) = execCmdEx(
-    BinPathEarly & " run -n 1 " & SmallVcf &
+    "./vcfparty run -n 1 " & SmallVcf &
     " ::: cat 2>&1")
   doAssert code != 0, "no -o and no {} should exit non-zero"
   doAssert "no output" in outp.toLowerAscii or "output" in outp.toLowerAscii,
@@ -245,7 +157,7 @@ timed("R3.1", "runShards: 1 shard, cat stage"):
   let tmpDir = createTempDir("vcfparty_", "")
   let tmpl = tmpDir / "out.{}.vcf.gz"
   runPipeline(RunPipelineCfg(
-    mode: pmTool, vcfPath: SmallVcf, nShards: 1, nThreads: 1,
+    vcfPath: SmallVcf, nShards: 1, nThreads: 1,
     stages: @[@["cat"]], outputTemplate: tmpl))
   let outPath = shardOutputPath(tmpl, 0, 1)
   doAssert fileExists(outPath), "output missing: " & outPath
@@ -264,7 +176,7 @@ timed("R3.2", "runShards: 4 shards concurrent"):
   let tmpDir = createTempDir("vcfparty_", "")
   let tmpl = tmpDir / "out.{}.vcf.gz"
   runPipeline(RunPipelineCfg(
-    mode: pmTool, vcfPath: SmallVcf, nShards: 4, nThreads: 1,
+    vcfPath: SmallVcf, nShards: 4, nThreads: 1,
     stages: @[@["cat"]], outputTemplate: tmpl))
   var total = 0
   var shardPaths: seq[string]
@@ -289,7 +201,7 @@ timed("R3.3", "runShards BCF: 4 shards, bcftools view -Ob"):
   let tmpDir = createTempDir("vcfparty_", "")
   let tmpl = tmpDir / "out.{}.bcf"
   runPipeline(RunPipelineCfg(
-    mode: pmTool, vcfPath: SmallBcf, nShards: 4, nThreads: 1,
+    vcfPath: SmallBcf, nShards: 4, nThreads: 1,
     stages: @[@["bcftools", "view", "-Ob"]], outputTemplate: tmpl))
   var total = 0
   var bcfShardPaths: seq[string]
@@ -471,30 +383,6 @@ timed("R4.11", "CLI run: --no-kill flag accepted, all shards complete normally")
     doAssert fileExists(tmpDir / ("shard_" & $i & ".out.vcf.gz")), &"--no-kill shard {i} missing"
   removeDir(tmpDir)
 
-# ---------------------------------------------------------------------------
-# R4.12 — testCliRunConcat: +concat+ gathers N shards into a single output file
-# ---------------------------------------------------------------------------
-timed("R4.12", "CLI run: +concat+ gathers 4 shards into single file"):
-  let tmpDir = createTempDir("vcfparty_", "")
-  let outFile = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 4 -o {outFile} {SmallVcf} ::: cat +concat+")
-  doAssert code == 0, &"+concat+ exited {code}:\n{outp}"
-  doAssert fileExists(outFile), "+concat+ output file missing"
-  let orig = countRecords(SmallVcf)
-  doAssert countRecords(outFile) == orig, "+concat+ record count mismatch"
-  removeDir(tmpDir)
-
-# ---------------------------------------------------------------------------
-# R4.13 — testCliRunConcatStdout: +concat+ without -o writes all records to stdout
-# ---------------------------------------------------------------------------
-timed("R4.13", "CLI run: +concat+ stdout"):
-  let (outp, code) = execCmdEx(
-    BinPath & " run -n 2 " & SmallVcf & " ::: cat +concat+ 2>/dev/null | bcftools view -H | wc -l")
-  doAssert code == 0, &"+concat+ stdout exited {code}"
-  let nRecs = outp.strip().parseInt
-  let orig  = countRecords(SmallVcf)
-  doAssert nRecs == orig, &"+concat+ stdout record count {nRecs} != {orig}"
-
 # ===========================================================================
 # R5 — inferRunMode: non-error cases
 # (The error case — no output, no {} — calls quit(1) and is covered at the
@@ -584,7 +472,7 @@ timed("R7.1", "tool-managed API: 2 shards, tool writes own output"):
   # We use bcftools view -Oz -o <path> rather than stdout.
   let stages = @[@["bcftools", "view", "-Oz", "-o", outTemplate]]
   runPipeline(RunPipelineCfg(
-    mode: pmTool, vcfPath: SmallVcf, nShards: 2, nThreads: 1,
+    vcfPath: SmallVcf, nShards: 2, nThreads: 1,
     stages: stages, toolManaged: true))
   var total = 0
   for i in 0..1:

@@ -1,7 +1,7 @@
 ## vcfparty CLI — argument parsing and subcommand dispatch.
 ## Entry point is src/vcfparty.nim which includes this file.
 
-import std/[options, os, parseopt, strutils, tempfiles]
+import std/[os, parseopt, strutils]
 import vcf_utils
 import scatter
 import run
@@ -146,27 +146,18 @@ proc runUsage() =
   stderr.writeLine ""
   stderr.writeLine "Options:"
   stderr.writeLine "  -n, --n-shards <int>         number of shards (required, >= 1); controls both shard count and concurrency"
-  stderr.writeLine "  -o, --output <str>           output path or prefix (default: stdout)"
+  stderr.writeLine "  -o, --output <str>           output path or prefix"
   stderr.writeLine "  -u                           force uncompressed file output (error with tool-managed {})"
   stderr.writeLine "  -t, --max-threads <int>      max threads for scatter/validation (default: min(n-shards, 8))"
   stderr.writeLine "      --force-scan             always scan BGZF blocks (ignore index even if present)"
   stderr.writeLine "      --clamp-shards           if -n exceeds available index entries, reduce -n instead of erroring"
   stderr.writeLine "      --no-kill                on failure, let sibling shards finish (default: kill them)"
-  stderr.writeLine "      --header-pattern <pat>   strip lines starting with pat from shards 2..N (text format only)"
-  stderr.writeLine "      --header-n <n>           strip the first n lines from shards 2..N (text format only)"
   stderr.writeLine "  -v, --verbose                print per-shard progress to stderr"
   stderr.writeLine "  -h, --help                   show this help"
   stderr.writeLine ""
-  stderr.writeLine "Separate pipeline stages with --- or :::. Append a terminal operator to gather output:"
-  stderr.writeLine "  vcfparty run -n 8 input.vcf.gz ::: bcftools view -i \"GT='alt'\" -Oz +concat+"
-  stderr.writeLine "  vcfparty run -n 8 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz +concat+"
+  stderr.writeLine "Separate pipeline stages with --- or :::."
+  stderr.writeLine "  vcfparty run -n 8 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz"
   stderr.writeLine "  vcfparty run -n 8 input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
-  stderr.writeLine ""
-  stderr.writeLine "Terminal operators (appended after last stage):"
-  stderr.writeLine "  +concat+    gather in genomic order via temp files (-o required)"
-  stderr.writeLine "  +merge+     k-way merge sort, interleaved scatter (-o required)"
-  stderr.writeLine "  +collect+   streaming gather in arrival order (-o required)"
-  stderr.writeLine "  (none)      tool manages output via {} substitution in command"
   quit(1)
 
 proc runRun(rawArgs: seq[string]) =
@@ -192,10 +183,6 @@ proc runRun(rawArgs: seq[string]) =
   var clampShards     = false
   var forceUncompress = false
   var noKill          = false
-  var headerPattern   = ""
-  var headerPatternSet = false
-  var headerN         = 0
-  var headerNSet      = false
   var p = initOptParser(vcfpartyPart, shortNoVal = ShortNoVal)
   while true:
     p.next()
@@ -232,20 +219,6 @@ proc runRun(rawArgs: seq[string]) =
         clampShards = true
       of "no-kill":
         noKill = true
-      of "header-pattern":
-        headerPattern    = nextVal(p, "header-pattern")
-        headerPatternSet = true
-      of "header-n":
-        let v = nextVal(p, "header-n")
-        try:
-          headerN = v.parseInt
-        except ValueError:
-          stderr.writeLine "error: --header-n must be an integer, got: " & v
-          quit(1)
-        if headerN < 0:
-          stderr.writeLine "error: --header-n must be >= 0, got: " & $headerN
-          quit(1)
-        headerNSet = true
       of "v", "verbose":
         scatter.verbose = true
       of "h", "help":
@@ -276,71 +249,24 @@ proc runRun(rawArgs: seq[string]) =
     quit(1)
   if not nThreadsSet:
     nThreads = min(nShards, 8)
-  let (_, stages, termOp) = parseRunArgv(rawArgs)
-  let hasBrace             = hasBracePlaceholder(stages)
-
-  var cfg = RunPipelineCfg(
-    vcfPath:     inputFile,
-    nShards:     nShards,
-    nThreads:    nThreads,
-    forceScan:   forceScan,
-    stages:      stages,
-    noKill:      noKill,
-    clampShards: clampShards)
-  case termOp
-  of topConcat:
-    let isStdout = (outPrefix == "" or outPrefix == "/dev/stdout")
-    let (gFmt, gComp) = inferFileFormat(outPrefix, "")
-    let finalComp =
-      if isStdout: compNone
-      elif forceUncompress: compNone
-      else: gComp
-    if forceUncompress and not isStdout and gComp == compBgzf:
-      stderr.writeLine "warning: -u forces uncompressed output but -o extension suggests compressed"
-    let resolvedTmpDir = createTempDir("vcfparty_", "")
-    var gcfg = GatherConfig(
-      format:      gFmt,
-      compression: finalComp,
-      outputPath:  if isStdout: "" else: outPrefix,
-      tmpDir:      resolvedTmpDir,
-      shardCount:  nShards,
-      toStdout:    isStdout)
-    if headerPatternSet:
-      gcfg.headerPattern = some(headerPattern)
-    if headerNSet:
-      gcfg.headerN = some(headerN)
-    validateGatherConfig(gcfg)
-    if not isStdout:
-      warnFormatMismatch(inputFile, outPrefix)
-    cfg.mode       = pmConcat
-    cfg.outputPath = outPrefix
-    cfg.toStdout   = isStdout
-    cfg.gather     = gcfg
-  of topCollect:
-    let isStdout = (outPrefix == "" or outPrefix == "/dev/stdout")
-    if not isStdout:
-      warnFormatMismatch(inputFile, outPrefix)
-    cfg.mode       = pmCollect
-    cfg.outputPath = outPrefix
-    cfg.toStdout   = isStdout
-  of topMerge:
-    let isStdout = (outPrefix == "" or outPrefix == "/dev/stdout")
-    if not isStdout:
-      warnFormatMismatch(inputFile, outPrefix)
-    cfg.mode       = pmMerge
-    cfg.outputPath = outPrefix
-    cfg.toStdout   = isStdout
-  of topNone:
-    let mode = inferRunMode(outPrefix != "", hasBrace)
-    if mode == rmToolManaged and forceUncompress:
-      stderr.writeLine "error: -u cannot be used with tool-managed output ({}); vcfparty does not control that output"
-      quit(1)
-    if mode == rmNormal:
-      warnFormatMismatch(inputFile, outPrefix)
-    cfg.mode           = pmTool
-    cfg.outputTemplate = outPrefix
-    cfg.toolManaged    = (mode == rmToolManaged)
-  runPipeline(cfg)
+  let (_, stages) = parseRunArgv(rawArgs)
+  let hasBrace    = hasBracePlaceholder(stages)
+  let mode        = inferRunMode(outPrefix != "", hasBrace)
+  if mode == rmToolManaged and forceUncompress:
+    stderr.writeLine "error: -u cannot be used with tool-managed output ({}); vcfparty does not control that output"
+    quit(1)
+  if mode == rmNormal:
+    warnFormatMismatch(inputFile, outPrefix)
+  runPipeline(RunPipelineCfg(
+    vcfPath:        inputFile,
+    nShards:        nShards,
+    nThreads:       nThreads,
+    forceScan:      forceScan,
+    stages:         stages,
+    noKill:         noKill,
+    clampShards:    clampShards,
+    outputTemplate: outPrefix,
+    toolManaged:    (mode == rmToolManaged)))
 
 proc gatherUsage() =
   ## Print gather subcommand usage to stderr and exit 1.
@@ -348,19 +274,13 @@ proc gatherUsage() =
   stderr.writeLine ""
   stderr.writeLine "Options:"
   stderr.writeLine "  -o, --output <str>           gather output path (default: stdout)"
-  stderr.writeLine "      --header-pattern <pat>   strip lines starting with pat from shards 2..N (text format only)"
-  stderr.writeLine "      --header-n <n>           strip the first n lines from shards 2..N (text format only)"
   stderr.writeLine "  -v, --verbose                print progress to stderr"
   stderr.writeLine "  -h, --help                   show this help"
   quit(1)
 
 proc runGather(rawArgs: seq[string]) =
   ## Parse gather subcommand arguments and concatenate pre-existing shard files.
-  var outPath: string      = ""
-  var headerPattern        = ""
-  var headerPatternSet     = false
-  var headerN              = 0
-  var headerNSet           = false
+  var outPath: string = ""
   var inputFiles: seq[string]
   var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
   while true:
@@ -371,20 +291,6 @@ proc runGather(rawArgs: seq[string]) =
       case p.key
       of "o", "output":
         outPath = nextVal(p, "o")
-      of "header-pattern":
-        headerPattern    = nextVal(p, "header-pattern")
-        headerPatternSet = true
-      of "header-n":
-        let v = nextVal(p, "header-n")
-        try:
-          headerN = v.parseInt
-        except ValueError:
-          stderr.writeLine "error: --header-n must be an integer, got: " & v
-          quit(1)
-        if headerN < 0:
-          stderr.writeLine "error: --header-n must be >= 0, got: " & $headerN
-          quit(1)
-        headerNSet = true
       of "v", "verbose":
         scatter.verbose = true
       of "h", "help":
@@ -403,17 +309,12 @@ proc runGather(rawArgs: seq[string]) =
       quit(1)
   let isStdout = (outPath == "" or outPath == "/dev/stdout")
   let (gFmt, gComp) = inferFileFormat(outPath, "")
-  var cfg = GatherConfig(
+  let cfg = GatherConfig(
     format:      gFmt,
     compression: if isStdout: compNone else: gComp,
     outputPath:  if isStdout: "" else: outPath,
     shardCount:  inputFiles.len,
     toStdout:    isStdout)
-  if headerPatternSet:
-    cfg.headerPattern = some(headerPattern)
-  if headerNSet:
-    cfg.headerN = some(headerN)
-  validateGatherConfig(cfg)
   if not isStdout:
     let outDir = outPath.parentDir
     if outDir != "":

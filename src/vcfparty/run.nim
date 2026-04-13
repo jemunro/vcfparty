@@ -6,12 +6,13 @@
 ##   3. Mode inference from -o / {} flags.
 ##   4. Executing per-shard pipelines concurrently (all N shards run at once).
 
-import std/[cpuinfo, os, posix, sequtils, strformat, strutils]
+import std/[atomics, cpuinfo, os, posix, sequtils, strformat, strutils, tempfiles]
 {.warning[Deprecated]: off.}
 import std/threadpool
 {.warning[Deprecated]: on.}
 import scatter
 import vcf_utils
+import gather
 
 # ---------------------------------------------------------------------------
 # Argv parsing
@@ -70,7 +71,8 @@ proc buildShellCmd*(stages: seq[seq[string]]): string =
 # ---------------------------------------------------------------------------
 
 type RunMode* = enum
-  rmNormal,      ## vcfparty writes shard output files via -o
+  rmFile,        ## concat thread writes to -o output file
+  rmStdout,      ## concat thread writes to stdout (no -o, no {})
   rmToolManaged  ## tool manages own output; vcfparty discards shard stdout
 
 proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
@@ -90,16 +92,16 @@ proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
 
 proc inferRunMode*(hasOutput: bool; hasBrace: bool): RunMode =
   ## Infer run mode from -o presence and {} in tool cmd.
-  ## Emits a warning when -o is ignored (tool-managed mode).
-  ## Calls quit(1) when no output of any kind is specified.
-  if not hasOutput and not hasBrace:
-    stderr.writeLine "error: no output specified: provide -o or {} in the tool command"
-    quit(1)
+  ## No -o and no {}: stdout mode (concat thread writes to stdout).
+  ## {} present: tool-managed (warns if -o also present).
+  ## -o present, no {}: file mode (concat thread writes to -o).
   if hasBrace:
     if hasOutput:
       stderr.writeLine "warning: -o is ignored in tool-managed mode (tool command contains {})"
     return rmToolManaged
-  return rmNormal
+  if hasOutput:
+    return rmFile
+  return rmStdout
 
 # ---------------------------------------------------------------------------
 # {} substitution
@@ -134,27 +136,83 @@ proc buildShellCmdForShard*(stages: seq[seq[string]]; shardIdx: int; nShards: in
   result = parts.join(" | ")
 
 # ---------------------------------------------------------------------------
-# Per-shard pipe execution
+# Shard queue (atomic pull counter) and deposit queue (ordered tmp file handoff)
 # ---------------------------------------------------------------------------
 
-type InFlight = object
-  ## Tracks one active shard: child process + writer thread.
-  pid:      Pid
-  writeFv:  FlowVar[int]
-  shardIdx: int
+var gNextShard* {.global.}: Atomic[int]
+  ## Atomic pull counter for the shard work queue. Workers call
+  ## fetchAdd(1) to claim the next shard index. When the returned
+  ## value >= nTotalShards, the worker has no more work and exits.
+
+type DepositSlot* = object
+  ## One slot in the deposit queue. Workers write the tmp file path
+  ## then set ready=true (release). The concat thread spin-waits on
+  ## ready (acquire) before reading the path.
+  path*:  array[4096, char]
+  len*:   int32
+  ready*: Atomic[bool]
+
+type DepositQueue* = object
+  ## Fixed-size array of deposit slots, one per shard. Heap-allocated
+  ## with allocShared0 for cross-thread access.
+  slots*: ptr UncheckedArray[DepositSlot]
+  count*: int
+
+proc newDepositQueue*(n: int): DepositQueue =
+  ## Allocate n deposit slots, all zeroed (ready = false).
+  let p = cast[ptr UncheckedArray[DepositSlot]](allocShared0(n * sizeof(DepositSlot)))
+  DepositQueue(slots: p, count: n)
+
+proc freeDepositQueue*(q: DepositQueue) =
+  if q.slots != nil:
+    deallocShared(q.slots)
+
+proc deposit*(q: DepositQueue; idx: int; path: string) =
+  ## Deposit a tmp file path at slot idx. Sets ready=true as a release
+  ## signal to the concat thread. The slot must not already be ready.
+  let slot = addr q.slots[idx]
+  let n = min(path.len, slot.path.len)
+  if n > 0:
+    copyMem(addr slot.path[0], unsafeAddr path[0], n)
+  slot.len = n.int32
+  slot.ready.store(true, moRelease)
+
+proc waitFor*(q: DepositQueue; idx: int): string =
+  ## Block until slot idx is ready, then return the path and reset
+  ## the slot. Used by the concat thread to consume deposits in order.
+  let slot = addr q.slots[idx]
+  while not slot.ready.load(moAcquire):
+    sleep(1)
+  result = newString(slot.len)
+  if slot.len > 0:
+    copyMem(addr result[0], addr slot.path[0], slot.len)
+  slot.len = 0
+  slot.ready.store(false, moRelease)
+
+# ---------------------------------------------------------------------------
+# sendfile(2) — zero-copy fd-to-fd transfer (Linux only)
+# ---------------------------------------------------------------------------
+
+when defined(linux):
+  proc c_sendfile(outFd, inFd: cint; offset: ptr Off; count: csize_t): int
+    {.importc: "sendfile", header: "<sys/sendfile.h>".}
+
+# ---------------------------------------------------------------------------
+# Subprocess fork/exec
+# ---------------------------------------------------------------------------
 
 proc forkExecSh(pipeReadFd: cint; pipeWriteFd: cint; stdoutFd: cint;
                 shellCmd: string; shardIdx: int): Pid =
   ## Fork a child that runs sh -c shellCmd with stdin = pipeReadFd and
   ## stdout = stdoutFd.  stderr is inherited.  Returns child PID.
-  ## pipeWriteFd is closed in the child so the child does not hold the
-  ## write-end of its own stdin pipe (which would prevent EOF).
+  ## All three fds should have FD_CLOEXEC set by the caller so that
+  ## concurrent workers' children do not inherit stale pipe ends.
   let pid = posix.fork()
   if pid < 0:
     stderr.writeLine &"error: fork() failed for shard {shardIdx + 1}"
     quit(1)
   if pid == 0:
-    # Child: rewire stdin and stdout, close the pipe write-end, exec shell.
+    # Child: rewire stdin and stdout, close originals, exec shell.
     if posix.dup2(pipeReadFd, STDIN_FILENO) < 0 or
        posix.dup2(stdoutFd,   STDOUT_FILENO) < 0:
       exitnow(1)
@@ -167,103 +225,183 @@ proc forkExecSh(pipeReadFd: cint; pipeWriteFd: cint; stdoutFd: cint;
     exitnow(127)
   result = pid
 
-proc killAll(running: seq[InFlight]) =
-  ## Send SIGTERM to every in-flight child process.
-  for s in running:
-    discard posix.kill(s.pid, SIGTERM)
-
-proc waitOne(running: var seq[InFlight]; failed: var bool) =
-  ## Wait for any one child to finish; sync writer thread; record failure.
-  var status: cint
-  let donePid = posix.waitpid(-1, status, 0)
-  let code    = int((status shr 8) and 0xff)
-  var j = 0
-  while j < running.len:
-    if running[j].pid == donePid:
-      discard ^running[j].writeFv
-      if code != 0:
-        stderr.writeLine &"shard {running[j].shardIdx + 1}: pipeline exited with code {code}"
-        failed = true
-      running.del(j)
-      return
-    j += 1
-
 # ---------------------------------------------------------------------------
-# Pipe setup, shard resolution, reap
+# Worker proc — pulls shards, forks subprocesses, collects output
 # ---------------------------------------------------------------------------
 
-type ShardPipes = object
-  ## Per-shard pipe set: stdin pipe + output fd.
-  stdinR*, stdinW*: cint
-  outFileFd*:       cint
+var gAnyFailed* {.global.}: Atomic[bool]
+  ## Set by any worker that observes a non-zero child exit code.
+  ## Checked by other workers to abort early (unless --no-kill).
 
-proc openShardPipes(shardIdx, nShards: int;
-                    outputTemplate: string; toolManaged: bool): ShardPipes =
-  ## Allocate the stdin pipe and per-shard output fd.
-  result = ShardPipes(stdinR: -1, stdinW: -1, outFileFd: -1)
-  var stdinPipe: array[2, cint]
-  if posix.pipe(stdinPipe) != 0:
-    stderr.writeLine &"error: pipe() failed for shard {shardIdx + 1}"
-    quit(1)
-  discard posix.fcntl(stdinPipe[1], F_SETFD, FD_CLOEXEC)
-  result.stdinR = stdinPipe[0]
-  result.stdinW = stdinPipe[1]
-  if toolManaged:
-    result.outFileFd = posix.open("/dev/null".cstring, O_WRONLY)
-    if result.outFileFd < 0:
-      stderr.writeLine &"error: could not open /dev/null for shard {shardIdx + 1}"
-      quit(1)
+proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
+                 stagesPtr: ptr seq[seq[string]]; tmpDirPtr: ptr string;
+                 depositsPtr: ptr DepositQueue; chromBufPtr: ptr SharedBuf;
+                 toolManaged: bool; noKill: bool): int {.gcsafe.} =
+  ## Worker loop: atomically pull shard indices from gNextShard, fork a
+  ## subprocess for each, write decompressed shard data to its stdin,
+  ## intercept stdout (strip headers, BGZF-compress) to a tmp file,
+  ## and deposit the path to the concat queue.
+  while true:
+    if gAnyFailed.load(moRelaxed) and not noKill:
+      break
+    let idx = gNextShard.fetchAdd(1, moRelaxed)
+    if idx >= nTotalShards:
+      break
+
+    var tmpPath: string
+    if not toolManaged:
+      tmpPath = tmpDirPtr[] / &"shard_{idx}.tmp"
+
+    # Subprocess stdout goes to a pipe (interceptor reads the other end)
+    # or /dev/null for tool-managed mode.
+    var stdoutFd: cint
+    var stdoutPipeR: cint = -1
+    if toolManaged:
+      stdoutFd = posix.open("/dev/null".cstring, O_WRONLY)
+      if stdoutFd < 0:
+        stderr.writeLine &"error: could not open /dev/null for shard {idx + 1}"
+        gAnyFailed.store(true, moRelease)
+        continue
+      discard posix.fcntl(stdoutFd, F_SETFD, FD_CLOEXEC)
+    else:
+      var stdoutPipe: array[2, cint]
+      if posix.pipe(stdoutPipe) != 0:
+        stderr.writeLine &"error: pipe() failed for shard {idx + 1}"
+        gAnyFailed.store(true, moRelease)
+        continue
+      discard posix.fcntl(stdoutPipe[0], F_SETFD, FD_CLOEXEC)
+      discard posix.fcntl(stdoutPipe[1], F_SETFD, FD_CLOEXEC)
+      stdoutPipeR = stdoutPipe[0]  # interceptor reads this
+      stdoutFd = stdoutPipe[1]     # child writes to this
+
+    # Create stdin pipe.
+    var stdinPipe: array[2, cint]
+    if posix.pipe(stdinPipe) != 0:
+      stderr.writeLine &"error: pipe() failed for shard {idx + 1}"
+      discard posix.close(stdoutFd)
+      if stdoutPipeR >= 0: discard posix.close(stdoutPipeR)
+      gAnyFailed.store(true, moRelease)
+      continue
+    discard posix.fcntl(stdinPipe[0], F_SETFD, FD_CLOEXEC)
+    discard posix.fcntl(stdinPipe[1], F_SETFD, FD_CLOEXEC)
+
+    # Fork subprocess.
+    let shardCmd = buildShellCmdForShard(stagesPtr[], idx, nTotalShards)
+    let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutFd, shardCmd, idx)
+    discard posix.close(stdinPipe[0])
+    discard posix.close(stdoutFd)
+
+    # Spawn interceptor thread (reads subprocess stdout, writes tmp file).
+    var interceptFv: FlowVar[int]
+    if not toolManaged:
+      interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr)
+
+    # Write decompressed shard data to subprocess stdin (synchronous).
+    var task = tasksPtr[][idx]
+    task.outFd = stdinPipe[1]
+    task.decompress = true
+    discard doWriteShard(task)
+
+    # Wait for subprocess to exit.
+    var status: cint
+    discard posix.waitpid(pid, status, 0)
+    let code = int((status shr 8) and 0xff)
+    if code != 0:
+      stderr.writeLine &"shard {idx + 1}: pipeline exited with code {code}"
+      gAnyFailed.store(true, moRelease)
+
+    # Wait for interceptor to finish writing tmp file.
+    if not toolManaged:
+      let interceptRc = ^interceptFv
+      if interceptRc != 0:
+        gAnyFailed.store(true, moRelease)
+
+    # Deposit tmp path for concat thread.
+    if not toolManaged:
+      depositsPtr[].deposit(idx, tmpPath)
+
+  result = 0
+
+# ---------------------------------------------------------------------------
+# Concat thread — appends tmp files to output fd in shard order
+# ---------------------------------------------------------------------------
+
+proc sendfileAll(outFd, inFd: cint; count: Off) =
+  ## Copy count bytes from inFd to outFd using sendfile (Linux) or read/write.
+  when defined(linux):
+    var offset: Off = 0
+    while offset < count:
+      let sent = c_sendfile(outFd, inFd, addr offset, csize_t(count - offset))
+      if sent <= 0: break
   else:
-    let outPath = shardOutputPath(outputTemplate, shardIdx, nShards)
-    createDir(outPath.parentDir)
-    result.outFileFd = posix.open(outPath.cstring,
-                                  O_WRONLY or O_CREAT or O_TRUNC,
-                                  0o666.Mode)
-    if result.outFileFd < 0:
-      stderr.writeLine &"error: could not create output file: {outPath}"
-      quit(1)
+    const BufSize = 65536
+    var buf = newSeqUninit[byte](BufSize)
+    var remaining = count
+    while remaining > 0:
+      let toRead = min(remaining, BufSize.Off)
+      let n = posix.read(inFd, addr buf[0], toRead.int)
+      if n <= 0: break
+      var written = 0
+      while written < n:
+        let w = posix.write(outFd, addr buf[written], n - written)
+        if w <= 0: break
+        written += w
+      remaining -= n.Off
 
-proc forkShardChild(pipes: var ShardPipes; shellCmd: string;
-                    shardIdx: int): Pid =
-  ## Fork the child with stdin = pipe read-end, stdout = outFileFd.
-  ## Closes parent's copies of child-owned fds after fork.
-  result = forkExecSh(pipes.stdinR, pipes.stdinW, pipes.outFileFd,
-                      shellCmd, shardIdx)
-  discard posix.close(pipes.stdinR); pipes.stdinR = -1
-  discard posix.close(pipes.outFileFd); pipes.outFileFd = -1
+proc concatProc*(depositsPtr: ptr DepositQueue; outFd: cint;
+                 nTotalShards: int; forceUncompress: bool): int {.gcsafe.} =
+  ## Wait for each shard's BGZF tmp file in order, copy to outFd, delete.
+  ## Skips trailing 28-byte BGZF EOF from each tmp; writes single EOF at end.
+  ## If forceUncompress: decompresses BGZF before writing (for -u flag).
+  for i in 0 ..< nTotalShards:
+    let tmpPath = depositsPtr[].waitFor(i)
+    let fd = posix.open(tmpPath.cstring, O_RDONLY)
+    if fd < 0:
+      stderr.writeLine &"error: could not open tmp file: {tmpPath}"
+      continue
+    var st: Stat
+    discard fstat(fd, st)
+    let fileSize = st.st_size
+    if forceUncompress:
+      # Decompress BGZF blocks and write raw bytes.
+      const BufSize = 65536
+      var buf = newSeqUninit[byte](BufSize)
+      var carry: seq[byte]
+      while true:
+        let n = posix.read(fd, addr buf[0], BufSize)
+        if n <= 0: break
+        carry.add(buf.toOpenArray(0, n.int - 1))
+        var p = 0
+        while p + 18 <= carry.len:
+          let blkSize = bgzfBlockSize(carry.toOpenArray(p, carry.high))
+          if blkSize <= 0: break
+          if p + blkSize > carry.len: break
+          let decompressed = decompressBgzf(carry.toOpenArray(p, p + blkSize - 1))
+          if decompressed.len > 0:
+            var w = 0
+            while w < decompressed.len:
+              let nw = posix.write(outFd, unsafeAddr decompressed[w],
+                                   decompressed.len - w)
+              if nw <= 0: break
+              w += nw
+          p += blkSize
+        if p > 0:
+          carry = if p < carry.len: carry[p ..< carry.len] else: @[]
+    else:
+      # Copy fileSize - 28 bytes (skip trailing BGZF EOF block).
+      let copySize = if fileSize >= 28: fileSize - 28 else: fileSize
+      sendfileAll(outFd, fd, copySize)
+    discard posix.close(fd)
+    try: removeFile(tmpPath) except OSError: discard
 
-proc resolveShards(vcfPath: string; nShards, nThreads: int;
-                   forceScan, clampShards: bool):
-    tuple[tasks: seq[ShardTask]; nShards: int] =
-  ## Thread-pool sizing + sequential shard computation.
-  let actualThreads = if nThreads == 0: countProcessors() else: nThreads
-  setMaxPoolSize(nShards)
-  let fmt = if vcfPath.endsWith(".bcf"): ffBcf else: ffVcf
-  let tasks = computeShards(vcfPath, nShards, actualThreads, forceScan, fmt,
-                            clampShards)
-  (tasks: tasks, nShards: tasks.len)
-
-proc reapAll(inFlight: var seq[InFlight]; noKill: bool; anyFailed: var bool) =
-  ## If a failure has been observed and --no-kill is off, SIGTERM any
-  ## still-running children, then drain every remaining child via waitOne.
-  if anyFailed and not noKill:
-    killAll(inFlight)
-  while inFlight.len > 0:
-    waitOne(inFlight, anyFailed)
-
-template drainLaunch(nShardsVal: int; noKillVal: bool;
-                     inFlightVar: var seq[InFlight]; anyFailedVar: var bool;
-                     body: untyped) =
-  ## Common drain-launch loop: iterate `i` from 0 to nShards-1, draining one
-  ## finished shard whenever the in-flight set is full, and stopping early on
-  ## failure unless --no-kill is set.
-  for i {.inject.} in 0 ..< nShardsVal:
-    if anyFailedVar and not noKillVal: break
-    while inFlightVar.len >= nShardsVal:
-      waitOne(inFlightVar, anyFailedVar)
-      if anyFailedVar and not noKillVal: break
-    if anyFailedVar and not noKillVal: break
-    body
+  # Write single BGZF EOF block at the end (unless -u).
+  if not forceUncompress:
+    var w = 0
+    while w < BGZF_EOF.len:
+      let n = posix.write(outFd, unsafeAddr BGZF_EOF[w], BGZF_EOF.len - w)
+      if n <= 0: break
+      w += n
+  result = 0
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -271,33 +409,86 @@ template drainLaunch(nShardsVal: int; noKillVal: bool;
 
 type RunPipelineCfg* = object
   ## Configuration for the run subcommand.
-  vcfPath*:        string
-  nShards*:        int
-  nThreads*:       int
-  forceScan*:      bool
-  stages*:         seq[seq[string]]
-  noKill*:         bool
-  clampShards*:    bool
-  outputTemplate*: string
-  toolManaged*:    bool
+  vcfPath*:             string
+  nWorkers*:            int
+  maxShardsPerWorker*:  int
+  nThreads*:            int
+  forceScan*:           bool
+  stages*:              seq[seq[string]]
+  noKill*:              bool
+  clampShards*:         bool
+  outputPath*:          string   ## single output file path; "" when toStdout
+  toStdout*:            bool     ## concat thread writes to stdout
+  toolManaged*:         bool     ## {} in tool cmd: discard stdout, no concat
+  forceUncompress*:     bool     ## -u: decompress BGZF tmp files for final output
 
 proc runPipeline*(cfg: RunPipelineCfg) =
-  ## Scatter into N shards, pipe each through the pipeline. Either
-  ## discards shard stdout to /dev/null (tool-managed) or writes per-shard
-  ## output files via cfg.outputTemplate.
-  let (tasks, nShards) = resolveShards(cfg.vcfPath, cfg.nShards, cfg.nThreads,
-                                       cfg.forceScan, cfg.clampShards)
-  var anyFailed = false
-  var inFlight: seq[InFlight]
-  drainLaunch(nShards, cfg.noKill, inFlight, anyFailed):
-    var pipes = openShardPipes(i, nShards, cfg.outputTemplate, cfg.toolManaged)
-    let writerOutFd = pipes.stdinW
-    let shardCmd = buildShellCmdForShard(cfg.stages, i, nShards)
-    let pid = forkShardChild(pipes, shardCmd, i)
-    var task = tasks[i]
-    task.outFd = writerOutFd
-    task.decompress = true
-    let writeFv = spawn doWriteShard(task)
-    inFlight.add(InFlight(pid: pid, writeFv: writeFv, shardIdx: i))
-  reapAll(inFlight, cfg.noKill, anyFailed)
-  if anyFailed: quit(1)
+  ## Scatter into n*m shards, run n workers concurrently, concat output
+  ## in shard order to cfg.outputPath (or stdout).
+  ## Tool-managed mode: workers discard stdout, no concat thread.
+  let nTotalShards = cfg.nWorkers * cfg.maxShardsPerWorker
+
+  # Compute shard tasks.
+  let actualThreads = if cfg.nThreads == 0: countProcessors() else: cfg.nThreads
+  let fmt = if cfg.vcfPath.endsWith(".bcf"): ffBcf else: ffVcf
+  var tasks = computeShards(cfg.vcfPath, nTotalShards, actualThreads,
+                            cfg.forceScan, fmt, cfg.clampShards)
+  let nShards = tasks.len  # may be < nTotalShards after clamping
+  let nWorkers = min(cfg.nWorkers, nShards)
+
+  # Create tmp dir for shard output files.
+  let tmpDir = createTempDir("vcfparty_", "")
+
+  # Reset global state.
+  gNextShard.store(0, moRelaxed)
+  gAnyFailed.store(false, moRelaxed)
+  # Workers need pool slots for: worker thread + interceptor thread each,
+  # plus 1 for the concat thread.
+  setMaxPoolSize(nWorkers * 2 + 1)
+
+  # Allocate shared #CHROM validation buffer.
+  let chromBuf = cast[ptr SharedBuf](allocShared0(sizeof(SharedBuf)))
+
+  # Open output fd for concat thread (unless tool-managed).
+  var outFd: cint = -1
+  if not cfg.toolManaged:
+    if cfg.toStdout:
+      outFd = STDOUT_FILENO
+    else:
+      outFd = posix.open(cfg.outputPath.cstring,
+                          O_WRONLY or O_CREAT or O_TRUNC, 0o666.Mode)
+      if outFd < 0:
+        stderr.writeLine "error: could not create output file: " & cfg.outputPath
+        quit(1)
+
+  # Spawn concat thread (unless tool-managed).
+  var deposits = if cfg.toolManaged: DepositQueue() else: newDepositQueue(nShards)
+  var concatFv: FlowVar[int]
+  if not cfg.toolManaged:
+    concatFv = spawn concatProc(addr deposits, outFd, nShards,
+                                 cfg.forceUncompress)
+
+  # Spawn worker threads.
+  var stages = cfg.stages
+  var workerFvs = newSeq[FlowVar[int]](nWorkers)
+  for i in 0 ..< nWorkers:
+    workerFvs[i] = spawn workerProc(addr tasks, nShards, addr stages,
+                                     unsafeAddr tmpDir, addr deposits,
+                                     chromBuf, cfg.toolManaged, cfg.noKill)
+
+  # Wait for all workers to finish.
+  for fv in workerFvs:
+    discard ^fv
+
+  # Wait for concat thread to finish.
+  if not cfg.toolManaged:
+    discard ^concatFv
+    freeDepositQueue(deposits)
+    if not cfg.toStdout:
+      discard posix.close(outFd)
+
+  # Clean up.
+  deallocShared(chromBuf)
+  try: removeDir(tmpDir) except OSError: discard
+
+  if gAnyFailed.load(moRelaxed): quit(1)

@@ -264,10 +264,10 @@ proc writeShardData*(outFile: File; bytes: seq[byte]; fmt: FileFormat;
     if headerEnd < 0: headerEnd = decompAccum.len  # edge: all-header shard
     let tail = decompAccum[headerEnd ..< decompAccum.len]
     if tail.len > 0:
-      let chunk =
-        if compression == compBgzf: compressToBgzfMulti(tail)
-        else: tail
-      discard outFile.writeBytes(chunk, 0, chunk.len)
+      if compression == compBgzf:
+        compressToBgzfMulti(outFile, tail)
+      else:
+        discard outFile.writeBytes(tail, 0, tail.len)
     while blockPos < bytes.len:
       let blkSize = bgzfBlockSize(bytes.toOpenArray(blockPos, bytes.high))
       if blkSize <= 0: break
@@ -288,10 +288,227 @@ proc writeShardData*(outFile: File; bytes: seq[byte]; fmt: FileFormat;
       if headerEnd > 0 and headerEnd < data.len: data[headerEnd ..< data.len]
       elif headerEnd == 0: data
       else: @[]
-    let toWrite =
-      if compression == compBgzf: compressToBgzfMulti(stripped)
-      else: stripped
-    discard outFile.writeBytes(toWrite, 0, toWrite.len)
+    if compression == compBgzf:
+      compressToBgzfMulti(outFile, stripped)
+    else:
+      discard outFile.writeBytes(stripped, 0, stripped.len)
+
+# ---------------------------------------------------------------------------
+# SharedBuf — GC-safe cross-thread buffer for #CHROM validation
+# ---------------------------------------------------------------------------
+
+type SharedBuf* = object
+  ## Fixed-size byte buffer for cross-thread handoff. Writer sets buf+len
+  ## then sets ready=true. Reader spin-waits on ready before reading.
+  buf*:   array[4 * 1024 * 1024, byte]
+  len*:   int32
+  ready*: bool
+
+# ---------------------------------------------------------------------------
+# Interceptor — streaming header strip + BGZF recompression for tmp files
+# ---------------------------------------------------------------------------
+
+proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
+                     chromBufPtr: ptr SharedBuf): int {.gcsafe.} =
+  ## Read subprocess stdout from inputFd (pipe), strip headers for shards 1..N,
+  ## BGZF-compress, and write to tmpPath. Shard 0 writes everything and sets
+  ## chromBufPtr with the #CHROM line. Shards 1..N validate #CHROM against it.
+  ## Returns 0 on success, 1 on #CHROM mismatch.
+  const ChunkSize = 65536
+  const FlushThresh = 1 * 1024 * 1024
+  var readBuf = newSeqUninit[byte](ChunkSize)
+
+  # Phase A: first read + format detection.
+  let initRead = posix.read(inputFd, cast[pointer](addr readBuf[0]), ChunkSize)
+  if initRead <= 0:
+    # Empty shard. Shard 0 must still release shards 1..N.
+    if shardIdx == 0:
+      chromBufPtr[].len = 0
+      chromBufPtr[].ready = true
+    discard posix.close(inputFd)
+    # Write empty BGZF file (just EOF block).
+    let f = open(tmpPath, fmWrite)
+    discard f.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
+    f.close()
+    return 0
+
+  let (fmt, isBgzf) = sniffStreamFormat(readBuf.toOpenArray(0, initRead.int - 1))
+
+  # Phase B: accumulate header.
+  var rawAccum: seq[byte]
+  var bgzfPos = 0
+  var pending: seq[byte]  # decompressed bytes accumulated so far
+
+  # Append initial read.
+  if isBgzf:
+    rawAccum.add(readBuf.toOpenArray(0, initRead.int - 1))
+    while bgzfPos + 18 <= rawAccum.len:
+      let blkSize = bgzfBlockSize(rawAccum.toOpenArray(bgzfPos, rawAccum.high))
+      if blkSize <= 0 or bgzfPos + blkSize > rawAccum.len: break
+      pending.add(decompressBgzf(rawAccum.toOpenArray(bgzfPos, bgzfPos + blkSize - 1)))
+      bgzfPos += blkSize
+  else:
+    pending.add(readBuf.toOpenArray(0, initRead.int - 1))
+
+  # Read until header end found.
+  var hEnd = -1
+  while hEnd < 0:
+    hEnd =
+      case fmt
+      of ffBcf:  findBcfHeaderEnd(pending)
+      of ffVcf:  findVcfHeaderEnd(pending)
+      of ffText: findVcfHeaderEnd(pending)  # # prefix for all non-BCF
+    if hEnd >= 0: break
+    let n = posix.read(inputFd, cast[pointer](addr readBuf[0]), ChunkSize)
+    if n <= 0: break
+    if isBgzf:
+      rawAccum.add(readBuf.toOpenArray(0, n.int - 1))
+      while bgzfPos + 18 <= rawAccum.len:
+        let blkSize = bgzfBlockSize(rawAccum.toOpenArray(bgzfPos, rawAccum.high))
+        if blkSize <= 0 or bgzfPos + blkSize > rawAccum.len: break
+        pending.add(decompressBgzf(rawAccum.toOpenArray(bgzfPos, bgzfPos + blkSize - 1)))
+        bgzfPos += blkSize
+    else:
+      pending.add(readBuf.toOpenArray(0, n.int - 1))
+  if hEnd < 0: hEnd = pending.len  # all header, no data
+
+  # Phase C: #CHROM validation.
+  let chromLine = extractChromLine(pending[0 ..< hEnd])
+  if shardIdx == 0:
+    let sz = min(chromLine.len, chromBufPtr[].buf.len)
+    if sz > 0:
+      copyMem(addr chromBufPtr[].buf[0], unsafeAddr chromLine[0], sz)
+    chromBufPtr[].len = sz.int32
+    chromBufPtr[].ready = true
+  else:
+    while not chromBufPtr[].ready: sleep(1)
+    let refLen = chromBufPtr[].len.int
+    var mismatch = (chromLine.len != refLen)
+    if not mismatch:
+      for k in 0 ..< refLen:
+        if byte(chromLine[k]) != chromBufPtr[].buf[k]:
+          mismatch = true; break
+    if mismatch:
+      var refLine = newString(refLen)
+      for k in 0 ..< refLen: refLine[k] = char(chromBufPtr[].buf[k])
+      stderr.writeLine &"error: #CHROM line mismatch at shard {shardIdx + 1}:"
+      stderr.writeLine &"  shard 1: {refLine}"
+      stderr.writeLine &"  shard {shardIdx + 1}: {chromLine}"
+      discard posix.close(inputFd)
+      return 1
+
+  # Phase D: write tmp file.
+  let outFile = open(tmpPath, fmWrite)
+
+  if isBgzf:
+    # ── BGZF optimised path ──────────────────────────────────────────────
+    if shardIdx == 0:
+      # Shard 0: raw-forward all BGZF blocks accumulated so far, then stream rest.
+      var p = 0
+      while p + 18 <= bgzfPos:
+        let blkSize = bgzfBlockSize(rawAccum.toOpenArray(p, bgzfPos - 1))
+        if blkSize <= 0 or p + blkSize > bgzfPos: break
+        discard outFile.writeBytes(rawAccum, p, blkSize)
+        p += blkSize
+    else:
+      # Shards 1..N: find which raw BGZF block contains hEnd, skip header blocks.
+      # Walk rawAccum's BGZF blocks, tracking cumulative decompressed size.
+      var cumDecomp = 0
+      var splitBlockRawStart = -1
+      var splitBlockRawEnd = -1
+      var splitBlockDecompStart = 0
+      block findSplit:
+        var p = 0
+        while p + 18 <= bgzfPos:
+          let blkSize = bgzfBlockSize(rawAccum.toOpenArray(p, bgzfPos - 1))
+          if blkSize <= 0 or p + blkSize > bgzfPos: break
+          let blkIsize = leU32(rawAccum.toOpenArray(p, p + blkSize - 1),
+                               blkSize - 4).int
+          if cumDecomp + blkIsize > hEnd:
+            splitBlockRawStart = p
+            splitBlockRawEnd = p + blkSize
+            splitBlockDecompStart = cumDecomp
+            break findSplit
+          cumDecomp += blkIsize
+          p += blkSize
+
+      var rawWriteStart: int
+      if splitBlockRawStart < 0:
+        rawWriteStart = bgzfPos  # header consumed all phase-B blocks
+      elif hEnd == splitBlockDecompStart:
+        rawWriteStart = splitBlockRawStart  # header ends at block boundary
+      else:
+        # Header ends mid-block: re-encode the post-header tail.
+        let splitBlkSize = splitBlockRawEnd - splitBlockRawStart
+        let splitBlkIsize = leU32(
+          rawAccum.toOpenArray(splitBlockRawStart, splitBlockRawEnd - 1),
+          splitBlkSize - 4).int
+        let splitBlockDecompEnd = splitBlockDecompStart + splitBlkIsize
+        let tail = pending[hEnd ..< splitBlockDecompEnd]
+        if tail.len > 0:
+          compressToBgzfMulti(outFile, tail)
+        rawWriteStart = splitBlockRawEnd
+
+      # Raw-forward remaining phase-B blocks (skip BGZF EOF blocks).
+      var fp = rawWriteStart
+      while fp + 18 <= bgzfPos:
+        let blkSize = bgzfBlockSize(rawAccum.toOpenArray(fp, bgzfPos - 1))
+        if blkSize <= 0 or fp + blkSize > bgzfPos: break
+        if blkSize != BGZF_EOF.len or
+           rawAccum[fp ..< fp + blkSize] != @BGZF_EOF:
+          discard outFile.writeBytes(rawAccum, fp, blkSize)
+        fp += blkSize
+
+    # Stream remaining pipe data: raw-forward complete BGZF blocks.
+    var carry: seq[byte] =
+      if bgzfPos < rawAccum.len: rawAccum[bgzfPos ..< rawAccum.len]
+      else: @[]
+    rawAccum.setLen(0); pending.setLen(0)
+    while true:
+      let n = posix.read(inputFd, cast[pointer](addr readBuf[0]), ChunkSize)
+      if n <= 0: break
+      carry.add(readBuf.toOpenArray(0, n.int - 1))
+      var p = 0
+      while p + 18 <= carry.len:
+        let blkSize = bgzfBlockSize(carry.toOpenArray(p, carry.high))
+        if blkSize <= 0: break
+        if p + blkSize > carry.len: break
+        if blkSize != BGZF_EOF.len or carry[p ..< p + blkSize] != @BGZF_EOF:
+          discard outFile.writeBytes(carry, p, blkSize)
+        p += blkSize
+      if p > 0:
+        carry = if p < carry.len: carry[p ..< carry.len] else: @[]
+
+  else:
+    # ── Uncompressed path ────────────────────────────────────────────────
+    # BGZF-compress and write.
+    if shardIdx == 0:
+      # Write header + post-header data.
+      if pending.len > 0:
+        compressToBgzfMulti(outFile, pending)
+    else:
+      # Skip header, write post-header data.
+      if hEnd < pending.len:
+        compressToBgzfMulti(outFile, pending[hEnd ..< pending.len])
+    pending.setLen(0)
+
+    # Stream remaining pipe data: compress in chunks.
+    var accum: seq[byte]
+    while true:
+      let n = posix.read(inputFd, cast[pointer](addr readBuf[0]), ChunkSize)
+      if n <= 0: break
+      accum.add(readBuf.toOpenArray(0, n.int - 1))
+      if accum.len >= FlushThresh:
+        compressToBgzfMulti(outFile, accum)
+        accum.setLen(0)
+    if accum.len > 0:
+      compressToBgzfMulti(outFile, accum)
+
+  # Write BGZF EOF block.
+  discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
+  outFile.close()
+  discard posix.close(inputFd)
+  result = 0
 
 # ---------------------------------------------------------------------------
 # Direct-file gather

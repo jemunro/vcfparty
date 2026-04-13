@@ -142,22 +142,24 @@ proc runScatter(rawArgs: seq[string]) =
 
 proc runUsage() =
   ## Print run subcommand usage to stderr and exit 1.
-  stderr.writeLine "Usage: vcfparty run -n <n_shards> -o <output> [options] <input.vcf.gz> (--- | :::) <cmd> [args...] [(--- | :::) <cmd2> ...]"
+  stderr.writeLine "Usage: vcfparty run -n <n_workers> [-m <shards_per_worker>] [options] <input.vcf.gz> (--- | :::) <cmd> [args...]"
   stderr.writeLine ""
   stderr.writeLine "Options:"
-  stderr.writeLine "  -n, --n-shards <int>         number of shards (required, >= 1); controls both shard count and concurrency"
-  stderr.writeLine "  -o, --output <str>           output path or prefix"
-  stderr.writeLine "  -u                           force uncompressed file output (error with tool-managed {})"
-  stderr.writeLine "  -t, --max-threads <int>      max threads for scatter/validation (default: min(n-shards, 8))"
-  stderr.writeLine "      --force-scan             always scan BGZF blocks (ignore index even if present)"
-  stderr.writeLine "      --clamp-shards           if -n exceeds available index entries, reduce -n instead of erroring"
-  stderr.writeLine "      --no-kill                on failure, let sibling shards finish (default: kill them)"
-  stderr.writeLine "  -v, --verbose                print per-shard progress to stderr"
-  stderr.writeLine "  -h, --help                   show this help"
+  stderr.writeLine "  -n, --n-workers <int>          number of concurrent worker pipelines (required, >= 1)"
+  stderr.writeLine "  -m, --max-shards-per-worker <int>  max shards each worker processes (default: 1)"
+  stderr.writeLine "  -o, --output <str>             output path (default: stdout)"
+  stderr.writeLine "  -u                             force uncompressed file output (error with tool-managed {})"
+  stderr.writeLine "  -t, --max-threads <int>        max threads for scatter (default: min(n, 8))"
+  stderr.writeLine "      --force-scan               always scan BGZF blocks (ignore index even if present)"
+  stderr.writeLine "      --clamp-shards             if total shards exceeds index entries, reduce instead of erroring"
+  stderr.writeLine "      --no-kill                  on failure, let sibling shards finish (default: kill them)"
+  stderr.writeLine "  -v, --verbose                  print per-shard progress to stderr"
+  stderr.writeLine "  -h, --help                     show this help"
   stderr.writeLine ""
   stderr.writeLine "Separate pipeline stages with --- or :::."
-  stderr.writeLine "  vcfparty run -n 8 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz"
-  stderr.writeLine "  vcfparty run -n 8 input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
+  stderr.writeLine "  vcfparty run -n 4 -o out.vcf input.vcf.gz ::: bcftools view -Ov"
+  stderr.writeLine "  vcfparty run -n 4 -m 2 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz"
+  stderr.writeLine "  vcfparty run -n 4 input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
   quit(1)
 
 proc runRun(rawArgs: seq[string]) =
@@ -173,8 +175,9 @@ proc runRun(rawArgs: seq[string]) =
   # Parse vcfparty options from the slice before --- (or all args if no --- found;
   # parseRunArgv will emit the appropriate error when called below).
   let vcfpartyPart = if firstSep < 0: rawArgs else: rawArgs[0 ..< firstSep]
-  var nShards         = 0
-  var nShardsSet      = false
+  var nWorkers        = 0
+  var nWorkersSet     = false
+  var maxShards       = 1
   var outPrefix       = ""
   var inputFile       = ""
   var nThreads        = 0
@@ -190,14 +193,24 @@ proc runRun(rawArgs: seq[string]) =
     of cmdEnd: break
     of cmdShortOption, cmdLongOption:
       case p.key
-      of "n", "n-shards":
+      of "n", "n-workers":
         let v = nextVal(p, "n")
         try:
-          nShards = v.parseInt
+          nWorkers = v.parseInt
         except ValueError:
           stderr.writeLine "error: -n must be an integer, got: " & v
           quit(1)
-        nShardsSet = true
+        nWorkersSet = true
+      of "m", "max-shards-per-worker":
+        let v = nextVal(p, "m")
+        try:
+          maxShards = v.parseInt
+        except ValueError:
+          stderr.writeLine "error: -m must be an integer, got: " & v
+          quit(1)
+        if maxShards < 1:
+          stderr.writeLine "error: -m must be >= 1, got: " & $maxShards
+          quit(1)
       of "o", "output":
         outPrefix = nextVal(p, "o")
       of "u":
@@ -231,11 +244,11 @@ proc runRun(rawArgs: seq[string]) =
         stderr.writeLine "error: unexpected argument: " & p.key
         quit(1)
       inputFile = p.key
-  if not nShardsSet:
-    stderr.writeLine "error: -n/--n-shards is required"
+  if not nWorkersSet:
+    stderr.writeLine "error: -n/--n-workers is required"
     quit(1)
-  if nShards < 1:
-    stderr.writeLine "error: -n must be >= 1, got: " & $nShards
+  if nWorkers < 1:
+    stderr.writeLine "error: -n must be >= 1, got: " & $nWorkers
     quit(1)
   if inputFile == "":
     stderr.writeLine "error: input VCF file is required"
@@ -248,25 +261,28 @@ proc runRun(rawArgs: seq[string]) =
     stderr.writeLine "error: vcfparty: --force-scan is not supported for BCF input"
     quit(1)
   if not nThreadsSet:
-    nThreads = min(nShards, 8)
+    nThreads = min(nWorkers, 8)
   let (_, stages) = parseRunArgv(rawArgs)
   let hasBrace    = hasBracePlaceholder(stages)
   let mode        = inferRunMode(outPrefix != "", hasBrace)
   if mode == rmToolManaged and forceUncompress:
     stderr.writeLine "error: -u cannot be used with tool-managed output ({}); vcfparty does not control that output"
     quit(1)
-  if mode == rmNormal:
+  if mode == rmFile:
     warnFormatMismatch(inputFile, outPrefix)
   runPipeline(RunPipelineCfg(
-    vcfPath:        inputFile,
-    nShards:        nShards,
-    nThreads:       nThreads,
-    forceScan:      forceScan,
-    stages:         stages,
-    noKill:         noKill,
-    clampShards:    clampShards,
-    outputTemplate: outPrefix,
-    toolManaged:    (mode == rmToolManaged)))
+    vcfPath:             inputFile,
+    nWorkers:            nWorkers,
+    maxShardsPerWorker:  maxShards,
+    nThreads:            nThreads,
+    forceScan:           forceScan,
+    stages:              stages,
+    noKill:              noKill,
+    clampShards:         clampShards,
+    outputPath:          outPrefix,
+    toStdout:            (mode == rmStdout),
+    toolManaged:         (mode == rmToolManaged),
+    forceUncompress:     forceUncompress))
 
 proc gatherUsage() =
   ## Print gather subcommand usage to stderr and exit 1.

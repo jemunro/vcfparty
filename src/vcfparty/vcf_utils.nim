@@ -228,41 +228,37 @@ proc decompressBgzf*(data: openArray[byte]): seq[byte] =
 
 proc compressToBgzf*(data: openArray[byte]; level: int = 6): seq[byte] =
   ## Compress data into a single valid BGZF block using raw deflate.
-  ## Builds the BGZF header (BC extra field, CRC32, ISIZE) manually.
+  ## Compresses directly into the result buffer — single allocation, zero copies.
   ## data.len must be <= BGZF_MAX_BLOCK_SIZE (65536).
   ## Reuses a thread-local compressor cached by level.
   if data.len > BGZF_MAX_BLOCK_SIZE:
     quit(&"compressToBgzf: input too large ({data.len} > {BGZF_MAX_BLOCK_SIZE})", 1)
   let cmp = getCompressor(level)
   let bound = libdeflateDeflateCompressBound(cmp, data.len.csize_t).int
-  var cdata = newSeqUninit[byte](bound)
+  # Allocate result at max possible size; compress directly into payload area.
+  result = newSeqUninit[byte](BGZF_OVERHEAD + bound)
+  result[0] = 0x1f; result[1] = 0x8b; result[2] = 0x08; result[3] = 0x04
+  result[4] = 0x00; result[5] = 0x00; result[6] = 0x00; result[7] = 0x00
+  result[8] = 0x00; result[9] = 0xff
+  putLeU16(result, 10, 6'u16)
+  result[12] = 0x42; result[13] = 0x43
+  putLeU16(result, 14, 2'u16)
+  # Compress directly into result[18..] — no temp buffer, no copy.
   let inPtr = if data.len > 0: unsafeAddr data[0] else: nil
   let cdataLen = libdeflateDeflateCompress(
-    cmp, inPtr, data.len.csize_t, addr cdata[0], bound.csize_t).int
+    cmp, inPtr, data.len.csize_t, addr result[18], bound.csize_t).int
   if cdataLen == 0:
     quit("compressToBgzf: deflate_compress failed", 1)
-  # Compute CRC32 of the original uncompressed data.
-  let crc = libdeflateCrc32(0'u32, inPtr, data.len.csize_t)
-  # Build the BGZF block: 18-byte header + cdata + CRC32 + ISIZE.
   let totalSize = BGZF_OVERHEAD + cdataLen
-  result = newSeqUninit[byte](totalSize)
-  result[0] = 0x1f; result[1] = 0x8b; result[2] = 0x08; result[3] = 0x04
-  # MTIME=0 (explicit zero so the header is reproducible with uninit alloc)
-  result[4] = 0x00; result[5] = 0x00; result[6] = 0x00; result[7] = 0x00
-  # XFL=0, OS=0xff
-  result[8] = 0x00; result[9] = 0xff
-  putLeU16(result, 10, 6'u16)                        # XLEN = 6
-  result[12] = 0x42; result[13] = 0x43               # SI1='B', SI2='C'
-  putLeU16(result, 14, 2'u16)                        # SLEN = 2
   putLeU16(result, 16, uint16(totalSize - 1))        # BSIZE - 1
-  copyMem(addr result[18], addr cdata[0], cdataLen)
+  let crc = libdeflateCrc32(0'u32, inPtr, data.len.csize_t)
   putLeU32(result, 18 + cdataLen,     crc.uint32)    # CRC32
   putLeU32(result, 18 + cdataLen + 4, data.len.uint32)  # ISIZE
+  result.setLen(totalSize)                            # shrink to actual
 
 proc compressToBgzfMulti*(data: openArray[byte]; level: int = 6): seq[byte] =
   ## Compress data into one or more BGZF blocks, splitting every 65536 bytes.
-  ## Use this instead of compressToBgzf when the input may exceed 65536 bytes
-  ## (e.g. a large VCF header).
+  ## Returns the concatenated BGZF blocks as a seq[byte].
   result = @[]
   if data.len == 0:
     result.add(compressToBgzf(data, level))
@@ -271,6 +267,49 @@ proc compressToBgzfMulti*(data: openArray[byte]; level: int = 6): seq[byte] =
   while pos < data.len:
     let chunkEnd = min(pos + BGZF_MAX_BLOCK_SIZE, data.len)
     result.add(compressToBgzf(data[pos ..< chunkEnd], level))
+    pos = chunkEnd
+
+var tlCompressBuf {.threadvar.}: seq[byte]
+  ## Thread-local reusable buffer for compressToBgzfMulti File overload.
+
+proc compressToBgzfMulti*(outFile: File; data: openArray[byte]; level: int = 6) =
+  ## Compress data into BGZF blocks and write directly to outFile.
+  ## Zero per-call allocation — uses thread-local reusable buffer.
+  if data.len == 0:
+    let z = compressToBgzf(data, level)
+    discard outFile.writeBytes(z, 0, z.len)
+    return
+  let cmp = getCompressor(level)
+  var pos = 0
+  while pos < data.len:
+    let chunkEnd = min(pos + BGZF_MAX_BLOCK_SIZE, data.len)
+    let chunkLen = chunkEnd - pos
+    let bound = libdeflateDeflateCompressBound(cmp, chunkLen.csize_t).int
+    let maxBlock = BGZF_OVERHEAD + bound
+    if tlCompressBuf.len < maxBlock:
+      tlCompressBuf = newSeqUninit[byte](maxBlock)
+    # BGZF header.
+    tlCompressBuf[0] = 0x1f; tlCompressBuf[1] = 0x8b
+    tlCompressBuf[2] = 0x08; tlCompressBuf[3] = 0x04
+    tlCompressBuf[4] = 0; tlCompressBuf[5] = 0
+    tlCompressBuf[6] = 0; tlCompressBuf[7] = 0
+    tlCompressBuf[8] = 0; tlCompressBuf[9] = 0xff
+    putLeU16(tlCompressBuf, 10, 6'u16)
+    tlCompressBuf[12] = 0x42; tlCompressBuf[13] = 0x43
+    putLeU16(tlCompressBuf, 14, 2'u16)
+    # Compress directly into buffer payload.
+    let inPtr = unsafeAddr data[pos]
+    let cdataLen = libdeflateDeflateCompress(
+      cmp, inPtr, chunkLen.csize_t,
+      addr tlCompressBuf[18], bound.csize_t).int
+    if cdataLen == 0:
+      quit("compressToBgzfMulti: deflate_compress failed", 1)
+    let totalSize = BGZF_OVERHEAD + cdataLen
+    putLeU16(tlCompressBuf, 16, uint16(totalSize - 1))
+    let crc = libdeflateCrc32(0'u32, inPtr, chunkLen.csize_t)
+    putLeU32(tlCompressBuf, 18 + cdataLen, crc.uint32)
+    putLeU32(tlCompressBuf, 18 + cdataLen + 4, chunkLen.uint32)
+    discard outFile.writeBytes(tlCompressBuf, 0, totalSize)
     pos = chunkEnd
 
 proc readBgzfBlockSize*(f: File; offset: int64): int64 =
@@ -324,20 +363,24 @@ proc decompressBgzfFile*(path: string): seq[byte] =
 proc decompressCopyBytes*(srcPath: string; dst: File; start: int64; length: int64) =
   ## Read BGZF blocks from [start, start+length) in srcPath, decompress each,
   ## and write the raw uncompressed bytes to dst.
+  ## Uses reusable buffers to avoid per-block allocation.
   let src = open(srcPath, fmRead)
   defer: src.close()
+  src.setFilePos(start)
   var cur = start
   let endAt = start + length
-  var hdrBuf = newSeqUninit[byte](18)
+  # Reusable block buffer — grows to max block size, never shrinks.
+  var blk = newSeqUninit[byte](BGZF_MAX_BLOCK_SIZE + BGZF_OVERHEAD)
   while cur + 18 <= endAt:
-    src.setFilePos(cur)
-    if readBytes(src, hdrBuf, 0, 18) < 18: break
-    let blkSize = bgzfBlockSize(hdrBuf)
+    # Read header into blk, then read rest of block — single seek per call.
+    if readBytes(src, blk, 0, 18) < 18: break
+    let blkSize = bgzfBlockSize(blk)
     if blkSize <= 0 or cur + blkSize.int64 > endAt: break
-    var blk = newSeqUninit[byte](blkSize)
-    src.setFilePos(cur)
-    discard readBytes(src, blk, 0, blkSize)
-    let decompressed = decompressBgzf(blk)
+    if blkSize > blk.len: blk.setLen(blkSize)
+    # Read remaining bytes after the 18-byte header already in blk.
+    if blkSize > 18:
+      if readBytes(src, blk, 18, blkSize - 18) < blkSize - 18: break
+    let decompressed = decompressBgzf(blk.toOpenArray(0, blkSize - 1))
     if decompressed.len > 0:
       discard dst.writeBytes(decompressed, 0, decompressed.len)
     cur += blkSize.int64

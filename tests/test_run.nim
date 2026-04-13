@@ -5,7 +5,10 @@
 
 echo "--------------- Test Run ---------------"
 
-import std/[os, osproc, strformat, strutils, tempfiles]
+import std/[atomics, os, osproc, strformat, strutils, tempfiles]
+{.warning[Deprecated]: off.}
+import std/threadpool
+{.warning[Deprecated]: on.}
 import test_utils
 import "../src/vcfparty/scatter"
 import "../src/vcfparty/run"
@@ -89,15 +92,14 @@ timed("R1.6", "parseRunArgv: ::: and --- may be mixed"):
   doAssert stages[2] == @["cmd3", "c"], "mixed: wrong stage 2"
 
 # ---------------------------------------------------------------------------
-# R1.7: no -o and no {} → exit 1 (no output specified)
+# R1.7: no -o and no {} → stdout mode (runs successfully)
 # ---------------------------------------------------------------------------
-timed("R1.7", "CLI run: no -o and no {} -> error"):
+timed("R1.7", "CLI run: no -o and no {} -> stdout mode"):
   let (outp, code) = execCmdEx(
     "./vcfparty run -n 1 " & SmallVcf &
-    " ::: cat 2>&1")
-  doAssert code != 0, "no -o and no {} should exit non-zero"
-  doAssert "no output" in outp.toLowerAscii or "output" in outp.toLowerAscii,
-    "expected output-related error, got:\n" & outp
+    " ::: cat 2>/dev/null | wc -c")
+  doAssert code == 0, "no -o should succeed (stdout mode)"
+  doAssert outp.strip.parseInt > 0, "stdout should have output"
 
 # ===========================================================================
 # R2 — buildShellCmd: stage list to shell command string
@@ -136,6 +138,12 @@ proc countRecords(path: string): int =
   let (o, _) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null | wc -l")
   o.strip.parseInt
 
+proc countTextLines(path: string): int =
+  ## Count non-header (non-#) lines in a plain text file.
+  for line in lines(path):
+    if line.len > 0 and line[0] != '#':
+      inc result
+
 proc recordsHash(paths: seq[string]): string =
   ## Concatenate records from paths in order (bcftools view -H, full genotypes),
   ## write to temp file, return sha256sum hex digest.
@@ -152,70 +160,49 @@ proc recordsHash(paths: seq[string]): string =
 # ---------------------------------------------------------------------------
 # R3.1 — testRunSingle1Shard: 1 shard, cat pipeline; output valid, record count matches
 # ---------------------------------------------------------------------------
-timed("R3.1", "runShards: 1 shard, cat stage"):
+timed("R3.1", "runPipeline: 1 worker, cat stage"):
   doAssert fileExists(SmallVcf), "fixture missing — run generate_fixtures.sh"
   let tmpDir = createTempDir("vcfparty_", "")
-  let tmpl = tmpDir / "out.{}.vcf.gz"
+  let outPath = tmpDir / "out.vcf.gz"
   runPipeline(RunPipelineCfg(
-    vcfPath: SmallVcf, nShards: 1, nThreads: 1,
-    stages: @[@["cat"]], outputTemplate: tmpl))
-  let outPath = shardOutputPath(tmpl, 0, 1)
+    vcfPath: SmallVcf, nWorkers: 1, maxShardsPerWorker: 1, nThreads: 1,
+    stages: @[@["cat"]], outputPath: outPath))
   doAssert fileExists(outPath), "output missing: " & outPath
-  let (_, bcCode) = execCmdEx("bcftools view -HG " & outPath & " > /dev/null 2>&1")
-  doAssert bcCode == 0, "bcftools rejected 1-shard run output"
   let orig = countRecords(SmallVcf)
   let got  = countRecords(outPath)
-  doAssert got == orig, &"1-shard record count mismatch: got {got}, expected {orig}"
+  doAssert got == orig, &"1-worker record count mismatch: got {got}, expected {orig}"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
 # R3.2 — testRun4Shards: 4 shards concurrent; all valid, record count + content hash match
 # ---------------------------------------------------------------------------
-timed("R3.2", "runShards: 4 shards concurrent"):
+timed("R3.2", "runPipeline: 4 workers, cat stage"):
   doAssert fileExists(SmallVcf), "fixture missing"
   let tmpDir = createTempDir("vcfparty_", "")
-  let tmpl = tmpDir / "out.{}.vcf.gz"
+  let outPath = tmpDir / "out.vcf.gz"
   runPipeline(RunPipelineCfg(
-    vcfPath: SmallVcf, nShards: 4, nThreads: 1,
-    stages: @[@["cat"]], outputTemplate: tmpl))
-  var total = 0
-  var shardPaths: seq[string]
-  for i in 0..3:
-    let p = shardOutputPath(tmpl, i, 4)
-    doAssert fileExists(p), &"shard {i+1} missing"
-    let (_, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
-    doAssert bc == 0, &"bcftools rejected shard {i+1}"
-    total += countRecords(p)
-    shardPaths.add(p)
+    vcfPath: SmallVcf, nWorkers: 4, maxShardsPerWorker: 1, nThreads: 1,
+    stages: @[@["cat"]], outputPath: outPath))
+  doAssert fileExists(outPath), "output missing"
   let orig = countRecords(SmallVcf)
-  doAssert total == orig, &"4-shard record count mismatch: {total} vs {orig}"
-  doAssert recordsHash(shardPaths) == recordsHash(@[SmallVcf]),
-    "4-shard content hash mismatch: record corruption or reordering detected"
+  let got  = countRecords(outPath)
+  doAssert got == orig, &"4-worker record count mismatch: {got} vs {orig}"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
 # R3.3 — testBcfRun4Shards: BCF runShards 4 shards, bcftools view -Ob; hash matches
 # ---------------------------------------------------------------------------
-timed("R3.3", "runShards BCF: 4 shards, bcftools view -Ob"):
+timed("R3.3", "runPipeline BCF: 4 workers, cat stage"):
   doAssert fileExists(SmallBcf), "BCF fixture missing — run generate_fixtures.sh"
   let tmpDir = createTempDir("vcfparty_", "")
-  let tmpl = tmpDir / "out.{}.bcf"
+  let outPath = tmpDir / "out.vcf.gz"
   runPipeline(RunPipelineCfg(
-    vcfPath: SmallBcf, nShards: 4, nThreads: 1,
-    stages: @[@["bcftools", "view", "-Ob"]], outputTemplate: tmpl))
-  var total = 0
-  var bcfShardPaths: seq[string]
-  for i in 0..3:
-    let p = shardOutputPath(tmpl, i, 4)
-    doAssert fileExists(p), &"BCF shard {i+1} missing: {p}"
-    let (_, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
-    doAssert bc == 0, &"bcftools rejected BCF shard {i+1}"
-    total += countRecords(p)
-    bcfShardPaths.add(p)
+    vcfPath: SmallBcf, nWorkers: 4, maxShardsPerWorker: 1, nThreads: 1,
+    stages: @[@["cat"]], outputPath: outPath))
+  doAssert fileExists(outPath), "BCF output missing"
   let orig = countRecords(SmallBcf)
-  doAssert total == orig, &"BCF 4-shard record count mismatch: {total} vs {orig}"
-  doAssert recordsHash(bcfShardPaths) == recordsHash(@[SmallBcf]),
-    "BCF 4-shard content hash mismatch: record corruption or reordering detected"
+  let got  = countRecords(outPath)
+  doAssert got == orig, &"BCF 4-worker record count mismatch: {got} vs {orig}"
   removeDir(tmpDir)
 
 # ===========================================================================
@@ -246,35 +233,27 @@ timed("R4.1", "CLI run: missing --- -> exits 1 with message"):
 # ---------------------------------------------------------------------------
 # R4.2 — testCliRun1Shard: run -n 1 --- cat; output valid, record count matches
 # ---------------------------------------------------------------------------
-timed("R4.2", "CLI run: 1 shard, cat stage"):
+timed("R4.2", "CLI run: 1 worker, cat stage, single output"):
   let tmpDir = createTempDir("vcfparty_", "")
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 1 -o {outp_template} {SmallVcf} --- cat")
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n 1 -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run -n 1 exited {code}:\n{outp}"
-  let p = tmpDir / "shard_1.out.vcf.gz"
-  doAssert fileExists(p), "output missing: " & p
-  let (_, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
-  doAssert bc == 0, "bcftools rejected 1-shard run output"
+  doAssert fileExists(outFile), "output missing: " & outFile
   let orig = countRecords(SmallVcf)
-  doAssert countRecords(p) == orig, "1-shard CLI record count mismatch"
+  doAssert countRecords(outFile) == orig, "1-worker CLI record count mismatch"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
 # R4.3 — testCliRun4Shards: run -n 4 --- cat; 4 shards valid, record count matches
 # ---------------------------------------------------------------------------
-timed("R4.3", "CLI run: 4 shards, cat stage"):
+timed("R4.3", "CLI run: 4 workers, cat stage, single output"):
   let tmpDir = createTempDir("vcfparty_", "")
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 4 -o {outp_template} {SmallVcf} --- cat")
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n 4 -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run -n 4 exited {code}:\n{outp}"
-  var total = 0
-  for i in 1..4:
-    let p = tmpDir / ("shard_" & $i & ".out.vcf.gz")
-    doAssert fileExists(p), &"shard {i} missing"
-    let (_, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
-    doAssert bc == 0, &"bcftools rejected shard {i}"
-    total += countRecords(p)
-  doAssert total == countRecords(SmallVcf), &"4-shard CLI record count mismatch: {total}"
+  doAssert fileExists(outFile), "output missing"
+  doAssert countRecords(outFile) == countRecords(SmallVcf),
+    "4-worker CLI record count mismatch"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
@@ -282,15 +261,11 @@ timed("R4.3", "CLI run: 4 shards, cat stage"):
 # ---------------------------------------------------------------------------
 timed("R4.4", "CLI run: multi-stage pipeline (cat | cat), records match"):
   let tmpDir = createTempDir("vcfparty_", "")
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 2 -o {outp_template} {SmallVcf} --- cat --- cat")
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n 2 -o {outFile} {SmallVcf} --- cat --- cat")
   doAssert code == 0, &"run multi-stage exited {code}:\n{outp}"
-  var total = 0
-  for i in 1..2:
-    let p = tmpDir / ("shard_" & $i & ".out.vcf.gz")
-    doAssert fileExists(p), &"multi-stage shard {i} missing"
-    total += countRecords(p)
-  doAssert total == countRecords(SmallVcf), "multi-stage record count mismatch"
+  doAssert countRecords(outFile) == countRecords(SmallVcf),
+    "multi-stage record count mismatch"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
@@ -307,17 +282,11 @@ timed("R4.5", "CLI run: -j exits non-zero (unknown option)"):
 # R4.6 — testCliRunAttachedN: -n4 (attached, no space) parsed correctly
 # ---------------------------------------------------------------------------
 timed("R4.6", "CLI run: -n4 attached-value flag works"):
-  # Nim's parseopt splits -n4 correctly; verify attached-value still works without -j.
   let tmpDir = createTempDir("vcfparty_", "")
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n4 -o {outp_template} {SmallVcf} --- cat")
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n4 -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run -n4 exited {code}:\n{outp}"
-  var total = 0
-  for i in 1..4:
-    let p = tmpDir / ("shard_" & $i & ".out.vcf.gz")
-    doAssert fileExists(p), &"-n4 shard {i} missing"
-    total += countRecords(p)
-  doAssert total == countRecords(SmallVcf), "-n4 record count mismatch"
+  doAssert countRecords(outFile) == countRecords(SmallVcf), "-n4 record count mismatch"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
@@ -346,12 +315,10 @@ timed("R4.8", "CLI run: non-zero stage exit -> vcfparty exits 1, shard mentioned
 # ---------------------------------------------------------------------------
 timed("R4.9", "CLI run: ::: separator works like ---"):
   let tmpDir = createTempDir("vcfparty_", "")
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 2 -o {outp_template} {SmallVcf} ::: cat")
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n 2 -o {outFile} {SmallVcf} ::: cat")
   doAssert code == 0, &"::: separator exited {code}:\n{outp}"
-  for i in 1..2:
-    let p = tmpDir / ("shard_" & $i & ".out.vcf.gz")
-    doAssert fileExists(p), &"::: shard {i} missing"
+  doAssert fileExists(outFile), "::: output missing"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
@@ -360,27 +327,22 @@ timed("R4.9", "CLI run: ::: separator works like ---"):
 timed("R4.10", "CLI run: -- inside stage passed through to bcftools"):
   # bcftools view -Oz -- - reads stdin, writes bgzipped VCF to stdout.
   let tmpDir = createTempDir("vcfparty_", "")
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 1 -o {outp_template} {SmallVcf} --- bcftools view -Oz -- -")
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n 1 -o {outFile} {SmallVcf} --- bcftools view -Oz -- -")
   doAssert code == 0, &"-- passthrough exited {code}:\n{outp}"
-  let p = tmpDir / "shard_1.out.vcf.gz"
-  doAssert fileExists(p), "-- passthrough output missing"
-  doAssert countRecords(p) == countRecords(SmallVcf), "-- passthrough record count mismatch"
+  doAssert fileExists(outFile), "-- passthrough output missing"
+  doAssert countRecords(outFile) == countRecords(SmallVcf), "-- passthrough record count mismatch"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
 # R4.11 — testCliRunNoKill: --no-kill flag accepted; run completes normally
 # ---------------------------------------------------------------------------
 timed("R4.11", "CLI run: --no-kill flag accepted, all shards complete normally"):
-  # Smoke test: verify --no-kill parses and the run succeeds when all shards
-  # succeed.  Behavioural difference (siblings not killed on failure) is hard to
-  # assert deterministically in a unit test.
   let tmpDir = createTempDir("vcfparty_", "")
-  let outp_template = tmpDir / "out.vcf.gz"
-  let (outp, code) = runBin(&"-n 2 --no-kill -o {outp_template} {SmallVcf} --- cat")
+  let outFile = tmpDir / "out.vcf.gz"
+  let (outp, code) = runBin(&"-n 2 --no-kill -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run --no-kill exited {code}:\n{outp}"
-  for i in 1..2:
-    doAssert fileExists(tmpDir / ("shard_" & $i & ".out.vcf.gz")), &"--no-kill shard {i} missing"
+  doAssert fileExists(outFile), "--no-kill output missing"
   removeDir(tmpDir)
 
 # ===========================================================================
@@ -389,18 +351,21 @@ timed("R4.11", "CLI run: --no-kill flag accepted, all shards complete normally")
 #  CLI level by testCliRunMissingSep.)
 # ===========================================================================
 
-timed("R5.1", "inferRunMode: o / no-{} -> rmNormal"):
+timed("R5.1", "inferRunMode: o / no-{} -> rmFile"):
   let m = inferRunMode(true, false)
-  doAssert m == rmNormal, "expected rmNormal, got " & $m
+  doAssert m == rmFile, "expected rmFile, got " & $m
 
 timed("R5.2", "inferRunMode: no-o / {} -> rmToolManaged"):
   let m = inferRunMode(false, true)
   doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
 
 timed("R5.3", "inferRunMode: o / {} -> rmToolManaged (warning: -o ignored)"):
-  # -o present but {} in cmd: -o ignored, still tool-managed (warning emitted)
   let m = inferRunMode(true, true)
   doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
+
+timed("R5.4", "inferRunMode: no-o / no-{} -> rmStdout"):
+  let m = inferRunMode(false, false)
+  doAssert m == rmStdout, "expected rmStdout, got " & $m
 
 # ===========================================================================
 # R6 — hasBracePlaceholder, substituteToken, buildShellCmdForShard
@@ -464,15 +429,13 @@ timed("R6.11", "buildShellCmdForShard: width 1 for nShards=4"):
 # ---------------------------------------------------------------------------
 # R7.1: tool-managed mode via API (runShards toolManaged=true)
 # ---------------------------------------------------------------------------
-timed("R7.1", "tool-managed API: 2 shards, tool writes own output"):
+timed("R7.1", "tool-managed API: 2 workers, tool writes own output"):
   doAssert fileExists(SmallVcf), "fixture missing"
   let tmpDir = createTempDir("vcfparty_", "")
   let outTemplate = tmpDir / "out.{}.vcf.gz"
-  # Tool writes its own output using {} substitution.
-  # We use bcftools view -Oz -o <path> rather than stdout.
   let stages = @[@["bcftools", "view", "-Oz", "-o", outTemplate]]
   runPipeline(RunPipelineCfg(
-    vcfPath: SmallVcf, nShards: 2, nThreads: 1,
+    vcfPath: SmallVcf, nWorkers: 2, maxShardsPerWorker: 1, nThreads: 1,
     stages: stages, toolManaged: true))
   var total = 0
   for i in 0..1:
@@ -523,3 +486,70 @@ timed("R7.3", "tool-managed CLI: -o present with {} -> warning, -o ignored"):
     doAssert fileExists(p), &"tool-managed -o shard {i+1} missing"
   doAssert not fileExists(tmpDir / "ignored.vcf.gz"), "-o file should not be created"
   removeDir(tmpDir)
+
+# ===========================================================================
+# W1 — DepositQueue and atomic shard counter
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# W1.1 — DepositQueue: deposit and waitFor in order
+# ---------------------------------------------------------------------------
+timed("W1.1", "DepositQueue: deposit in order, waitFor retrieves correctly"):
+  var q = newDepositQueue(4)
+  q.deposit(0, "/tmp/shard_0.tmp")
+  q.deposit(1, "/tmp/shard_1.tmp")
+  q.deposit(2, "/tmp/shard_2.tmp")
+  q.deposit(3, "/tmp/shard_3.tmp")
+  doAssert q.waitFor(0) == "/tmp/shard_0.tmp", "W1.1: slot 0 wrong"
+  doAssert q.waitFor(1) == "/tmp/shard_1.tmp", "W1.1: slot 1 wrong"
+  doAssert q.waitFor(2) == "/tmp/shard_2.tmp", "W1.1: slot 2 wrong"
+  doAssert q.waitFor(3) == "/tmp/shard_3.tmp", "W1.1: slot 3 wrong"
+  freeDepositQueue(q)
+
+# ---------------------------------------------------------------------------
+# W1.2 — DepositQueue: out-of-order deposit, in-order waitFor
+# ---------------------------------------------------------------------------
+timed("W1.2", "DepositQueue: out-of-order deposit, ordered waitFor"):
+  var q = newDepositQueue(4)
+  # Deposit out of order using threads to exercise cross-thread visibility.
+  proc depositDelayed(qp: ptr DepositQueue; idx: int; path: string): int {.gcsafe.} =
+    sleep(idx * 10)  # stagger: slot 2 deposits first, slot 3 last
+    qp[].deposit(idx, path)
+    0
+  setMaxPoolSize(4)
+  let fv2 = spawn depositDelayed(addr q, 2, "/tmp/s2")
+  let fv0 = spawn depositDelayed(addr q, 0, "/tmp/s0")
+  let fv3 = spawn depositDelayed(addr q, 3, "/tmp/s3")
+  let fv1 = spawn depositDelayed(addr q, 1, "/tmp/s1")
+  # waitFor in order — each blocks until that slot is deposited.
+  doAssert q.waitFor(0) == "/tmp/s0", "W1.2: slot 0 wrong"
+  doAssert q.waitFor(1) == "/tmp/s1", "W1.2: slot 1 wrong"
+  doAssert q.waitFor(2) == "/tmp/s2", "W1.2: slot 2 wrong"
+  doAssert q.waitFor(3) == "/tmp/s3", "W1.2: slot 3 wrong"
+  discard ^fv0; discard ^fv1; discard ^fv2; discard ^fv3
+  freeDepositQueue(q)
+
+# ---------------------------------------------------------------------------
+# W1.3 — Atomic shard counter: each index claimed exactly once
+# ---------------------------------------------------------------------------
+timed("W1.3", "gNextShard: atomic pull, each index claimed once"):
+  const NItems = 8
+  gNextShard.store(0, moRelaxed)
+  var claimed: array[NItems, Atomic[int]]
+  for i in 0 ..< NItems:
+    claimed[i].store(0, moRelaxed)
+  proc puller(claimedArr: ptr array[NItems, Atomic[int]]): int {.gcsafe.} =
+    while true:
+      let idx = gNextShard.fetchAdd(1, moRelaxed)
+      if idx >= NItems: break
+      discard claimedArr[][idx].fetchAdd(1, moRelaxed)
+    0
+  setMaxPoolSize(4)
+  var fvs: array[4, FlowVar[int]]
+  for i in 0..3:
+    fvs[i] = spawn puller(addr claimed)
+  for fv in fvs:
+    discard ^fv
+  for i in 0 ..< NItems:
+    doAssert claimed[i].load(moRelaxed) == 1,
+      &"W1.3: index {i} claimed {claimed[i].load(moRelaxed)} times (expected 1)"

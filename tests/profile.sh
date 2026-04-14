@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# profile.sh — perf flat-profile for 4 vcfparty gather configurations
+# profile.sh — perf flat-profile for 4 blocky gather configurations
 #
 # Usage:
-#   bash tests/profile.sh [--fixture <vcf.gz>] [--binary <vcfparty>] [--outdir <dir>]
+#   bash tests/profile.sh [--fixture <vcf.gz>] [--binary <blocky>] [--outdir <dir>]
 #
 # Defaults:
 #   --fixture  tests/data/chr22_1kg_50k.vcf.gz
-#   --binary   ./vcfparty
-#   --outdir   /tmp/vcfparty_profiles
+#   --binary   ./blocky
+#   --outdir   /tmp/blocky_profiles
 #
 # For each of 4 input×output combinations, records a perf flat profile and
 # writes a <name>.txt report to outdir.  Prints a summary table to stdout.
@@ -18,8 +18,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "${SCRIPT_DIR}")"
 
 FIXTURE="${SCRIPT_DIR}/data/chr22_1kg_50k.vcf.gz"
-BINARY="${ROOT_DIR}/vcfparty"
-OUTDIR="/tmp/vcfparty_profiles"
+BINARY="${ROOT_DIR}/blocky"
+OUTDIR="/tmp/blocky_profiles"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

@@ -1,8 +1,8 @@
-## vcfparty CLI — argument parsing and subcommand dispatch.
-## Entry point is src/vcfparty.nim which includes this file.
+## blocky CLI — argument parsing and subcommand dispatch.
+## Entry point is src/blocky.nim which includes this file.
 
-import std/[os, parseopt, posix, strutils]
-import vcf_utils
+import std/[os, parseopt, posix, strformat, strutils]
+import bgzf
 import scatter
 import run
 import gather
@@ -21,23 +21,23 @@ const VERSION = "0.1.0"
 
 proc usage() =
   ## Print top-level usage to stderr and exit 1.
-  stderr.writeLine "vcfparty v" & VERSION
+  stderr.writeLine "blocky v" & VERSION
   stderr.writeLine ""
-  stderr.writeLine "Usage: vcfparty <subcommand> [options]"
+  stderr.writeLine "Usage: blocky <subcommand> [options]"
   stderr.writeLine ""
   stderr.writeLine "Subcommands:"
-  stderr.writeLine "  scatter      Split a bgzipped VCF/BCF into N shards"
+  stderr.writeLine "  scatter      Split a bgzipped file into N shards"
   stderr.writeLine "  run          Scatter, pipe each shard through a tool pipeline"
   stderr.writeLine "  gather       Concatenate pre-existing shard files into a single output"
   stderr.writeLine "  compress     BGZF-compress a file (like bgzip)"
   stderr.writeLine "  decompress   Decompress a BGZF file"
   stderr.writeLine ""
-  stderr.writeLine "Run 'vcfparty <subcommand> --help' for subcommand options."
+  stderr.writeLine "Run 'blocky <subcommand> --help' for subcommand options."
   quit(1)
 
 proc scatterUsage() =
   ## Print scatter subcommand usage to stderr and exit 1.
-  stderr.writeLine "Usage: vcfparty scatter -n <n_shards> -o <prefix> [options] <input.vcf.gz>"
+  stderr.writeLine "Usage: blocky scatter -n <n_shards> -o <prefix> [options] <input>"
   stderr.writeLine ""
   stderr.writeLine "Options:"
   stderr.writeLine "  -n, --n-shards <int>      number of output shards (required, >= 1)"
@@ -107,7 +107,7 @@ proc runScatter(rawArgs: seq[string]) =
       of "clamp-shards":
         clampShards = true
       of "v", "verbose":
-        scatter.verbose = true
+        bgzf.verbose = true
       of "h", "help":
         scatterUsage()
       else:
@@ -134,8 +134,9 @@ proc runScatter(rawArgs: seq[string]) =
     stderr.writeLine "error: input file not found: " & inputFile
     quit(1)
   let fmt = inferInputFormat(inputFile)
+  info(&"scatter: input={inputFile}, format={fmt}")
   if fmt == ffBcf and forceScan:
-    stderr.writeLine "error: vcfparty: --force-scan is not supported for BCF input"
+    stderr.writeLine "error: blocky: --force-scan is not supported for BCF input"
     quit(1)
   if not nThreadsSet:
     nThreads = min(nShards, 8)
@@ -144,7 +145,7 @@ proc runScatter(rawArgs: seq[string]) =
 
 proc runUsage() =
   ## Print run subcommand usage to stderr and exit 1.
-  stderr.writeLine "Usage: vcfparty run -n <n_workers> [-m <shards_per_worker>] [options] <input.vcf.gz> (--- | :::) <cmd> [args...]"
+  stderr.writeLine "Usage: blocky run -n <n_workers> [-m <shards_per_worker>] [options] <input> (--- | :::) <cmd> [args...]"
   stderr.writeLine ""
   stderr.writeLine "Options:"
   stderr.writeLine "  -n, --n-workers <int>          number of concurrent worker pipelines (required, >= 1)"
@@ -159,24 +160,24 @@ proc runUsage() =
   stderr.writeLine "  -h, --help                     show this help"
   stderr.writeLine ""
   stderr.writeLine "Separate pipeline stages with --- or :::."
-  stderr.writeLine "  vcfparty run -n 4 -o out.vcf input.vcf.gz ::: bcftools view -Ov"
-  stderr.writeLine "  vcfparty run -n 4 -m 2 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz"
-  stderr.writeLine "  vcfparty run -n 4 input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
+  stderr.writeLine "  blocky run -n 4 -o out.vcf input.vcf.gz ::: bcftools view -Ov"
+  stderr.writeLine "  blocky run -n 4 -m 2 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz"
+  stderr.writeLine "  blocky run -n 4 input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
   quit(1)
 
 proc runRun(rawArgs: seq[string]) =
   ## Parse `run` subcommand arguments, build a RunPipelineCfg, and dispatch
   ## to run.runPipeline.
-  ## Everything before the first --- is parsed as vcfparty options.
+  ## Everything before the first --- is parsed as blocky options.
   ## Everything from --- onward is the pipeline stage definition.
   var firstSep = -1
   for i, tok in rawArgs:
     if tok == "---" or tok == ":::":
       firstSep = i
       break
-  # Parse vcfparty options from the slice before --- (or all args if no --- found;
+  # Parse blocky options from the slice before --- (or all args if no --- found;
   # parseRunArgv will emit the appropriate error when called below).
-  let vcfpartyPart = if firstSep < 0: rawArgs else: rawArgs[0 ..< firstSep]
+  let blockyPart = if firstSep < 0: rawArgs else: rawArgs[0 ..< firstSep]
   var nWorkers        = 0
   var nWorkersSet     = false
   var maxShards       = 1
@@ -188,7 +189,7 @@ proc runRun(rawArgs: seq[string]) =
   var clampShards     = false
   var forceUncompress = false
   var noKill          = false
-  var p = initOptParser(vcfpartyPart, shortNoVal = ShortNoVal)
+  var p = initOptParser(blockyPart, shortNoVal = ShortNoVal)
   while true:
     p.next()
     case p.kind
@@ -235,7 +236,7 @@ proc runRun(rawArgs: seq[string]) =
       of "no-kill":
         noKill = true
       of "v", "verbose":
-        scatter.verbose = true
+        bgzf.verbose = true
       of "h", "help":
         runUsage()
       else:
@@ -259,16 +260,18 @@ proc runRun(rawArgs: seq[string]) =
     stderr.writeLine "error: input file not found: " & inputFile
     quit(1)
   let fmt = inferInputFormat(inputFile)
+  info(&"run: input={inputFile}, format={fmt}")
   if fmt == ffBcf and forceScan:
-    stderr.writeLine "error: vcfparty: --force-scan is not supported for BCF input"
+    stderr.writeLine "error: blocky: --force-scan is not supported for BCF input"
     quit(1)
   if not nThreadsSet:
     nThreads = min(nWorkers, 8)
   let (_, stages) = parseRunArgv(rawArgs)
   let hasBrace    = hasBracePlaceholder(stages)
   let mode        = inferRunMode(outPrefix != "", hasBrace)
+  info(&"run: mode={mode}, stages={stages.len}")
   if mode == rmToolManaged and forceUncompress:
-    stderr.writeLine "error: -u cannot be used with tool-managed output ({}); vcfparty does not control that output"
+    stderr.writeLine "error: -u cannot be used with tool-managed output ({}); blocky does not control that output"
     quit(1)
   if mode == rmFile:
     warnFormatMismatch(inputFile, outPrefix)
@@ -288,7 +291,7 @@ proc runRun(rawArgs: seq[string]) =
 
 proc gatherUsage() =
   ## Print gather subcommand usage to stderr and exit 1.
-  stderr.writeLine "Usage: vcfparty gather [-o <output>] [options] <shard1> [<shard2> ...]"
+  stderr.writeLine "Usage: blocky gather [-o <output>] [options] <shard1> [<shard2> ...]"
   stderr.writeLine ""
   stderr.writeLine "Options:"
   stderr.writeLine "  -o, --output <str>           gather output path (default: stdout)"
@@ -310,7 +313,7 @@ proc runGather(rawArgs: seq[string]) =
       of "o", "output":
         outPath = nextVal(p, "o")
       of "v", "verbose":
-        scatter.verbose = true
+        bgzf.verbose = true
       of "h", "help":
         gatherUsage()
       else:
@@ -340,7 +343,7 @@ proc runGather(rawArgs: seq[string]) =
   gatherFiles(cfg, inputFiles)
 
 proc compressUsage() =
-  stderr.writeLine "Usage: vcfparty compress [-c] [file]"
+  stderr.writeLine "Usage: blocky compress [-c] [file]"
   stderr.writeLine ""
   stderr.writeLine "Compress input to BGZF format."
   stderr.writeLine ""
@@ -352,7 +355,7 @@ proc compressUsage() =
   quit(1)
 
 proc decompressUsage() =
-  stderr.writeLine "Usage: vcfparty decompress [-c] [file]"
+  stderr.writeLine "Usage: blocky decompress [-c] [file]"
   stderr.writeLine ""
   stderr.writeLine "Decompress BGZF input to raw bytes."
   stderr.writeLine ""
@@ -505,7 +508,7 @@ proc mainEntry*() =
   of "decompress":
     runDecompress(args[1 .. ^1])
   of "--version":
-    echo "vcfparty v" & VERSION
+    echo "blocky v" & VERSION
   of "--help", "-h":
     usage()
   else:

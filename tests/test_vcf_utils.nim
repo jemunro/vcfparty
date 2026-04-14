@@ -1,13 +1,13 @@
-## Tests for vcf_utils.nim — BGZF I/O (V1), format sniffing (V2), file format sniffing (V3).
+## Tests for bgzf.nim — BGZF I/O (V1), format sniffing (V2), file format sniffing (V3).
 ## Run from project root: nim c -r tests/test_vcf_utils.nim
 
-echo "--------------- Test VCF Utils ---------------"
+echo "--------------- Test BGZF ---------------"
 
 import std/[algorithm, os, strformat]
 import test_utils
-import "../src/vcfparty/vcf_utils"
+import "../src/blocky/bgzf"
 
-# libdeflate CRC32 — already linked via -ldeflate in vcf_utils
+# libdeflate CRC32 — already linked via -ldeflate in bgzf
 proc libdeflateCrc32(crc: cuint; buf: pointer; len: csize_t): cuint
   {.importc: "libdeflate_crc32", header: "<libdeflate.h>".}
 
@@ -81,7 +81,7 @@ timed("V1.3", "rawCopyBytes: copied bytes match source"):
   doAssert blkSize > 0
 
   let expected = readFileSlice(SmallVcf, starts[0], blkSize)
-  let tmpPath = getTempDir() / "vcfparty_test_rawcopy.bin"
+  let tmpPath = getTempDir() / "blocky_test_rawcopy.bin"
   let dst = open(tmpPath, fmWrite)
   rawCopyBytes(SmallVcf, dst, starts[0], blkSize.int64)
   dst.close()
@@ -267,7 +267,7 @@ timed("V2.5", "sniffStreamFormat: text/uncompressed"):
 
 timed("V2.6", "sniffStreamFormat: uncompressed VCF"):
   var raw: seq[byte]
-  for c in "##fileformatVCFv4.2\n##source=vcfparty\n#CHROM\tPOS\n":
+  for c in "##fileformatVCFv4.2\n##source=blocky\n#CHROM\tPOS\n":
     raw.add(byte(c))
   let (fmt, isBgzf) = sniffStreamFormat(raw)
   doAssert fmt == ffVcf,  &"uncompressed VCF: expected ffVcf, got {fmt}"
@@ -315,7 +315,7 @@ timed("V3.2", "sniffFileFormat: BCF BGZF"):
 # ---------------------------------------------------------------------------
 
 timed("V3.3", "sniffFileFormat: uncompressed VCF"):
-  let tmp = getTempDir() / "vcfparty_sniff_test_v3_3.vcf"
+  let tmp = getTempDir() / "blocky_sniff_test_v3_3.vcf"
   writeFile(tmp, "##fileformat=VCFv4.1\n#CHROM\tPOS\tID\tREF\tALT\n")
   let (fmt, compressed) = sniffFileFormat(tmp)
   doAssert fmt == ffVcf,   "V3.3: expected ffVcf, got " & $fmt
@@ -327,7 +327,7 @@ timed("V3.3", "sniffFileFormat: uncompressed VCF"):
 # ---------------------------------------------------------------------------
 
 timed("V3.4", "sniffFileFormat: uncompressed BCF magic"):
-  let tmp = getTempDir() / "vcfparty_sniff_test_v3_4.bcf_raw"
+  let tmp = getTempDir() / "blocky_sniff_test_v3_4.bcf_raw"
   let magic: seq[byte] = @[byte('B'), byte('C'), byte('F'), 0x02'u8, 0x02'u8]
   var f = open(tmp, fmWrite)
   discard f.writeBytes(magic, 0, magic.len)
@@ -389,9 +389,9 @@ timed("V5.1", "bgzfCompressStream/bgzfDecompressStream: round-trip"):
   let original = decompressBgzfFile(SmallVcf)
   doAssert original.len > 0, "fixture decompressed to empty"
 
-  let tmpComp = getTempDir() / "vcfparty_test_compress_stream.gz"
-  let tmpDecomp = getTempDir() / "vcfparty_test_decompress_stream.raw"
-  let tmpRaw = getTempDir() / "vcfparty_test_raw_input.bin"
+  let tmpComp = getTempDir() / "blocky_test_compress_stream.gz"
+  let tmpDecomp = getTempDir() / "blocky_test_decompress_stream.raw"
+  let tmpRaw = getTempDir() / "blocky_test_raw_input.bin"
 
   # Write raw bytes to a temp file, then compress via stream.
   var fRaw = open(tmpRaw, fmWrite)
@@ -431,8 +431,8 @@ timed("V5.1", "bgzfCompressStream/bgzfDecompressStream: round-trip"):
 # ---------------------------------------------------------------------------
 
 timed("V5.2", "bgzfCompressStream: empty input -> EOF block only"):
-  let tmpIn = getTempDir() / "vcfparty_test_empty_in.bin"
-  let tmpOut = getTempDir() / "vcfparty_test_empty_out.gz"
+  let tmpIn = getTempDir() / "blocky_test_empty_in.bin"
+  let tmpOut = getTempDir() / "blocky_test_empty_out.gz"
   writeFile(tmpIn, "")
   var fIn = open(tmpIn, fmRead)
   var fOut = open(tmpOut, fmWrite)

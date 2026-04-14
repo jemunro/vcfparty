@@ -10,8 +10,8 @@ import std/[atomics, os, osproc, strformat, strutils, tempfiles]
 import std/threadpool
 {.warning[Deprecated]: on.}
 import test_utils
-import "../src/vcfparty/scatter"
-import "../src/vcfparty/run"
+import "../src/blocky/scatter"
+import "../src/blocky/run"
 
 const DataDir  = "tests/data"
 const SmallVcf = DataDir / "small.vcf.gz"
@@ -22,14 +22,14 @@ const SmallBcf = DataDir / "small.bcf"
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# R1 — testSingleStage: single --- stage; vcfparty args and stage tokens correct
+# R1 — testSingleStage: single --- stage; blocky args and stage tokens correct
 # ---------------------------------------------------------------------------
 timed("R1.1", "parseRunArgv: single stage"):
   let argv = @["--shards", "4", "-o", "out", "input.vcf.gz",
                "---", "bcftools", "view", "-Oz"]
   let (pArgs, stages) = parseRunArgv(argv)
   doAssert pArgs == @["--shards", "4", "-o", "out", "input.vcf.gz"],
-    "single stage: wrong vcfparty args"
+    "single stage: wrong blocky args"
   doAssert stages.len == 1, "single stage: expected 1 stage, got " & $stages.len
   doAssert stages[0] == @["bcftools", "view", "-Oz"],
     "single stage: wrong stage tokens"
@@ -43,7 +43,7 @@ timed("R1.2", "parseRunArgv: multi-stage pipeline"):
                "---",
                "bcftools", "view", "-s", "Sample", "-Oz"]
   let (pArgs, stages) = parseRunArgv(argv)
-  doAssert pArgs == @["-n", "10"], "multi-stage: wrong vcfparty args"
+  doAssert pArgs == @["-n", "10"], "multi-stage: wrong blocky args"
   doAssert stages.len == 2, "multi-stage: expected 2 stages, got " & $stages.len
   doAssert stages[0] == @["bcftools", "+split-vep", "-Ou", "--", "-f", "%SYMBOL"],
     "multi-stage: wrong stage 0 tokens"
@@ -53,10 +53,10 @@ timed("R1.2", "parseRunArgv: multi-stage pipeline"):
 # ---------------------------------------------------------------------------
 # R3 — testSepFirst: --- at argv[0]; empty partyvcf args, one stage
 # ---------------------------------------------------------------------------
-timed("R1.3", "parseRunArgv: --- first, no vcfparty args"):
+timed("R1.3", "parseRunArgv: --- first, no blocky args"):
   let argv = @["---", "cat"]
   let (pArgs, stages) = parseRunArgv(argv)
-  doAssert pArgs.len == 0, "sep-first: vcfparty args should be empty"
+  doAssert pArgs.len == 0, "sep-first: blocky args should be empty"
   doAssert stages.len == 1, "sep-first: expected 1 stage"
   doAssert stages[0] == @["cat"], "sep-first: wrong stage tokens"
 
@@ -76,7 +76,7 @@ timed("R1.4", "parseRunArgv: -- inside stage is a plain token"):
 timed("R1.5", "parseRunArgv: ::: is alias for ---"):
   let argv = @["-n", "4", ":::", "bcftools", "view", "-Oz"]
   let (pArgs, stages) = parseRunArgv(argv)
-  doAssert pArgs == @["-n", "4"], "::: sep: wrong vcfparty args"
+  doAssert pArgs == @["-n", "4"], "::: sep: wrong blocky args"
   doAssert stages.len == 1, "::: sep: expected 1 stage"
   doAssert stages[0] == @["bcftools", "view", "-Oz"], "::: sep: wrong stage tokens"
 
@@ -96,7 +96,7 @@ timed("R1.6", "parseRunArgv: ::: and --- may be mixed"):
 # ---------------------------------------------------------------------------
 timed("R1.7", "CLI run: no -o and no {} -> stdout mode"):
   let (outp, code) = execCmdEx(
-    "./vcfparty run -n 1 " & SmallVcf &
+    "./blocky run -n 1 " & SmallVcf &
     " ::: cat 2>/dev/null | wc -c")
   doAssert code == 0, "no -o should succeed (stdout mode)"
   doAssert outp.strip.parseInt > 0, "stdout should have output"
@@ -147,7 +147,7 @@ proc countTextLines(path: string): int =
 proc recordsHash(paths: seq[string]): string =
   ## Concatenate records from paths in order (bcftools view -H, full genotypes),
   ## write to temp file, return sha256sum hex digest.
-  let tmp = getTempDir() / "vcfparty_hash_" & $getCurrentProcessId() & ".txt"
+  let tmp = getTempDir() / "blocky_hash_" & $getCurrentProcessId() & ".txt"
   var f = open(tmp, fmWrite)
   for p in paths:
     let (o, _) = execCmdEx("bcftools view -H " & p & " 2>/dev/null")
@@ -162,7 +162,7 @@ proc recordsHash(paths: seq[string]): string =
 # ---------------------------------------------------------------------------
 timed("R3.1", "runPipeline: 1 worker, cat stage"):
   doAssert fileExists(SmallVcf), "fixture missing — run generate_fixtures.sh"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outPath = tmpDir / "out.vcf.gz"
   runPipeline(RunPipelineCfg(
     vcfPath: SmallVcf, nWorkers: 1, maxShardsPerWorker: 1, nThreads: 1,
@@ -178,7 +178,7 @@ timed("R3.1", "runPipeline: 1 worker, cat stage"):
 # ---------------------------------------------------------------------------
 timed("R3.2", "runPipeline: 4 workers, cat stage"):
   doAssert fileExists(SmallVcf), "fixture missing"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outPath = tmpDir / "out.vcf.gz"
   runPipeline(RunPipelineCfg(
     vcfPath: SmallVcf, nWorkers: 4, maxShardsPerWorker: 1, nThreads: 1,
@@ -194,7 +194,7 @@ timed("R3.2", "runPipeline: 4 workers, cat stage"):
 # ---------------------------------------------------------------------------
 timed("R3.3", "runPipeline BCF: 4 workers, cat stage"):
   doAssert fileExists(SmallBcf), "BCF fixture missing — run generate_fixtures.sh"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outPath = tmpDir / "out.vcf.gz"
   runPipeline(RunPipelineCfg(
     vcfPath: SmallBcf, nWorkers: 4, maxShardsPerWorker: 1, nThreads: 1,
@@ -209,7 +209,7 @@ timed("R3.3", "runPipeline BCF: 4 workers, cat stage"):
 # R4 — CLI integration tests via the compiled binary
 # ===========================================================================
 
-const BinPath = "./vcfparty"
+const BinPath = "./blocky"
 
 timed("R4.0", "binary available (run CLI tests)"):
   if not fileExists(BinPath):
@@ -234,7 +234,7 @@ timed("R4.1", "CLI run: missing --- -> exits 1 with message"):
 # R4.2 — testCliRun1Shard: run -n 1 --- cat; output valid, record count matches
 # ---------------------------------------------------------------------------
 timed("R4.2", "CLI run: 1 worker, cat stage, single output"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outFile = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n 1 -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run -n 1 exited {code}:\n{outp}"
@@ -247,7 +247,7 @@ timed("R4.2", "CLI run: 1 worker, cat stage, single output"):
 # R4.3 — testCliRun4Shards: run -n 4 --- cat; 4 shards valid, record count matches
 # ---------------------------------------------------------------------------
 timed("R4.3", "CLI run: 4 workers, cat stage, single output"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outFile = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n 4 -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run -n 4 exited {code}:\n{outp}"
@@ -260,7 +260,7 @@ timed("R4.3", "CLI run: 4 workers, cat stage, single output"):
 # R4.4 — testCliRunMultiStage: run -n 2 --- cat --- cat; record count matches
 # ---------------------------------------------------------------------------
 timed("R4.4", "CLI run: multi-stage pipeline (cat | cat), records match"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outFile = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n 2 -o {outFile} {SmallVcf} --- cat --- cat")
   doAssert code == 0, &"run multi-stage exited {code}:\n{outp}"
@@ -272,7 +272,7 @@ timed("R4.4", "CLI run: multi-stage pipeline (cat | cat), records match"):
 # R4.5 — testCliRunJError: -j is unknown, exits non-zero
 # ---------------------------------------------------------------------------
 timed("R4.5", "CLI run: -j exits non-zero (unknown option)"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outp_template = tmpDir / "out.vcf.gz"
   let (_, code) = runBin(&"-n 4 -j 1 -o {outp_template} {SmallVcf} --- cat")
   doAssert code != 0, "-j should cause a non-zero exit (unknown option)"
@@ -282,7 +282,7 @@ timed("R4.5", "CLI run: -j exits non-zero (unknown option)"):
 # R4.6 — testCliRunAttachedN: -n4 (attached, no space) parsed correctly
 # ---------------------------------------------------------------------------
 timed("R4.6", "CLI run: -n4 attached-value flag works"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outFile = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n4 -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run -n4 exited {code}:\n{outp}"
@@ -293,20 +293,20 @@ timed("R4.6", "CLI run: -n4 attached-value flag works"):
 # R4.7 — testCliRunMaxJobsError: --max-jobs is unknown, exits non-zero
 # ---------------------------------------------------------------------------
 timed("R4.7", "CLI run: --max-jobs exits non-zero (unknown option)"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outp_template = tmpDir / "out.vcf.gz"
   let (_, code) = runBin(&"-n 2 --max-jobs 10 -o {outp_template} {SmallVcf} --- cat")
   doAssert code != 0, "--max-jobs should cause a non-zero exit (unknown option)"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
-# R4.8 — testCliRunNonZeroExit: non-zero stage exit → vcfparty exits 1, shard mentioned
+# R4.8 — testCliRunNonZeroExit: non-zero stage exit → blocky exits 1, shard mentioned
 # ---------------------------------------------------------------------------
-timed("R4.8", "CLI run: non-zero stage exit -> vcfparty exits 1, shard mentioned"):
-  let tmpDir = createTempDir("vcfparty_", "")
+timed("R4.8", "CLI run: non-zero stage exit -> blocky exits 1, shard mentioned"):
+  let tmpDir = createTempDir("blocky_", "")
   let outp_template = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n 1 -o {outp_template} {SmallVcf} --- false")
-  doAssert code != 0, "non-zero stage should make vcfparty exit non-zero"
+  doAssert code != 0, "non-zero stage should make blocky exit non-zero"
   doAssert "shard 1" in outp, &"stderr should mention 'shard 1', got:\n{outp}"
   removeDir(tmpDir)
 
@@ -314,7 +314,7 @@ timed("R4.8", "CLI run: non-zero stage exit -> vcfparty exits 1, shard mentioned
 # R4.9 — testCliRunColonColon: ::: separator works at CLI level
 # ---------------------------------------------------------------------------
 timed("R4.9", "CLI run: ::: separator works like ---"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outFile = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n 2 -o {outFile} {SmallVcf} ::: cat")
   doAssert code == 0, &"::: separator exited {code}:\n{outp}"
@@ -326,7 +326,7 @@ timed("R4.9", "CLI run: ::: separator works like ---"):
 # ---------------------------------------------------------------------------
 timed("R4.10", "CLI run: -- inside stage passed through to bcftools"):
   # bcftools view -Oz -- - reads stdin, writes bgzipped VCF to stdout.
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outFile = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n 1 -o {outFile} {SmallVcf} --- bcftools view -Oz -- -")
   doAssert code == 0, &"-- passthrough exited {code}:\n{outp}"
@@ -338,7 +338,7 @@ timed("R4.10", "CLI run: -- inside stage passed through to bcftools"):
 # R4.11 — testCliRunNoKill: --no-kill flag accepted; run completes normally
 # ---------------------------------------------------------------------------
 timed("R4.11", "CLI run: --no-kill flag accepted, all shards complete normally"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outFile = tmpDir / "out.vcf.gz"
   let (outp, code) = runBin(&"-n 2 --no-kill -o {outFile} {SmallVcf} --- cat")
   doAssert code == 0, &"run --no-kill exited {code}:\n{outp}"
@@ -431,7 +431,7 @@ timed("R6.11", "buildShellCmdForShard: width 1 for nShards=4"):
 # ---------------------------------------------------------------------------
 timed("R7.1", "tool-managed API: 2 workers, tool writes own output"):
   doAssert fileExists(SmallVcf), "fixture missing"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outTemplate = tmpDir / "out.{}.vcf.gz"
   let stages = @[@["bcftools", "view", "-Oz", "-o", outTemplate]]
   runPipeline(RunPipelineCfg(
@@ -453,7 +453,7 @@ timed("R7.1", "tool-managed API: 2 workers, tool writes own output"):
 # ---------------------------------------------------------------------------
 timed("R7.2", "tool-managed CLI: {} in tool cmd, no -o"):
   doAssert fileExists(SmallVcf), "fixture missing"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outTemplate = tmpDir / "out.{}.vcf.gz"
   let (outp, code) = execCmdEx(
     BinPath & " run -n 2 " & SmallVcf &
@@ -473,7 +473,7 @@ timed("R7.2", "tool-managed CLI: {} in tool cmd, no -o"):
 # ---------------------------------------------------------------------------
 timed("R7.3", "tool-managed CLI: -o present with {} -> warning, -o ignored"):
   doAssert fileExists(SmallVcf), "fixture missing"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outTemplate = tmpDir / "out.{}.vcf.gz"
   let (outp, code) = execCmdEx(
     BinPath & " run -n 2 -o " & tmpDir / "ignored.vcf.gz" &

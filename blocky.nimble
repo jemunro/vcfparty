@@ -1,10 +1,10 @@
 # Package
 version     = "0.1.0"
 author      = "munro.j"
-description = "Parallel processing of VCF files"
+description = "Parallel processing of bgzipped files"
 license     = "MIT"
 srcDir      = "src"
-bin         = @["vcfparty"]
+bin         = @["blocky"]
 
 # Dependencies
 requires "nim >= 2.0.0"
@@ -40,7 +40,7 @@ before build:
 
 task release, "Build release binary":
   buildLibdeflate()
-  exec "nim c -d:release src/vcfparty.nim"
+  exec "nim c -d:release src/blocky.nim"
 
 task test, "Run all tests":
   exec "nimble build"   # triggers before build hook → buildLibdeflate + nim compile

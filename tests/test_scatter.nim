@@ -9,8 +9,8 @@ import std/[algorithm, math, os, osproc, posix, strformat, strutils, tempfiles]
 import std/threadpool
 {.warning[Deprecated]: on.}
 import test_utils
-import "../src/vcfparty/vcf_utils"
-import "../src/vcfparty/scatter"
+import "../src/blocky/bgzf"
+import "../src/blocky/scatter"
 
 const DataDir  = "tests/data"
 const SmallVcf = DataDir / "small.vcf.gz"     # TBI indexed
@@ -176,7 +176,7 @@ proc checkShards(vcfPath: string; tmpl: string; n: int) =
 # SC12 — testScatter4ShardsTbi: 4 shards (TBI); BGZF structure, completeness, order, size balance
 # ---------------------------------------------------------------------------
 timed("SC5.1", "scatter TBI: 4 shards, completeness, order, balance"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let tmpl = tmpDir / "shard.{}.vcf.gz"
   scatter(SmallVcf, 4, tmpl)
   checkShards(SmallVcf, tmpl, 4)
@@ -196,7 +196,7 @@ timed("SC5.1", "scatter TBI: 4 shards, completeness, order, balance"):
 # ---------------------------------------------------------------------------
 timed("SC5.2", "scatter --force-scan: completeness, order"):
   ## scatter with forceScan=true on a fully indexed file — index is ignored.
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let tmpl = tmpDir / "shard.{}.vcf.gz"
   scatter(SmallVcf, 4, tmpl, 1, forceScan = true)
   checkShards(SmallVcf, tmpl, 4)
@@ -207,7 +207,7 @@ timed("SC5.2", "scatter --force-scan: completeness, order"):
 # ---------------------------------------------------------------------------
 timed("SC5.3", "scatter CSI: 4 shards, completeness, order"):
   doAssert fileExists(CsiVcf & ".csi"), "CSI fixture missing — run generate_fixtures.sh"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let tmpl = tmpDir / "shard.{}.vcf.gz"
   scatter(CsiVcf, 4, tmpl)
   checkShards(CsiVcf, tmpl, 4)
@@ -218,7 +218,7 @@ timed("SC5.3", "scatter CSI: 4 shards, completeness, order"):
 # ---------------------------------------------------------------------------
 timed("SC5.4", "scatter GZI: 4 shards, completeness, order"):
   if fileExists(GziVcf & ".gzi"):
-    let tmpDir = createTempDir("vcfparty_", "")
+    let tmpDir = createTempDir("blocky_", "")
     let tmpl = tmpDir / "shard.{}.vcf.gz"
     scatter(GziVcf, 4, tmpl)
     checkShards(GziVcf, tmpl, 4)
@@ -382,7 +382,7 @@ proc checkBcfShards(bcfPath: string; tmpl: string; n: int) =
 # ---------------------------------------------------------------------------
 timed("SC7.1", "BCF scatter: 4 shards, completeness, order, balance"):
   doAssert fileExists(SmallBcf), &"BCF fixture missing: {SmallBcf}"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let tmpl = tmpDir / "shard.{}.bcf"
   scatter(SmallBcf, 4, tmpl, format = ffBcf)
   checkBcfShards(SmallBcf, tmpl, 4)
@@ -400,7 +400,7 @@ timed("SC7.1", "BCF scatter: 4 shards, completeness, order, balance"):
 # ---------------------------------------------------------------------------
 timed("SC7.2", "BCF scatter: chr22_1kg.bcf large header, 4 shards"):
   doAssert fileExists(KgBcf), &"large BCF fixture missing: {KgBcf}"
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let tmpl = tmpDir / "shard.{}.bcf"
   scatter(KgBcf, 4, tmpl, format = ffBcf)
   checkBcfShards(KgBcf, tmpl, 4)

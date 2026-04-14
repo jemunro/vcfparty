@@ -1,7 +1,7 @@
-## run — scatter a VCF into N shards and pipe each through a tool pipeline.
+## run — scatter a bgzipped file into N shards and pipe each through a tool pipeline.
 ##
 ## This module is responsible for:
-##   1. Parsing the "---"-separated argv into vcfparty args + pipeline stages.
+##   1. Parsing the "---"-separated argv into blocky args + pipeline stages.
 ##   2. Building the sh -c command string for each shard.
 ##   3. Mode inference from -o / {} flags.
 ##   4. Executing per-shard pipelines concurrently (all N shards run at once).
@@ -11,7 +11,7 @@ import std/[atomics, cpuinfo, os, posix, sequtils, strformat, strutils, tempfile
 import std/threadpool
 {.warning[Deprecated]: on.}
 import scatter
-import vcf_utils
+import bgzf
 import gather
 
 # ---------------------------------------------------------------------------
@@ -24,7 +24,7 @@ proc isSep(tok: string): bool {.inline.} =
 
 proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
   ## Split argv at "---" / ":::" separators.
-  ## Returns (vcfpartyArgs, stages).
+  ## Returns (blockyArgs, stages).
   ## Exits 1 with a message if no separator is present or any stage is empty.
   var firstSep = -1
   for i, tok in argv:
@@ -32,26 +32,26 @@ proc parseRunArgv*(argv: seq[string]): (seq[string], seq[seq[string]]) =
       firstSep = i
       break
   if firstSep < 0:
-    stderr.writeLine "vcfparty run: at least one --- stage is required"
+    stderr.writeLine "blocky run: at least one --- stage is required"
     quit(1)
-  let vcfpartyArgs = argv[0 ..< firstSep]
+  let blockyArgs = argv[0 ..< firstSep]
 
   var stages: seq[seq[string]]
   var cur: seq[string]
   for i in firstSep + 1 ..< argv.len:
     if isSep(argv[i]):
       if cur.len == 0:
-        stderr.writeLine "vcfparty run: empty pipeline stage"
+        stderr.writeLine "blocky run: empty pipeline stage"
         quit(1)
       stages.add(cur)
       cur = @[]
     else:
       cur.add(argv[i])
   if cur.len == 0:
-    stderr.writeLine "vcfparty run: empty pipeline stage"
+    stderr.writeLine "blocky run: empty pipeline stage"
     quit(1)
   stages.add(cur)
-  result = (vcfpartyArgs, stages)
+  result = (blockyArgs, stages)
 
 # ---------------------------------------------------------------------------
 # Shell command construction
@@ -73,7 +73,7 @@ proc buildShellCmd*(stages: seq[seq[string]]): string =
 type RunMode* = enum
   rmFile,        ## concat thread writes to -o output file
   rmStdout,      ## concat thread writes to stdout (no -o, no {})
-  rmToolManaged  ## tool manages own output; vcfparty discards shard stdout
+  rmToolManaged  ## tool manages own output; blocky discards shard stdout
 
 proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
   ## Return true if any token in any stage contains an unescaped {}.
@@ -109,7 +109,7 @@ proc inferRunMode*(hasOutput: bool; hasBrace: bool): RunMode =
 
 proc substituteToken*(tok: string; shardNum: string): string =
   ## Replace each unescaped {} in tok with shardNum.
-  ## Replace \{} with a literal {} (backslash consumed by vcfparty).
+  ## Replace \{} with a literal {} (backslash consumed by blocky).
   ## Other characters are copied unchanged.
   var r = newStringOfCap(tok.len + shardNum.len)
   var i = 0
@@ -287,6 +287,7 @@ proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
 
     # Fork subprocess.
     let shardCmd = buildShellCmdForShard(stagesPtr[], idx, nTotalShards)
+    info(&"shard {idx + 1}/{nTotalShards}: {shardCmd}")
     let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutFd, shardCmd, idx)
     discard posix.close(stdinPipe[0])
     discard posix.close(stdoutFd)
@@ -306,6 +307,7 @@ proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
     var status: cint
     discard posix.waitpid(pid, status, 0)
     let code = int((status shr 8) and 0xff)
+    info(&"shard {idx + 1}: exit {code}")
     if code != 0:
       stderr.writeLine &"shard {idx + 1}: pipeline exited with code {code}"
       gAnyFailed.store(true, moRelease)
@@ -437,7 +439,8 @@ proc runPipeline*(cfg: RunPipelineCfg) =
   let nWorkers = min(cfg.nWorkers, nShards)
 
   # Create tmp dir for shard output files.
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
+  info(&"run: {nShards} shards, {nWorkers} workers, tmpDir={tmpDir}")
 
   # Reset global state.
   gNextShard.store(0, moRelaxed)
@@ -462,6 +465,9 @@ proc runPipeline*(cfg: RunPipelineCfg) =
         quit(1)
 
   # Spawn concat thread (unless tool-managed).
+  if cfg.toolManaged: info("run: tool-managed mode, no concat thread")
+  elif cfg.toStdout: info("run: concat to stdout")
+  else: info(&"run: concat to {cfg.outputPath}")
   var deposits = if cfg.toolManaged: DepositQueue() else: newDepositQueue(nShards)
   var concatFv: FlowVar[int]
   if not cfg.toolManaged:
@@ -491,4 +497,7 @@ proc runPipeline*(cfg: RunPipelineCfg) =
   deallocShared(chromBuf)
   try: removeDir(tmpDir) except OSError: discard
 
-  if gAnyFailed.load(moRelaxed): quit(1)
+  if gAnyFailed.load(moRelaxed):
+    info("run: pipeline failed")
+    quit(1)
+  info(&"run: complete, {nShards} shards processed")

@@ -99,7 +99,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # small_gzi.vcf.gz — same content as small.vcf.gz but GZI indexed only.
-# No .tbi or .csi is created alongside it so vcfparty's index-detection falls
+# No .tbi or .csi is created alongside it so blocky's index-detection falls
 # through to the .gzi scan-shortcut path — exercising parseGziBlockStarts.
 # ---------------------------------------------------------------------------
 GZI="${DATA_DIR}/small_gzi.vcf.gz"
@@ -114,7 +114,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # small_csi.vcf.gz — same content as small.vcf.gz but CSI indexed only.
-# No .tbi is created alongside it so vcfparty's index-detection falls through
+# No .tbi is created alongside it so blocky's index-detection falls through
 # to the .csi path — exercising parseCsiBlockStarts.
 # ---------------------------------------------------------------------------
 CSI="${DATA_DIR}/small_csi.vcf.gz"
@@ -202,6 +202,71 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# small.bed.gz — BED format derived from small.vcf.gz, TBI indexed.
+# Used to verify generic (non-VCF/BCF) format handling in scatter/run/gather.
+# No header lines — all data is records.
+# ---------------------------------------------------------------------------
+BED="${DATA_DIR}/small.bed.gz"
+if [[ ! -f "${BED}" ]]; then
+  echo "Generating ${BED} (BED from small.vcf.gz) ..."
+  bcftools query -f '%CHROM\t%POS0\t%END\t%ID\n' "${SMALL}" \
+    | sort -k1,1 -k2,2n \
+    | bgzip -c > "${BED}"
+  tabix -p bed "${BED}"
+  echo "  -> $(bgzip -d -c "${BED}" | wc -l) records, TBI index: ${BED}.tbi"
+else
+  echo "Skipping ${BED} (already exists)"
+fi
+
+# ---------------------------------------------------------------------------
+# small_noindex.tsv.gz — unindexed bgzipped TSV with a # header line.
+# No .tbi/.csi/.gzi — exercises the --force-scan / auto-scan fallback path.
+# ---------------------------------------------------------------------------
+TSV="${DATA_DIR}/small_noindex.tsv.gz"
+if [[ ! -f "${TSV}" ]]; then
+  echo "Generating ${TSV} (unindexed TSV from small.vcf.gz) ..."
+  {
+    printf "# CHROM\tPOS\tREF\tALT\n"
+    bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n' "${SMALL}"
+  } | bgzip -c > "${TSV}"
+  echo "  -> $(bgzip -d -c "${TSV}" | wc -l) lines (no index)"
+else
+  echo "Skipping ${TSV} (already exists)"
+fi
+
+# ---------------------------------------------------------------------------
+# gencode_5k.gtf.gz — first 5000 lines of GENCODE v49 primary GTF, TBI indexed.
+# Real-world GTF with ## comment headers. Optional — requires network.
+# ---------------------------------------------------------------------------
+GTF="${DATA_DIR}/gencode_5k.gtf.gz"
+GTF_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_49/gencode.v49.primary_assembly.basic.annotation.gtf.gz"
+
+if [[ ! -f "${GTF}" ]]; then
+  if command -v wget &>/dev/null || command -v curl &>/dev/null; then
+    echo "Downloading and subsampling ${GTF} (first 5000 lines) ..."
+    GTF_TMP="${DATA_DIR}/gencode_5k_tmp.gtf"
+    set +o pipefail
+    if command -v wget &>/dev/null; then
+      wget -q -O - "${GTF_URL}" | bgzip -d | head -n 5000 > "${GTF_TMP}"
+    else
+      curl -s -L "${GTF_URL}" | bgzip -d | head -n 5000 > "${GTF_TMP}"
+    fi
+    set -o pipefail
+    # Separate headers from data, sort data by chr+pos, reassemble.
+    grep '^#' "${GTF_TMP}" > "${GTF_TMP}.hdr" || true
+    grep -v '^#' "${GTF_TMP}" | sort -k1,1 -k4,4n > "${GTF_TMP}.body" || true
+    cat "${GTF_TMP}.hdr" "${GTF_TMP}.body" | bgzip -c > "${GTF}"
+    rm -f "${GTF_TMP}" "${GTF_TMP}.hdr" "${GTF_TMP}.body"
+    tabix -p gff "${GTF}"
+    echo "  -> $(bgzip -d -c "${GTF}" | wc -l) lines, TBI index: ${GTF}.tbi"
+  else
+    echo "Skipping ${GTF} (no wget or curl found)"
+  fi
+else
+  echo "Skipping ${GTF} (already exists)"
+fi
+
+# ---------------------------------------------------------------------------
 # chr22_1kg_50k.vcf.gz — large perf fixture (--perf only)
 # 50,000 records from 1000 Genomes chr22, all 2504 samples, TBI indexed.
 # Used for benchmarking; not required for the standard test suite.
@@ -234,4 +299,4 @@ fi
 
 echo ""
 echo "All fixtures ready in ${DATA_DIR}/"
-ls -lh "${DATA_DIR}"/*.vcf.gz "${DATA_DIR}"/*.bcf "${DATA_DIR}"/*.tbi "${DATA_DIR}"/*.csi 2>/dev/null || true
+ls -lh "${DATA_DIR}"/*.vcf.gz "${DATA_DIR}"/*.bcf "${DATA_DIR}"/*.bed.gz "${DATA_DIR}"/*.gtf.gz "${DATA_DIR}"/*.tsv.gz "${DATA_DIR}"/*.tbi "${DATA_DIR}"/*.csi 2>/dev/null || true

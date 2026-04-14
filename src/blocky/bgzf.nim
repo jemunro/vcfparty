@@ -1,9 +1,18 @@
-## vcf_utils — BGZF I/O, VCF/BCF format types, and format sniffing.
+## bgzf — BGZF I/O, format types, index parsing, and format sniffing.
 ##
 ## Only external dependency: libdeflate (-ldeflate), no htslib required.
 ## All proc signatures use explicit types per project style guide.
 
 import std/[algorithm, os, strformat, strutils]
+
+# ---------------------------------------------------------------------------
+# Verbose logging — enabled by -v flag, shared across all modules
+# ---------------------------------------------------------------------------
+
+var verbose* = false
+
+template info*(msg: string) =
+  if verbose: stderr.writeLine "info: " & msg
 
 # ---------------------------------------------------------------------------
 # Format types

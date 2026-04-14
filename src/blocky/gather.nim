@@ -2,7 +2,7 @@
 
 import std/[os, strformat, strutils]
 import std/posix
-import vcf_utils
+import bgzf
 
 # ---------------------------------------------------------------------------
 # Types
@@ -333,6 +333,7 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
     return 0
 
   let (fmt, isBgzf) = sniffStreamFormat(readBuf.toOpenArray(0, initRead.int - 1))
+  info(&"intercept shard {shardIdx}: {fmt}, bgzf={isBgzf}")
 
   # Phase B: accumulate header.
   var rawAccum: seq[byte]
@@ -380,6 +381,7 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
       copyMem(addr chromBufPtr[].buf[0], unsafeAddr chromLine[0], sz)
     chromBufPtr[].len = sz.int32
     chromBufPtr[].ready = true
+    info(&"shard 0: #CHROM stored ({sz} bytes)")
   else:
     while not chromBufPtr[].ready: sleep(1)
     let refLen = chromBufPtr[].len.int
@@ -524,6 +526,7 @@ proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
     quit(1)
 
   # ── Phase 1: read shard 0, detect format, validate #CHROM ──────────────────
+  info(&"gather: {inputPaths.len} shards")
   let s0Size = getFileSize(inputPaths[0]).int
   var s0Bytes = newSeqUninit[byte](s0Size)
   block:
@@ -566,3 +569,4 @@ proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
   if cfg.compression == compBgzf:
     discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
   if not cfg.toStdout: outFile.close()
+  info(&"gather: complete, {inputPaths.len} shards concatenated")

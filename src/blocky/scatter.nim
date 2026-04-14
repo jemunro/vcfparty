@@ -1,28 +1,21 @@
-## scatter — split a bgzipped VCF/BCF into N shards.
+## scatter — split a bgzipped file into N shards.
 ##
 ## This module is focused on the sharding algorithm itself:
 ##   - sequential scatter (`computeShards`, `doWriteShard`, `scatter`)
-##   - interleaved scatter (`interleavedBlockAssignment`, `writeInterleavedShard`,
-##     the inbox handoff primitive for partial-record exchange between workers)
 ##
-## VCF/BCF format knowledge — BGZF I/O, TBI/CSI index parsing, header
-## extraction (`extractBcfHeader`, `getHeaderAndFirstBlock`), block-length
-## maths and BCF record walking — lives in `vcf_utils`.
+## Format knowledge — BGZF I/O, TBI/CSI index parsing, header extraction
+## (`extractBcfHeader`, `getHeaderAndFirstBlock`), block-length maths and
+## BCF record walking — lives in `bgzf`.
 
 import std/[algorithm, cpuinfo, os, posix, sequtils, strformat, strutils]
 {.warning[Deprecated]: off.}
 import std/threadpool
 {.warning[Deprecated]: on.}
-import vcf_utils
+import bgzf
 
 # ---------------------------------------------------------------------------
 # Optional info-level logging (enabled by --info flag via main.nim)
 # ---------------------------------------------------------------------------
-
-var verbose* = false
-
-template info(msg: string) =
-  if verbose: stderr.writeLine "info: " & msg
 
 # ---------------------------------------------------------------------------
 # Output path helpers
@@ -40,7 +33,7 @@ proc shardOutputPath*(tmpl: string; shardIdx: int; nShards: int): string =
   let prefixed = "shard_" & padded & "." & base
   result = if dir.len == 0: prefixed else: dir / prefixed
 
-# FileFormat and Compression are imported from vcf_utils.
+# FileFormat and Compression are imported from bgzf.
 
 # ---------------------------------------------------------------------------
 # Shard writing helpers
@@ -133,7 +126,7 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
     firstBlockOff = fdbo
     firstUOff = uOff
   else:
-    # VCF: header from BGZF scan; first block offset.
+    # Text/VCF: header from BGZF scan; first block offset.
     let (hb, fb) = getHeaderAndFirstBlock(vcfPath)
     headerBytes = hb
     firstBlockOff = fb
@@ -141,7 +134,7 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
 
   # Build the list of virtual offsets used as candidate boundary points.
   var voffs: seq[(int64, int)]
-  if forceScan and format == ffVcf:
+  if forceScan and format != ffBcf:
     info("--force-scan: ignoring index, scanning all BGZF blocks")
     let starts = scanBgzfBlockStarts(vcfPath, startAt = firstBlockOff,
                                      endAt = fileSize - 28)
@@ -151,6 +144,9 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
   else:
     voffs = readIndexVirtualOffsets(vcfPath)
     voffs.keepItIf(it[0] >= firstBlockOff)
+    if voffs.len > 0:
+      let indexType = if fileExists(vcfPath & ".csi"): "CSI" elif fileExists(vcfPath & ".tbi"): "TBI" else: "index"
+      info(&"index: {indexType} with {voffs.len} offsets for {vcfPath}")
     if voffs.len == 0:
       # No TBI/CSI index — try .gzi as a scan shortcut, else full scan.
       let gziPath = vcfPath & ".gzi"
@@ -175,10 +171,21 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
   if firstVO notin voffs: voffs.add(firstVO)
   voffs.sort(proc(a, b: (int64, int)): int =
     if a[0] != b[0]: cmp(a[0], b[0]) else: cmp(a[1], b[1]))
+  let preDedup = voffs.len
+  # Collapse to one entry per block_off, picking the middle u_off.  This
+  # guarantees no two consecutive shard boundaries share a BGZF block (which
+  # would cause data duplication in the tail+head concatenation), and the
+  # middle u_off gives the most balanced head/tail split (~L/2 each).
   var deduped: seq[(int64, int)]
-  for i, v in voffs:
-    if i == 0 or v != voffs[i - 1]: deduped.add(v)
+  var groupStart = 0
+  for i in 0 ..< voffs.len:
+    if i == voffs.len - 1 or voffs[i + 1][0] != voffs[i][0]:
+      let mid = (groupStart + i) div 2
+      deduped.add(voffs[mid])
+      groupStart = i + 1
   voffs = deduped
+  if preDedup != voffs.len:
+    info(&"dedup: {preDedup} -> {voffs.len} unique block offsets")
   info(&"computeShards: {voffs.len} virtual offsets, firstData=({firstBlockOff},{firstUOff})")
 
   # If nShards > voffs.len there are not enough index entries to place shard

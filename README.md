@@ -1,16 +1,16 @@
-# vcfparty
+# blocky
 
-Parallelise VCF/BCF processing by splitting files along BGZF block boundaries and piping each shard through a tool pipeline concurrently.
+Parallelise processing of bgzipped files by splitting along BGZF block boundaries and piping each shard through a tool pipeline concurrently. Works with any BGZF+TBI/CSI file: VCF, BCF, BED, GFF, GTF, TSV, or any newline-delimited bgzipped format.
 
 ---
 
 ## How it works
 
-A bgzipped VCF or BCF is a sequence of independent BGZF blocks, each containing up to 64 KiB of uncompressed data. Because blocks are self-contained, any block boundary is a valid split point — the file can be divided into shards without decompressing the data in between.
+A bgzipped file is a sequence of independent BGZF blocks, each containing up to 64 KiB of uncompressed data. Because blocks are self-contained, any block boundary is a valid split point — the file can be divided into shards without decompressing the data in between.
 
-vcfparty uses the tabix (TBI) or CSI index to obtain coarse block offsets, then refines those to exact BGZF block boundaries within a small byte window around each split point. Each shard receives a recompressed header and a recompressed boundary block; the blocks in between are byte-copied directly from disk without decompression.
+blocky uses the tabix (TBI), CSI, or GZI index to obtain block offsets, then splits the file at those boundaries. Each shard receives a recompressed header and a recompressed boundary block; the blocks in between are byte-copied directly from disk without decompression.
 
-Only one block per split point is ever decompressed and recompressed. For a file split into N shards, that is N−1 boundary blocks regardless of file size.
+Only one block per split point is ever decompressed and recompressed. For a file split into N shards, that is N-1 boundary blocks regardless of file size.
 
 ---
 
@@ -18,12 +18,12 @@ Only one block per split point is ever decompressed and recompressed. For a file
 
 ```bash
 # Requires Nim >= 2.0 and cmake (used once to build the vendored compression library)
-git clone https://github.com/jemunro/vcfparty vcfparty
-cd vcfparty
+git clone https://github.com/jemunro/blocky
+cd blocky
 nimble release
 ```
 
-The first build downloads and compiles the compression library automatically. Subsequent builds skip that step. `bcftools` (or any other tool) is a runtime dependency for pipeline use but is not needed at build time.
+The first build downloads and compiles libdeflate automatically. Subsequent builds skip that step. Tools like `bcftools` are runtime dependencies for pipeline use but not needed at build time.
 
 For offline or HPC use, place `vendor/libdeflate-1.25.tar.gz` in the repo before running `nimble release` to skip the download.
 
@@ -33,19 +33,22 @@ For offline or HPC use, place `vendor/libdeflate-1.25.tar.gz` in the repo before
 
 ```bash
 # Split a VCF into 8 shards
-vcfparty scatter -n 8 -o output.vcf.gz input.vcf.gz
+blocky scatter -n 8 -o output_{}.vcf.gz input.vcf.gz
 
-# Filter in parallel, keep per-shard outputs
-vcfparty run -n 8 -o filtered.vcf.gz input.vcf.gz \
+# Filter in parallel (4 workers, each processing 2 shards sequentially)
+blocky run -n 4 -m 2 -o filtered.vcf.gz input.vcf.gz \
   ::: bcftools view -i "GT='alt'" -Oz
 
-# Filter and gather into a single file
-vcfparty run --gather -n 8 -o filtered.vcf.gz input.vcf.gz \
-  ::: bcftools view -i "GT='alt'" -Oz
-
-# Tool-managed: tool writes per-shard files using {} in the command
-vcfparty run -n 8 input.vcf.gz \
+# Tool-managed output: tool writes per-shard files using {} placeholder
+blocky run -n 8 input.vcf.gz \
   ::: bcftools view -i "GT='alt'" -Oz -o output.{}.vcf.gz
+
+# Process a BED file
+blocky run -n 4 --clamp-shards -o out.bed.gz input.bed.gz ::: cat
+
+# Compress/decompress (like bgzip)
+blocky compress input.vcf
+blocky decompress input.vcf.gz
 ```
 
 ---
@@ -54,290 +57,198 @@ vcfparty run -n 8 input.vcf.gz \
 
 ### `scatter`
 
-Split input into N shards. Each shard is a valid standalone VCF/BCF file.
+Split input into N shards. Each shard is a valid standalone file with its own header.
 
 ```
-vcfparty scatter -n <n> -o <o> [options] <input>
+blocky scatter -n <n_shards> -o <output> [options] <input>
 ```
 
-| Flag | Long form | Description |
-|---|---|---|
-| `-n` | `--n-shards` | Number of shards (required, ≥ 1) |
-| `-o` | `--output` | Output path or suffix. Required. |
-| `-t` | `--max-threads` | Max threads for scatter/validation (default: min(n, 8)) |
-| | `--force-scan` | Ignore index, scan all BGZF blocks — VCF only; exits 1 for BCF |
-| `-v` | `--verbose` | Print progress to stderr |
-| `-h` | `--help` | Show usage |
+| Flag | Description |
+|---|---|
+| `-n`/`--n-shards` | Number of shards (required, >= 1) |
+| `-o`/`--output` | Output path template (required). Use `{}` for shard number. |
+| `-t`/`--max-threads` | Max threads for scatter (default: min(n, 8)) |
+| `--force-scan` | Ignore index, scan all BGZF blocks (not valid for BCF) |
+| `--clamp-shards` | Reduce -n if fewer split points available (instead of erroring) |
+| `-v`/`--verbose` | Print progress to stderr |
 
 ```bash
-# Scatter into 4 shards using the {} placeholder
-vcfparty scatter -n 4 -o output.{}.vcf.gz input.vcf.gz
-# → output.1.vcf.gz  output.2.vcf.gz  output.3.vcf.gz  output.4.vcf.gz
+blocky scatter -n 4 -o output.{}.vcf.gz input.vcf.gz
+# -> output.1.vcf.gz  output.2.vcf.gz  output.3.vcf.gz  output.4.vcf.gz
 
-# BCF requires a CSI index
-vcfparty scatter -n 4 -o output.bcf input.bcf
+blocky scatter -n 4 -o output.bcf input.bcf
 ```
 
-BCF input requires a `.csi` index alongside the file (`bcftools index input.bcf`). VCF input uses a TBI or CSI index if present; if no index is found, all BGZF blocks are scanned directly and a warning is printed. Use `--force-scan` to force this path explicitly.
+**Index priority**: CSI > TBI > GZI > block scan. BCF requires a CSI index. VCF/text uses whichever index is found; if none, blocks are scanned directly (with a warning).
 
 ---
 
 ### `run`
 
-Scatter and pipe each shard through a tool pipeline in parallel. Without `--gather`, writes N per-shard output files. `-o` is optional when `{}` appears in the tool command (tool-managed mode — see below).
+Scatter and pipe each shard through a tool pipeline in parallel. Workers pull shards from a shared queue; a concat thread reassembles output in order.
 
 ```
-vcfparty run -n <n> [-o <o>] [options] <input> ::: <cmd> [::: <cmd> ...]
+blocky run -n <n_workers> [-m <shards_per_worker>] [options] <input> ::: <cmd> [args...]
 ```
 
-| Flag | Long form | Description |
-|---|---|---|
-| `-n` | `--n-shards` | Number of shards (required, ≥ 1) |
-| `-o` | `--output` | Output path or suffix. Required unless `{}` is in the tool command or `--gather` is set. |
-| `-j` | `--max-jobs` | Max concurrent shard pipelines (default: n-shards) |
-| `-t` | `--max-threads` | Max threads for scatter/validation (default: min(max-jobs, 8)) |
-| | `--force-scan` | Ignore index, scan all BGZF blocks — VCF only; exits 1 for BCF |
-| | `--no-kill` | On failure, let sibling shards finish (default: kill siblings) |
-| `-v` | `--verbose` | Print per-shard progress to stderr |
-| `-h` | `--help` | Show usage |
+| Flag | Description |
+|---|---|
+| `-n`/`--n-workers` | Number of concurrent worker pipelines (required, >= 1) |
+| `-m`/`--max-shards-per-worker` | Max shards each worker processes sequentially (default: 1) |
+| `-o`/`--output` | Output path (optional; absent -> stdout) |
+| `-u` | Force uncompressed file output (error with `{}`) |
+| `-t`/`--max-threads` | Max threads for scatter (default: min(n, 8)) |
+| `--force-scan` | Ignore index, scan all BGZF blocks |
+| `--clamp-shards` | Reduce shard count if fewer split points available |
+| `--no-kill` | On failure, let sibling shards finish (default: kill them) |
+| `-v`/`--verbose` | Print per-shard progress to stderr |
+
+Total shards = `n * m`. Each worker processes up to `m` shards sequentially. The concat thread writes shard outputs to `-o` (or stdout) in order, stripping duplicate headers from shards 2..N.
 
 ```bash
-# 8 shards, at most 4 concurrent pipelines
-vcfparty run -n 8 -j 4 -o filtered.vcf.gz input.vcf.gz \
+# 4 workers, 2 shards each = 8 total shards
+blocky run -n 4 -m 2 -o filtered.vcf.gz input.vcf.gz \
   ::: bcftools view -i "GT='alt'" -Oz
+
+# Output to stdout (no -o)
+blocky run -n 4 input.vcf.gz ::: bcftools view -Ov | wc -l
+
+# Force uncompressed output
+blocky run -n 4 -u -o filtered.vcf input.vcf.gz \
+  ::: bcftools view -Ov
 ```
 
----
-
-### `run --gather`
-
-As `run`, but intercept each shard's stdout, strip duplicate headers from shards 2..N, and concatenate all outputs into a single file.
-
-```
-vcfparty run --gather [-o <o>] -n <n> [options] <input> ::: <cmd> [::: <cmd> ...]
-```
-
-In addition to the `run` flags:
-
-| Flag | Long form | Description |
-|---|---|---|
-| | `--gather` | Bare flag. Gather all shard outputs into single `-o` file |
-| | `--tmp-dir <dir>` | Temp dir for gather (default: `$TMPDIR/vcfparty` or `/tmp/vcfparty`) |
-| | `--header-pattern <pat>` | Strip lines with this prefix from shards 2..N — **text format only**; error if specified with VCF or BCF |
-| | `--header-n <n>` | Strip first N lines from shards 2..N — **text format only**; error if specified with VCF or BCF |
-
-`-o` is optional. If omitted or set to `/dev/stdout`, output is written to stdout uncompressed. Temp shard files are deleted on success; on failure they are left on disk and their paths are printed to stderr.
-
-```bash
-# Gather into a single BCF
-vcfparty run --gather -n 8 -o filtered.bcf input.bcf \
-  ::: bcftools view -i "GT='alt'" -Ob
-
-# Write to stdout
-vcfparty run --gather -n 8 input.vcf.gz \
-  ::: bcftools view -i "GT='alt'" -Oz | bcftools stats
-```
+**Subprocess stdin** is always decompressed (raw bytes). The interceptor thread detects the subprocess output format (BGZF or uncompressed) and handles header stripping and recompression automatically.
 
 ---
 
 ### `gather`
 
-Concatenate pre-existing shard files (output of `scatter` or `run`) into a single file. No temp files — reads directly from input files.
+Concatenate pre-existing shard files into a single output. Raw block copy with header stripping on shards 2..N.
 
 ```
-vcfparty gather [-o <o>] [options] <shard1> [<shard2> ...]
+blocky gather [-o <output>] [options] <shard1> [<shard2> ...]
 ```
 
-| Flag | Long form | Description |
-|---|---|---|
-| `-o` | `--output` | Output path (optional; omit for stdout) |
-| | `--header-pattern <pat>` | Strip lines with this prefix from shards 2..N — **text format only**; error if specified with VCF or BCF |
-| | `--header-n <n>` | Strip first N lines from shards 2..N — **text format only**; error if specified with VCF or BCF |
-| `-v` | `--verbose` | Print progress to stderr |
-| `-h` | `--help` | Show usage |
-
-`--header-pattern` and `--header-n` are mutually exclusive.
+| Flag | Description |
+|---|---|
+| `-o`/`--output` | Output path (optional; absent -> stdout) |
+| `-v`/`--verbose` | Print progress to stderr |
 
 ```bash
-vcfparty gather -o merged.vcf.gz shard_*.vcf.gz
-
-# Stdout (pipe to bcftools)
-vcfparty gather shard_*.vcf.gz | bcftools stats > stats.txt
+blocky gather -o merged.vcf.gz shard_*.vcf.gz
+blocky gather shard_*.vcf.gz | bcftools stats
 ```
+
+For VCF/BCF, the `#CHROM` line is validated byte-for-byte across all shards before writing. A mismatch exits with code 1 and no partial output is written.
 
 ---
 
-## Output file naming
+### `compress` / `decompress`
 
-### Without `{}`
-
-The shard number is prepended as `shard_XX.` to the filename component. Zero-padding width is determined by the number of shards:
+BGZF compression and decompression using blocky's libdeflate engine. Output is compatible with `bgzip` and `htslib`. Matches `bgzip` behavior: the input file is removed after successful operation.
 
 ```
--o output.vcf.gz, -n 8   →  shard_01.output.vcf.gz ... shard_08.output.vcf.gz
--o out.bcf, -n 4          →  shard_1.out.bcf ... shard_4.out.bcf
--o results.txt, -n 100    →  shard_001.results.txt ... shard_100.results.txt
+blocky compress   [-c] [file]
+blocky decompress [-c] [file]
 ```
 
-### With `{}`
+| Flag | Description |
+|---|---|
+| `-c`/`--stdout` | Write to stdout, keep original file |
 
-`{}` is replaced with the zero-padded shard number. It may appear anywhere in the path, including in a directory component:
-
+```bash
+blocky compress data.vcf       # -> data.vcf.gz (removes data.vcf)
+blocky decompress data.vcf.gz  # -> data.vcf (removes data.vcf.gz)
+cat data.vcf | blocky compress -c | blocky decompress -c  # pipe mode
 ```
--o output.{}.vcf.gz       →  output.01.vcf.gz ... output.08.vcf.gz
--o /results/{}/batch.bcf  →  /results/01/batch.bcf ... /results/08/batch.bcf
-```
 
-Parent directories are created automatically. With `--gather`, `-o` is the final output path — no shard numbering is applied to it.
+Errors if the output file already exists. Warns if compressing an already-compressed file or decompressing a non-compressed file.
+
+These subcommands are included for convenience (e.g. on systems without htslib). If `bgzip` is available, prefer it — it is multithreaded and better optimised for large files.
 
 ---
 
 ## Tool-managed output
 
-When `{}` appears in the tool command, vcfparty substitutes it with the zero-padded shard number in each per-shard pipeline invocation. If `-o` is absent, vcfparty enters tool-managed output mode: shard stdout is discarded and the tool is expected to write its own files using `{}`.
+When `{}` appears in the tool command and `-o` is absent, blocky enters tool-managed mode: subprocess stdout is discarded and the tool writes its own output files. `{}` is replaced with the zero-padded shard number.
 
 ```bash
-# Tool writes output.01.vcf.gz ... output.08.vcf.gz
-vcfparty run -n 8 input.vcf.gz \
+blocky run -n 8 input.vcf.gz \
   ::: bcftools view -Oz -o output.{}.vcf.gz
-
-# Multi-stage: {} only needed in the stage that writes the file
-vcfparty run -n 8 input.vcf.gz \
-  ::: bcftools view -i "GT='alt'" -Ou \
-  ::: bcftools view -s Sample -Oz -o filtered.{}.vcf.gz
 ```
 
-`{}` substitution also applies in normal (`-o`) and gather modes — the shard number is replaced in every tool command token that contains `{}`.
+To pass a literal `{}` to a tool, escape as `\{}` (use single quotes: `'\{}'`).
 
-To pass a literal `{}` to a tool without substitution, escape it as `\{}` (use single quotes in the shell: `'\{}'`). The backslash is consumed by vcfparty; the tool receives `{}`.
+| `-o` | `{}` in cmd | Mode |
+|---|---|---|
+| Yes | No | File output (concat thread writes to `-o`) |
+| No | No | Stdout output |
+| No | Yes | Tool-managed (tool writes its own files) |
+| Yes | Yes | Tool-managed (warning: `-o` ignored) |
 
-| `-o` present | `{}` in tool cmd | `--gather` | Mode |
-|---|---|---|---|
-| No | No | Yes | Gather → stdout |
-| Yes | No | Yes | Gather → `-o` file |
-| Yes | No | No | Normal — vcfparty writes shard files |
-| No | Yes | No | Tool-managed — tool writes its own files |
-| No | No | No | Error |
+---
 
-If `-o` is provided alongside `{}` in the tool command, a warning is printed and `-o` is ignored (tool-managed mode applies). If `--gather` and `{}` are both present, `{}` is substituted and gather proceeds normally.
+## Output file naming
+
+`{}` in the `-o` template is replaced with the zero-padded shard number:
+
+```
+-o output.{}.vcf.gz, -n 8   ->  output.1.vcf.gz ... output.8.vcf.gz
+-o /results/{}/out.bcf       ->  /results/1/out.bcf ... /results/4/out.bcf
+```
+
+Parent directories are created automatically.
+
+---
+
+## Supported formats
+
+| Format | Index | Notes |
+|--------|-------|-------|
+| bgzipped VCF (`.vcf.gz`) | TBI, CSI, or GZI | Auto-scan if no index (with warning) |
+| BCF (`.bcf`) | CSI required | No scan fallback |
+| BED, GFF, GTF, TSV (`.bed.gz`, `.gtf.gz`, etc.) | TBI, CSI, or GZI | `#`-prefixed header lines stripped automatically |
+
+Format is detected from file content (magic bytes), not from extension. Any BGZF file with `#`-prefixed headers works out of the box.
 
 ---
 
 ## Pipeline separator
 
-`:::` separates pipeline stages, which are joined with `|` and executed via `sh -c`. Multiple `:::` blocks define a multi-stage pipeline. `---` (three dashes) is also accepted as an alternative to `:::`.
-
-Both are chosen to avoid collision with tools (such as bcftools plugins) that use `--` as their own argument separator.
+`:::` (or `---`) separates pipeline stages. Stages are joined with `|` and executed via `sh -c`.
 
 ```bash
-# Multi-stage pipeline
-vcfparty run -n 8 -o out.vcf.gz input.vcf.gz \
+blocky run -n 8 -o out.vcf.gz input.vcf.gz \
   ::: bcftools view -i "GT='alt'" -Ou \
   ::: bcftools view -s Sample -Oz
 ```
 
 ---
 
-## Supported formats
+## Performance
 
-| Format | Input | Output | Index required |
-|--------|-------|--------|----------------|
-| bgzipped VCF (`.vcf.gz`) | ✓ | ✓ | TBI or CSI (auto-scan if absent, with warning) |
-| BCF (`.bcf`) | ✓ | ✓ | CSI (required) |
-
-Format conversion between VCF and BCF is the user's responsibility via the pipeline (e.g. `::: bcftools view -Ob`). If the input and output extensions suggest different formats, a warning is printed to stderr but processing continues.
-
----
-
-## Gather format inference
-
-The output format for `run --gather` and `gather` is inferred from the `-o` extension (case-insensitive). `.gz` and `.bgz` are treated identically.
-
-| Extension | Format | Compression |
-|---|---|---|
-| `.vcf.gz` or `.vcf.bgz` | VCF | BGZF |
-| `.vcf` | VCF | Uncompressed |
-| `.bcf` | BCF | BGZF |
-| `.gz` or `.bgz` (any other stem) | Text | BGZF |
-| Anything else | Text | Uncompressed |
-
-Any extension not matching VCF or BCF is treated as text. When `-o` is omitted or set to `/dev/stdout`, output is written uncompressed.
-
----
-
-## Advanced examples
-
-```bash
-# Multi-stage pipeline: filter then annotate
-vcfparty run --gather -n 8 -o annotated.bcf input.vcf.gz \
-  ::: bcftools view -i "GT='alt'" -Ou \
-  ::: bcftools +fill-tags -Ob -- -t AF,AC
-
-# VEP annotation in parallel
-vcfparty run --gather -n 8 -o annotated.vcf.gz input.vcf.gz \
-  ::: vep --format vcf --vcf --cache --offline --no_stats -o stdout
-
-# bcftools query to text
-vcfparty run --gather -n 8 -o variants.txt input.vcf.gz \
-  ::: bcftools query -f '%CHROM\t%POS\t%REF\t%ALT\n'
-
-# Pipe gather output to stdout
-vcfparty gather shard_*.vcf.gz | bcftools stats > stats.txt
-
-# Per-shard output directories (created automatically)
-vcfparty run -n 8 -o /results/{}/out.vcf.gz input.vcf.gz \
-  ::: bcftools view -i "GT='alt'" -Oz
-
-# Limit concurrency on a shared node: 32 shards, 8 at a time
-vcfparty run --gather -n 32 -j 8 -o filtered.bcf input.bcf \
-  ::: bcftools view -i "GT='alt'" -Ob
-
-# BCF scatter with CSI index
-vcfparty scatter -n 4 -o output.bcf input.bcf
-
-# Tool-managed: bcftools writes per-shard files, vcfparty discards stdout
-vcfparty run -n 8 input.vcf.gz \
-  ::: bcftools view -i "GT='alt'" -Oz -o filtered.{}.vcf.gz
-```
-
----
-
-## Header validation
-
-When gathering VCF or BCF output, vcfparty checks that the `#CHROM` line (the sample column header) is byte-for-byte identical across all shards before writing any output. A mismatch exits with code 1 and no partial output is written. This catches cases where shards were inadvertently produced from different sample sets.
+- Middle BGZF blocks are byte-copied at disk bandwidth — no decompression
+- Only N-1 boundary blocks are decompressed per scatter (one per split point)
+- Worker pool model: `-n` workers pull from a shared shard queue, keeping all cores busy even when shard processing times vary
+- Tmp shard files are BGZF-compressed (saves disk), decompressed on-the-fly during concat if `-u` is set
+- For CPU-heavy tools (VEP, GATK), combine blocky's `-n` with the tool's own threading
 
 ---
 
 ## Limitations
 
-- BCF input requires a CSI index (`bcftools index input.bcf`). There is no auto-scan fallback for BCF.
-- Tools in the pipeline must read from stdin. In normal and gather modes they must also write to stdout; in tool-managed mode (`{}` in the tool command) they may write to their own files instead. Tools requiring seekable input are not supported.
-- Format conversion between VCF and BCF is not automatic — use `bcftools view -Ob` or similar within the pipeline.
-
----
-
-## Performance notes
-
-Middle BGZF blocks are byte-copied at disk bandwidth with no decompression. Only the boundary blocks — one per split point — are decompressed and recompressed. The cost of splitting scales with the number of shards, not the file size.
-
-`-j` controls how many shard pipelines run concurrently and is independent of `-t` (scatter thread count). Set `-j` based on available cores and the concurrency of the tool being run.
-
-For CPU-heavy tools such as VEP, combining vcfparty's `-j` with the tool's own threading flag (e.g. `--fork`) can reduce wall time further, keeping the total thread count within available cores.
+- BCF requires a CSI index (`bcftools index input.bcf`). No scan fallback for BCF.
+- Tools must read from stdin and write to stdout (or use `{}` for tool-managed output).
+- Format conversion (VCF <-> BCF) is the pipeline's responsibility.
+- BAM/CRAM are explicitly not supported — reads span block boundaries, making block-level splitting produce incorrect results.
 
 ---
 
 ## Development
 
 ```bash
-# Build
-nimble release
-
-# Tests (requires bcftools, bgzip, tabix on PATH)
-bash tests/generate_fixtures.sh
-nimble test
-
-# Performance benchmark (downloads large fixture)
-bash tests/generate_fixtures.sh --perf
-time vcfparty run --gather -n 8 -j 4 -o out.vcf.gz \
-  tests/data/chr22_1kg_full.vcf.gz ::: bcftools view -Oz
+nimble release          # build
+nimble test             # run all tests (requires bcftools, bgzip, tabix)
+bash tests/generate_fixtures.sh  # regenerate test fixtures
 ```

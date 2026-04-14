@@ -6,8 +6,8 @@ echo "--------------- Test Gather ---------------"
 import std/[os, osproc, strformat, strutils, tempfiles]
 import std/posix
 import test_utils
-import "../src/vcfparty/gather"
-import "../src/vcfparty/vcf_utils"
+import "../src/blocky/gather"
+import "../src/blocky/bgzf"
 
 const DataDir  = "tests/data"
 const SmallVcf = DataDir / "small.vcf.gz"
@@ -92,7 +92,7 @@ timed("G1.2", "inferFileFormat: fmtOverride overrides format"):
 # ---------------------------------------------------------------------------
 
 const SelfSrc   = "tests/test_gather.nim"
-const HelperBin = "/tmp/vcfparty_test_gather_helper"
+const HelperBin = "/tmp/blocky_test_gather_helper"
 
 timed("G1.0", "buildHelper: compiled exit-1 test helper"):
   let (outp, code) = execCmdEx(
@@ -201,7 +201,7 @@ timed("G2.3", "stripBcfHeader"):
 # G5 — Integration tests via compiled binary
 # ===========================================================================
 
-const BinPath = "./vcfparty"
+const BinPath = "./blocky"
 
 timed("G5.0", "binary available"):
   if not fileExists(BinPath):
@@ -231,7 +231,7 @@ proc runGatherSubcmd(args: string): (string, int) =
 # ---------------------------------------------------------------------------
 
 timed("G6.1", "gather subcommand VCF: records, content hash matches"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let shardTemplate = tmpDir / "shard.{}.vcf.gz"
   # Scatter into 4 shards via CLI.
   let (sOutp, sCode) = execCmdEx(
@@ -258,7 +258,7 @@ timed("G6.1", "gather subcommand VCF: records, content hash matches"):
 # ---------------------------------------------------------------------------
 
 timed("G6.2", "gather subcommand BCF: records, content hash matches"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let (sOutp, sCode) = execCmdEx(
     BinPath & &" scatter -n 4 -o {tmpDir}/shard.bcf {SmallBcf} 2>&1")
   doAssert sCode == 0, &"G8.2 scatter exited {sCode}:\n{sOutp}"
@@ -282,7 +282,7 @@ timed("G6.2", "gather subcommand BCF: records, content hash matches"):
 # ---------------------------------------------------------------------------
 
 timed("G6.3", "gather subcommand stdout: records written to stdout"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let (sOutp, sCode) = execCmdEx(
     BinPath & &" scatter -n 4 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
   doAssert sCode == 0, &"G8.3 scatter exited {sCode}:\n{sOutp}"
@@ -306,7 +306,7 @@ timed("G6.3", "gather subcommand stdout: records written to stdout"):
 # ---------------------------------------------------------------------------
 
 timed("G6.4", "gather subcommand: no input files exits non-zero"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGatherSubcmd(&"-o {outPath}")
   doAssert code != 0, "G8.4: no inputs should exit non-zero"
@@ -317,7 +317,7 @@ timed("G6.4", "gather subcommand: no input files exits non-zero"):
 # ---------------------------------------------------------------------------
 
 timed("G6.5", "gather subcommand: missing input file exits non-zero"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let outPath = tmpDir / "out.vcf.gz"
   let (outp, code) = runGatherSubcmd(&"-o {outPath} /nonexistent/shard.vcf.gz")
   doAssert code != 0, "G8.5: missing input file should exit non-zero"
@@ -406,7 +406,7 @@ timed("G7.5", "chromLineFromFile: matches chromLineFromBytes result"):
 # ---------------------------------------------------------------------------
 
 timed("G7.6", "gather #CHROM match: success"):
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let (sOutp, sCode) = execCmdEx(
     BinPath & &" scatter -n 2 -o {tmpDir}/shard.vcf.gz {SmallVcf} 2>&1")
   doAssert sCode == 0, &"S2.6 scatter exited {sCode}:\n{sOutp}"
@@ -427,7 +427,7 @@ timed("G7.6", "gather #CHROM match: success"):
 
 timed("G7.7", "gather #CHROM mismatch: exits 1, no partial output"):
   # Build two synthetic BGZF-VCF files with different sample columns.
-  let tmpDir = createTempDir("vcfparty_", "")
+  let tmpDir = createTempDir("blocky_", "")
   let vcfA =
     "##fileformat=VCFv4.2\n" &
     "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSampleA\n" &

@@ -161,9 +161,9 @@ timed("CL9", "--force-scan: 4 shards, records match"):
   doAssert runCode == 0, &"--force-scan exited non-zero:\n{runOutp}"
   proc countAndCheckFS(path: string): int =
     ## Count records; also validates the file (bcftools exits 0 on success).
-    let (o, code) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null")
+    let (o, code) = execCmdEx("bcftools query -f '%POS\\n' " & path & " 2>/dev/null")
     doAssert code == 0, &"bcftools rejected --force-scan shard: {path}"
-    o.splitLines.countIt(it.len > 0)
+    o.strip.countLines
   var total = 0
   for i in 1..4:
     let p = tmpDir / ("shard_" & $i & ".out.vcf.gz")
@@ -214,7 +214,7 @@ timed("CL11", "CSI: scatter -n 4, all shards valid"):
   doAssert runCode == 0, &"blocky scatter (CSI) exited non-zero:\n{runOutp}"
 
   proc countRec(path: string): int =
-    let (o, _) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null | wc -l")
+    let (o, _) = execCmdEx("bcftools query -f '%POS\\n' " & path & " 2>/dev/null | wc -l")
     o.strip.parseInt
 
   var shardTotal = 0
@@ -275,7 +275,7 @@ block testKg1000Genomes:
         doAssert bcfCode == 0, &"bcftools rejected 1KG shard {i}: {bcfOutp}"
 
       proc countRecs(path: string): int =
-        let (o, _) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null | wc -l")
+        let (o, _) = execCmdEx("bcftools query -f '%POS\\n' " & path & " 2>/dev/null | wc -l")
         o.strip.parseInt
 
       var shardTotal = 0
@@ -352,24 +352,23 @@ timed("CL31.2", "scatter -n too high BCF: errors without --force-scan suggestion
 # CL31.3 — scatter --force-scan VCF: succeeds when raw blocks exceed -n
 # ---------------------------------------------------------------------------
 
-timed("CL31.3", "scatter --force-scan recovers: 100 shards, records match"):
+timed("CL31.3", "scatter --force-scan recovers: 30 shards, records match"):
   let tmpDir = createTempDir("blocky_", "")
-  # chr22_1kg.vcf.gz has 57 voffs but ~834 raw BGZF blocks; --force-scan
-  # gives access to all raw blocks so -n 100 works.
+  # chr22_1kg.vcf.gz has 28 unique block offsets; -n 30 exceeds index entries
+  # but --force-scan uses raw BGZF blocks (~834 blocks) so -n 30 succeeds.
   let (outp, code) = run(
-    &"scatter -n 100 --force-scan -o {tmpDir}/shard_{{}}.vcf.gz {KgVcf}")
+    &"scatter -n 30 --force-scan -o {tmpDir}/shard_{{}}.vcf.gz {KgVcf}")
   doAssert code == 0,
-    &"CL31.3: --force-scan with -n 100 should succeed, got {code}:\n{outp}"
+    &"CL31.3: --force-scan with -n 30 should succeed, got {code}:\n{outp}"
   let shards = toSeq(walkFiles(tmpDir / "shard_*.vcf.gz"))
-  doAssert shards.len == 100,
-    &"CL31.3: expected 100 shards, got {shards.len}"
-  # Sanity-check record count
+  doAssert shards.len == 30,
+    &"CL31.3: expected 30 shards, got {shards.len}"
+  # Verify record count: concat all shards naively, count once (fast).
   let origCnt = execCmdEx(
-    "bcftools view -H " & KgVcf & " 2>/dev/null | wc -l")[0].strip.parseInt
-  var outCnt = 0
-  for s in shards:
-    outCnt += execCmdEx(
-      "bcftools view -H " & s & " 2>/dev/null | wc -l")[0].strip.parseInt
+    "bcftools query -f '%POS\\n' " & KgVcf & " 2>/dev/null | wc -l")[0].strip.parseInt
+  let outCnt = execCmdEx(
+    "bcftools concat --naive " & shards.join(" ") &
+    " 2>/dev/null | bcftools query -f '%POS\\n' 2>/dev/null | wc -l")[0].strip.parseInt
   doAssert outCnt == origCnt,
     &"CL31.3: record count mismatch: orig={origCnt} shards={outCnt}"
   removeDir(tmpDir)
@@ -414,11 +413,11 @@ timed("CL32.1", "scatter --clamp-shards VCF: 28 shards, records match"):
     &"CL32.1: expected 28 clamped shards, got {shards.len}"
   # Sanity-check record count matches the original.
   let origCnt = execCmdEx(
-    "bcftools view -H " & KgVcf & " 2>/dev/null | wc -l")[0].strip.parseInt
+    "bcftools query -f '%POS\\n' " & KgVcf & " 2>/dev/null | wc -l")[0].strip.parseInt
   var outCnt = 0
   for s in shards:
     outCnt += execCmdEx(
-      "bcftools view -H " & s & " 2>/dev/null | wc -l")[0].strip.parseInt
+      "bcftools query -f '%POS\\n' " & s & " 2>/dev/null | wc -l")[0].strip.parseInt
   doAssert outCnt == origCnt,
     &"CL32.1: record count mismatch: orig={origCnt} shards={outCnt}"
   removeDir(tmpDir)

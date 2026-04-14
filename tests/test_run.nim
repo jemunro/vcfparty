@@ -135,7 +135,7 @@ timed("R2.3", "buildShellCmd: three stages"):
 # ===========================================================================
 
 proc countRecords(path: string): int =
-  let (o, _) = execCmdEx("bcftools view -HG " & path & " 2>/dev/null | wc -l")
+  let (o, _) = execCmdEx("bcftools query -f '%POS\\n' " & path & " 2>/dev/null | wc -l")
   o.strip.parseInt
 
 proc countTextLines(path: string): int =

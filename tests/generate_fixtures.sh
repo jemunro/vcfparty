@@ -98,6 +98,21 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# small_gzi.vcf.gz — same content as small.vcf.gz but GZI indexed only.
+# No .tbi or .csi is created alongside it so vcfparty's index-detection falls
+# through to the .gzi scan-shortcut path — exercising parseGziBlockStarts.
+# ---------------------------------------------------------------------------
+GZI="${DATA_DIR}/small_gzi.vcf.gz"
+if [[ ! -f "${GZI}" ]]; then
+  echo "Generating ${GZI} (GZI index only) ..."
+  cp "${SMALL}" "${GZI}"
+  bgzip --reindex "${GZI}"
+  echo "  -> GZI index: ${GZI}.gzi"
+else
+  echo "Skipping ${GZI} (already exists)"
+fi
+
+# ---------------------------------------------------------------------------
 # small_csi.vcf.gz — same content as small.vcf.gz but CSI indexed only.
 # No .tbi is created alongside it so vcfparty's index-detection falls through
 # to the .csi path — exercising parseCsiBlockStarts.

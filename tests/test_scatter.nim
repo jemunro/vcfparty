@@ -15,6 +15,7 @@ import "../src/vcfparty/scatter"
 const DataDir  = "tests/data"
 const SmallVcf = DataDir / "small.vcf.gz"     # TBI indexed
 const CsiVcf   = DataDir / "small_csi.vcf.gz" # CSI indexed only (no .tbi)
+const GziVcf   = DataDir / "small_gzi.vcf.gz" # GZI indexed only (no .tbi/.csi)
 const SmallBcf = DataDir / "small.bcf"
 const KgBcf    = DataDir / "chr22_1kg.bcf"
 
@@ -211,6 +212,19 @@ timed("SC5.3", "scatter CSI: 4 shards, completeness, order"):
   scatter(CsiVcf, 4, tmpl)
   checkShards(CsiVcf, tmpl, 4)
   removeDir(tmpDir)
+
+# ---------------------------------------------------------------------------
+# SC5.4 — scatter GZI: 4 shards (GZI scan shortcut); completeness, order
+# ---------------------------------------------------------------------------
+timed("SC5.4", "scatter GZI: 4 shards, completeness, order"):
+  if fileExists(GziVcf & ".gzi"):
+    let tmpDir = createTempDir("vcfparty_", "")
+    let tmpl = tmpDir / "shard.{}.vcf.gz"
+    scatter(GziVcf, 4, tmpl)
+    checkShards(GziVcf, tmpl, 4)
+    removeDir(tmpDir)
+  else:
+    echo "  [skipped — small_gzi.vcf.gz.gzi not found, run generate_fixtures.sh]"
 
 # ===========================================================================
 # SC16–SC20 — BCF: header extraction and scatter end-to-end

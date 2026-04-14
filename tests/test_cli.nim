@@ -423,3 +423,94 @@ timed("CL32.1", "scatter --clamp-shards VCF: 28 shards, records match"):
     &"CL32.1: record count mismatch: orig={origCnt} shards={outCnt}"
   removeDir(tmpDir)
 
+# ===========================================================================
+# CL40 — compress / decompress subcommands
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# CL40.1 — compress file, then decompress: round-trip identity
+# ---------------------------------------------------------------------------
+
+timed("CL40.1", "compress/decompress round-trip: file identity"):
+  let tmpDir = createTempDir("vcfparty_", "")
+  let rawPath = tmpDir / "small.vcf"
+  # Create a raw VCF by decompressing the fixture.
+  let (_, dec) = execCmdEx(&"bgzip -d -c {SmallVcf} > {rawPath}")
+  doAssert dec == 0, "failed to decompress fixture"
+  let origData = readFile(rawPath)
+
+  # Compress.
+  let (cOut, cCode) = run(&"compress {rawPath}")
+  doAssert cCode == 0, &"CL40.1: compress failed: {cOut}"
+  let gzPath = rawPath & ".gz"
+  doAssert fileExists(gzPath), "CL40.1: compressed file not created"
+
+  # Verify BGZF magic.
+  let gzData = readFile(gzPath)
+  doAssert gzData.len > 28, "CL40.1: compressed file too small"
+  doAssert gzData[0].byte == 0x1f and gzData[1].byte == 0x8b,
+    "CL40.1: missing gzip magic"
+
+  # Decompress.
+  let (dOut, dCode) = run(&"decompress {gzPath}")
+  doAssert dCode == 0, &"CL40.1: decompress failed: {dOut}"
+  doAssert fileExists(rawPath), "CL40.1: decompressed file not created"
+  let roundTrip = readFile(rawPath)
+  doAssert roundTrip == origData,
+    &"CL40.1: round-trip mismatch: orig={origData.len} got={roundTrip.len}"
+  removeDir(tmpDir)
+
+# ---------------------------------------------------------------------------
+# CL40.2 — compress -c / decompress -c: stdin/stdout pipe round-trip
+# ---------------------------------------------------------------------------
+
+timed("CL40.2", "compress/decompress -c: pipe round-trip"):
+  let tmpDir = createTempDir("vcfparty_", "")
+  let rawPath = tmpDir / "small.vcf"
+  discard execCmdEx(&"bgzip -d -c {SmallVcf} > {rawPath}")
+  let origMd5 = execCmdEx(&"md5sum {rawPath}")[0].split(' ')[0]
+
+  let pipeMd5 = execCmdEx(
+    &"cat {rawPath} | {BinPath} compress -c | {BinPath} decompress -c | md5sum")[0].split(' ')[0]
+  doAssert pipeMd5 == origMd5,
+    &"CL40.2: pipe round-trip md5 mismatch: orig={origMd5} got={pipeMd5}"
+  removeDir(tmpDir)
+
+# ---------------------------------------------------------------------------
+# CL40.3 — compress warns on already-compressed input
+# ---------------------------------------------------------------------------
+
+timed("CL40.3", "compress: warns on already-compressed input"):
+  let (outp, code) = run(&"compress -c {SmallVcf}")
+  # Should succeed but warn.
+  doAssert code == 0, &"CL40.3: expected exit 0, got {code}"
+  doAssert "already" in outp.toLowerAscii,
+    &"CL40.3: expected warning about already-compressed, got: {outp}"
+
+# ---------------------------------------------------------------------------
+# CL40.4 — decompress warns on non-compressed input
+# ---------------------------------------------------------------------------
+
+timed("CL40.4", "decompress: warns on non-compressed input"):
+  let tmpDir = createTempDir("vcfparty_", "")
+  let rawPath = tmpDir / "small.vcf.gz"  # named .gz but actually raw
+  writeFile(rawPath, "##fileformat=VCFv4.2\n#CHROM\tPOS\n")
+  let (outp, code) = run(&"decompress -c {rawPath}")
+  # Should warn about non-compressed input.
+  doAssert "not appear" in outp.toLowerAscii or "warning" in outp.toLowerAscii,
+    &"CL40.4: expected warning, got: {outp}"
+  removeDir(tmpDir)
+
+# ---------------------------------------------------------------------------
+# CL40.5 — decompress: non-.gz file without -c exits 1
+# ---------------------------------------------------------------------------
+
+timed("CL40.5", "decompress: non-.gz file without -c exits 1"):
+  let tmpDir = createTempDir("vcfparty_", "")
+  let rawPath = tmpDir / "data.vcf"
+  writeFile(rawPath, "test")
+  let (outp, code) = run(&"decompress {rawPath}")
+  doAssert code != 0, &"CL40.5: expected non-zero exit, got {code}: {outp}"
+  doAssert ".gz" in outp, &"CL40.5: error should mention .gz, got: {outp}"
+  removeDir(tmpDir)
+

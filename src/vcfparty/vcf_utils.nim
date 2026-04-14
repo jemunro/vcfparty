@@ -386,6 +386,41 @@ proc decompressCopyBytes*(srcPath: string; dst: File; start: int64; length: int6
     cur += blkSize.int64
 
 # ---------------------------------------------------------------------------
+# Streaming BGZF compress / decompress (File → File)
+# ---------------------------------------------------------------------------
+
+proc bgzfCompressStream*(inFile, outFile: File; level: int = 6) =
+  ## Read raw bytes from inFile, compress into BGZF blocks, write to outFile.
+  ## Appends a BGZF EOF block at the end.  Uses thread-local codec cache.
+  var buf = newSeqUninit[byte](BGZF_MAX_BLOCK_SIZE)
+  while true:
+    let n = readBytes(inFile, buf, 0, BGZF_MAX_BLOCK_SIZE)
+    if n == 0: break
+    compressToBgzfMulti(outFile, buf.toOpenArray(0, n - 1), level)
+  discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
+
+proc bgzfDecompressStream*(inFile, outFile: File) =
+  ## Read BGZF blocks from inFile, decompress each, write raw bytes to outFile.
+  ## Skips EOF blocks (ISIZE=0).  Uses thread-local decompressor and reusable
+  ## block buffer (grows once, never shrinks).
+  var blk = newSeqUninit[byte](BGZF_MAX_BLOCK_SIZE + BGZF_OVERHEAD)
+  while true:
+    let hdrRead = readBytes(inFile, blk, 0, 18)
+    if hdrRead < 18: break
+    let blkSize = bgzfBlockSize(blk)
+    if blkSize <= 0: break
+    if blkSize > blk.len: blk.setLen(blkSize)
+    if blkSize > 18:
+      let rest = readBytes(inFile, blk, 18, blkSize - 18)
+      if rest < blkSize - 18: break
+    # Skip EOF blocks (ISIZE = 0 in last 4 bytes).
+    let isize = leU32(blk, blkSize - 4)
+    if isize == 0: continue
+    let decompressed = decompressBgzf(blk.toOpenArray(0, blkSize - 1))
+    if decompressed.len > 0:
+      discard outFile.writeBytes(decompressed, 0, decompressed.len)
+
+# ---------------------------------------------------------------------------
 # Index parsing — TBI / CSI virtual offsets
 # ---------------------------------------------------------------------------
 
@@ -453,6 +488,26 @@ proc parseCsiVirtualOffsets*(csiPath: string): seq[(int64, int)] =
     if i == 0 or v != offsets[i - 1]:
       deduped.add(v)
   result = deduped
+
+proc parseGziBlockStarts*(gziPath: string): seq[int64] =
+  ## Parse a .gzi index and return sorted BGZF block start offsets.
+  ## GZI format: uint64 count, then count pairs of (compressed_off, uncompressed_off)
+  ## as uint64 LE.  Only compressed offsets are used — GZI is a scan shortcut,
+  ## not a virtual-offset index.
+  let data = cast[seq[byte]](readFile(gziPath))
+  if data.len < 8:
+    quit(&"parseGziBlockStarts: file too small: {gziPath}", 1)
+  var pos = 0
+  let count = readLeU64(data, pos).int
+  if data.len < 8 + count * 16:
+    quit(&"parseGziBlockStarts: truncated .gzi file: {gziPath} (expected {8 + count * 16} bytes, got {data.len})", 1)
+  result = newSeqOfCap[int64](count + 1)
+  result.add(0'i64)  # first block at offset 0 is implicit in GZI format
+  for _ in 0 ..< count:
+    let compOff = readLeU64(data, pos).int64
+    discard readLeU64(data, pos)  # skip cumulative uncompressed offset
+    result.add(compOff)
+  result.sort()
 
 proc readIndexVirtualOffsets*(vcfPath: string): seq[(int64, int)] =
   ## Detect a .csi or .tbi index and return sorted unique virtual offsets as

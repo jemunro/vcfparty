@@ -152,14 +152,23 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
     voffs = readIndexVirtualOffsets(vcfPath)
     voffs.keepItIf(it[0] >= firstBlockOff)
     if voffs.len == 0:
-      # No index for VCF — fall back to scanning all blocks.
-      stderr.writeLine &"warning: no index found for {vcfPath} — scanning BGZF blocks directly"
-      stderr.writeLine "  (create an index with 'tabix -p vcf' for faster operation)"
-      let starts = scanBgzfBlockStarts(vcfPath, startAt = firstBlockOff,
-                                       endAt = fileSize - 28)
-      info(&"scan: found {starts.len} data blocks")
-      for off in starts:
-        voffs.add((off, 0))
+      # No TBI/CSI index — try .gzi as a scan shortcut, else full scan.
+      let gziPath = vcfPath & ".gzi"
+      if fileExists(gziPath):
+        info(&"using GZI index: {gziPath}")
+        let starts = parseGziBlockStarts(gziPath)
+        info(&"GZI: {starts.len} block offsets")
+        for off in starts:
+          if off >= firstBlockOff:
+            voffs.add((off, 0))
+      else:
+        stderr.writeLine &"warning: no index found for {vcfPath} — scanning BGZF blocks directly"
+        stderr.writeLine "  (create an index with 'tabix -p vcf' for faster operation)"
+        let starts = scanBgzfBlockStarts(vcfPath, startAt = firstBlockOff,
+                                         endAt = fileSize - 28)
+        info(&"scan: found {starts.len} data blocks")
+        for off in starts:
+          voffs.add((off, 0))
 
   # Ensure the first data virtual offset is in the list, then sort + dedupe.
   let firstVO = (firstBlockOff, firstUOff)

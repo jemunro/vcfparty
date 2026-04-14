@@ -1,7 +1,7 @@
 ## vcfparty CLI — argument parsing and subcommand dispatch.
 ## Entry point is src/vcfparty.nim which includes this file.
 
-import std/[os, parseopt, strutils]
+import std/[os, parseopt, posix, strutils]
 import vcf_utils
 import scatter
 import run
@@ -26,9 +26,11 @@ proc usage() =
   stderr.writeLine "Usage: vcfparty <subcommand> [options]"
   stderr.writeLine ""
   stderr.writeLine "Subcommands:"
-  stderr.writeLine "  scatter   Split a bgzipped VCF/BCF into N shards"
-  stderr.writeLine "  run       Scatter, pipe each shard through a tool pipeline"
-  stderr.writeLine "  gather    Concatenate pre-existing shard files into a single output"
+  stderr.writeLine "  scatter      Split a bgzipped VCF/BCF into N shards"
+  stderr.writeLine "  run          Scatter, pipe each shard through a tool pipeline"
+  stderr.writeLine "  gather       Concatenate pre-existing shard files into a single output"
+  stderr.writeLine "  compress     BGZF-compress a file (like bgzip)"
+  stderr.writeLine "  decompress   Decompress a BGZF file"
   stderr.writeLine ""
   stderr.writeLine "Run 'vcfparty <subcommand> --help' for subcommand options."
   quit(1)
@@ -49,7 +51,7 @@ proc scatterUsage() =
 
 ## Short flags that DO NOT take a value. parseopt uses this set to correctly
 ## parse attached values like `-n50` (otherwise it splits into `-n`, `-5`, `-0`).
-const ShortNoVal = {'u', 'v', 'h'}
+const ShortNoVal = {'c', 'u', 'v', 'h'}
 
 proc nextVal(p: var OptParser; flag: string): string =
   ## Return the value for a flag, consuming the next argv token if the value
@@ -337,6 +339,147 @@ proc runGather(rawArgs: seq[string]) =
       createDir(outDir)
   gatherFiles(cfg, inputFiles)
 
+proc compressUsage() =
+  stderr.writeLine "Usage: vcfparty compress [-c] [file]"
+  stderr.writeLine ""
+  stderr.writeLine "Compress input to BGZF format."
+  stderr.writeLine ""
+  stderr.writeLine "Options:"
+  stderr.writeLine "  -c, --stdout    write to stdout, keep original file"
+  stderr.writeLine "  -h, --help      show this help"
+  stderr.writeLine ""
+  stderr.writeLine "If no file is given, reads from stdin and writes to stdout."
+  quit(1)
+
+proc decompressUsage() =
+  stderr.writeLine "Usage: vcfparty decompress [-c] [file]"
+  stderr.writeLine ""
+  stderr.writeLine "Decompress BGZF input to raw bytes."
+  stderr.writeLine ""
+  stderr.writeLine "Options:"
+  stderr.writeLine "  -c, --stdout    write to stdout, keep original file"
+  stderr.writeLine "  -h, --help      show this help"
+  stderr.writeLine ""
+  stderr.writeLine "If no file is given, reads from stdin and writes to stdout."
+  quit(1)
+
+proc runCompress(rawArgs: seq[string]) =
+  var toStdout = false
+  var inputFile = ""
+  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "c", "stdout": toStdout = true
+      of "h", "help": compressUsage()
+      else:
+        stderr.writeLine "error: unknown option: -" & p.key
+        quit(1)
+    of cmdArgument:
+      if inputFile != "":
+        stderr.writeLine "error: unexpected argument: " & p.key
+        quit(1)
+      inputFile = p.key
+
+  var inFile: File
+  var outFile: File
+  var outPath = ""
+
+  if inputFile == "":
+    # stdin mode — must be a pipe, not a terminal.
+    if isatty(0) != 0:
+      stderr.writeLine "error: no input file and stdin is a terminal"
+      quit(1)
+    inFile = stdin
+    toStdout = true
+  else:
+    if not fileExists(inputFile):
+      stderr.writeLine "error: input file not found: " & inputFile
+      quit(1)
+    inFile = open(inputFile, fmRead)
+    # Warn if input looks already compressed.
+    var peek: array[4, byte]
+    let n = readBytes(inFile, peek, 0, 4)
+    if n >= 2 and peek[0] == 0x1f and peek[1] == 0x8b:
+      stderr.writeLine "warning: input appears to be gzip/BGZF compressed already"
+    inFile.setFilePos(0)
+
+  if toStdout:
+    outFile = stdout
+  else:
+    outPath = inputFile & ".gz"
+    outFile = open(outPath, fmWrite)
+
+  bgzfCompressStream(inFile, outFile)
+
+  if inputFile != "":
+    inFile.close()
+  if not toStdout:
+    outFile.close()
+
+proc runDecompress(rawArgs: seq[string]) =
+  var toStdout = false
+  var inputFile = ""
+  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+  while true:
+    p.next()
+    case p.kind
+    of cmdEnd: break
+    of cmdShortOption, cmdLongOption:
+      case p.key
+      of "c", "stdout": toStdout = true
+      of "h", "help": decompressUsage()
+      else:
+        stderr.writeLine "error: unknown option: -" & p.key
+        quit(1)
+    of cmdArgument:
+      if inputFile != "":
+        stderr.writeLine "error: unexpected argument: " & p.key
+        quit(1)
+      inputFile = p.key
+
+  var inFile: File
+  var outFile: File
+  var outPath = ""
+
+  if inputFile == "":
+    if isatty(0) != 0:
+      stderr.writeLine "error: no input file and stdin is a terminal"
+      quit(1)
+    inFile = stdin
+    toStdout = true
+  else:
+    if not fileExists(inputFile):
+      stderr.writeLine "error: input file not found: " & inputFile
+      quit(1)
+    inFile = open(inputFile, fmRead)
+    # Warn if input does NOT look like BGZF/gzip.
+    var peek: array[4, byte]
+    let n = readBytes(inFile, peek, 0, 4)
+    if n < 4 or peek[0] != 0x1f or peek[1] != 0x8b:
+      stderr.writeLine "warning: input does not appear to be gzip/BGZF compressed"
+    inFile.setFilePos(0)
+    if not toStdout:
+      if not inputFile.endsWith(".gz"):
+        stderr.writeLine "error: cannot infer output name (input does not end in .gz); use -c for stdout"
+        quit(1)
+      outPath = inputFile[0 ..< inputFile.len - 3]
+
+  if toStdout:
+    outFile = stdout
+  else:
+    outFile = open(outPath, fmWrite)
+
+  bgzfDecompressStream(inFile, outFile)
+
+  if inputFile != "":
+    inFile.close()
+  if not toStdout:
+    outFile.close()
+
 proc mainEntry*() =
   ## Top-level entry point: dispatch to the appropriate subcommand.
   let args = commandLineParams()
@@ -349,6 +492,10 @@ proc mainEntry*() =
     runRun(args[1 .. ^1])
   of "gather":
     runGather(args[1 .. ^1])
+  of "compress":
+    runCompress(args[1 .. ^1])
+  of "decompress":
+    runDecompress(args[1 .. ^1])
   of "--version":
     echo "vcfparty v" & VERSION
   of "--help", "-h":

@@ -3,7 +3,7 @@
 
 echo "--------------- Test VCF Utils ---------------"
 
-import std/[os, strformat]
+import std/[algorithm, os, strformat]
 import test_utils
 import "../src/vcfparty/vcf_utils"
 
@@ -336,3 +336,112 @@ timed("V3.4", "sniffFileFormat: uncompressed BCF magic"):
   doAssert fmt == ffBcf,   "V3.4: expected ffBcf, got " & $fmt
   doAssert not compressed, "V3.4: expected compressed=false"
   removeFile(tmp)
+
+# ===========================================================================
+# V4 — GZI index parsing
+# ===========================================================================
+
+const Kg22Vcf = DataDir / "chr22_1kg.vcf.gz"
+const Kg22Gzi = Kg22Vcf & ".gzi"
+
+# ---------------------------------------------------------------------------
+# V4.1 — parseGziBlockStarts: offsets non-empty, sorted, first is 0
+# ---------------------------------------------------------------------------
+
+timed("V4.1", "parseGziBlockStarts: offsets non-empty, sorted, first=0"):
+  if fileExists(Kg22Gzi):
+    let starts = parseGziBlockStarts(Kg22Gzi)
+    doAssert starts.len > 0, "GZI should have at least one entry"
+    doAssert starts[0] == 0, &"first GZI offset should be 0, got {starts[0]}"
+    for i in 1 ..< starts.len:
+      doAssert starts[i] > starts[i - 1],
+        &"GZI offsets not sorted at index {i}: {starts[i-1]} >= {starts[i]}"
+  else:
+    echo "  [skipped — chr22_1kg.vcf.gz.gzi not found]"
+
+# ---------------------------------------------------------------------------
+# V4.2 — parseGziBlockStarts cross-validate: every GZI offset is a valid block
+# ---------------------------------------------------------------------------
+
+timed("V4.2", "parseGziBlockStarts: every offset is a valid BGZF block start"):
+  if fileExists(Kg22Gzi) and fileExists(Kg22Vcf):
+    let gziStarts = parseGziBlockStarts(Kg22Gzi)
+    let scanStarts = scanBgzfBlockStarts(Kg22Vcf)
+    # Every GZI offset must appear in scanBgzfBlockStarts results.
+    var scanSet: seq[int64] = scanStarts
+    scanSet.sort()
+    for off in gziStarts:
+      let idx = scanSet.binarySearch(off)
+      doAssert idx >= 0,
+        &"GZI offset {off} not found in scanBgzfBlockStarts results"
+  else:
+    echo "  [skipped — chr22_1kg fixtures not found]"
+
+# ===========================================================================
+# V5 — Streaming BGZF compress / decompress
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# V5.1 — bgzfCompressStream/bgzfDecompressStream: round-trip identity
+# ---------------------------------------------------------------------------
+
+timed("V5.1", "bgzfCompressStream/bgzfDecompressStream: round-trip"):
+  let original = decompressBgzfFile(SmallVcf)
+  doAssert original.len > 0, "fixture decompressed to empty"
+
+  let tmpComp = getTempDir() / "vcfparty_test_compress_stream.gz"
+  let tmpDecomp = getTempDir() / "vcfparty_test_decompress_stream.raw"
+  let tmpRaw = getTempDir() / "vcfparty_test_raw_input.bin"
+
+  # Write raw bytes to a temp file, then compress via stream.
+  var fRaw = open(tmpRaw, fmWrite)
+  discard fRaw.writeBytes(original, 0, original.len)
+  fRaw.close()
+
+  var fIn = open(tmpRaw, fmRead)
+  var fOut = open(tmpComp, fmWrite)
+  bgzfCompressStream(fIn, fOut)
+  fOut.close()
+  fIn.close()
+
+  # Verify output is valid BGZF (check magic at start).
+  let compData = readFile(tmpComp)
+  doAssert compData.len > 28, "compressed output too small"
+  doAssert compData[0].byte == 0x1f and compData[1].byte == 0x8b,
+    "compressed output missing gzip magic"
+
+  # Decompress back via stream.
+  fIn = open(tmpComp, fmRead)
+  fOut = open(tmpDecomp, fmWrite)
+  bgzfDecompressStream(fIn, fOut)
+  fOut.close()
+  fIn.close()
+
+  let roundTrip = cast[seq[byte]](readFile(tmpDecomp))
+  doAssert roundTrip.len == original.len,
+    &"round-trip size mismatch: {roundTrip.len} vs {original.len}"
+  doAssert roundTrip == original, "round-trip content mismatch"
+
+  removeFile(tmpRaw)
+  removeFile(tmpComp)
+  removeFile(tmpDecomp)
+
+# ---------------------------------------------------------------------------
+# V5.2 — bgzfCompressStream: empty input produces only EOF block
+# ---------------------------------------------------------------------------
+
+timed("V5.2", "bgzfCompressStream: empty input -> EOF block only"):
+  let tmpIn = getTempDir() / "vcfparty_test_empty_in.bin"
+  let tmpOut = getTempDir() / "vcfparty_test_empty_out.gz"
+  writeFile(tmpIn, "")
+  var fIn = open(tmpIn, fmRead)
+  var fOut = open(tmpOut, fmWrite)
+  bgzfCompressStream(fIn, fOut)
+  fOut.close()
+  fIn.close()
+
+  let data = readFile(tmpOut)
+  doAssert data.len == 28, &"empty compress: expected 28-byte EOF, got {data.len}"
+
+  removeFile(tmpIn)
+  removeFile(tmpOut)

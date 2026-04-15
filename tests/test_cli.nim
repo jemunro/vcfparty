@@ -15,7 +15,7 @@ const KgVcf    = DataDir / "chr22_1kg.vcf.gz"
 const SmallBcf = DataDir / "small.bcf"          # CSI indexed BCF
 
 proc run(args: string): (string, int) =
-  ## Run partyvcf with shell args; combine stdout+stderr; return (outp, code).
+  ## Run blocky with shell args; combine stdout+stderr; return (outp, code).
   execCmdEx(BinPath & " " & args & " 2>&1")
 
 proc recordsHash(paths: seq[string]): string =

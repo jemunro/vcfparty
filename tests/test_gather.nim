@@ -138,33 +138,6 @@ timed("G2.2", "findVcfHeaderEnd"):
   doAssert findVcfHeaderEnd(midData) == midDataStart,
     &"mid-data-line: expected {midDataStart}, got {findVcfHeaderEnd(midData)}"
 
-# ---------------------------------------------------------------------------
-# G2.3 — testStripBcfHeader: record bytes returned after stripping magic+l_text+header
-# ---------------------------------------------------------------------------
-
-timed("G2.3", "stripBcfHeader"):
-  # Build minimal fake uncompressed BCF: magic(5) + l_text(4) + header + records.
-  let hdrText = "##BCF fake header\n"
-  let lText = hdrText.len.uint32
-  var bcfData: seq[byte]
-  bcfData.add([byte('B'), byte('C'), byte('F'), 0x02'u8, 0x02'u8])
-  bcfData.add([byte(lText and 0xff), byte((lText shr 8) and 0xff),
-               byte((lText shr 16) and 0xff), byte((lText shr 24) and 0xff)])
-  for c in hdrText: bcfData.add(byte(c))
-  let recordBytes = @[0x01'u8, 0x02, 0x03, 0x04, 0x05]
-  bcfData.add(recordBytes)
-
-  let got = stripBcfHeader(bcfData)
-  doAssert got == recordBytes, &"BCF strip: expected records only, got {got}"
-
-  # Too short to hold l_text.
-  doAssert stripBcfHeader(@[0x42'u8, 0x43, 0x46]) == @[],
-    "short buffer: expected @[]"
-
-  # Exactly the header, no record bytes.
-  let hdrOnly = bcfData[0 ..< bcfData.len - recordBytes.len]
-  doAssert stripBcfHeader(hdrOnly) == @[], "header-only: expected @[]"
-
 # ===========================================================================
 # G5 — Integration tests via compiled binary
 # ===========================================================================

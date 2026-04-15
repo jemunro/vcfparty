@@ -7,7 +7,7 @@
 ## (`extractBcfHeaderAndFirstOffset`, `getHeaderAndFirstBlock`), and
 ## block splitting — lives in `bgzf`.
 
-import std/[algorithm, cpuinfo, os, posix, sequtils, strformat, strutils]
+import std/[algorithm, atomics, cpuinfo, os, posix, sequtils, strformat, strutils]
 {.warning[Deprecated]: off.}
 import std/threadpool
 {.warning[Deprecated]: on.}
@@ -70,8 +70,6 @@ proc doWriteShard*(task: ShardTask): int {.gcsafe.} =
   ## detected via waitpid's exit code rather than via a write error.
   ## When task.decompress is true, BGZF blocks are decompressed before writing
   ## so the receiver gets a raw uncompressed byte stream.
-  if task.logLine.len > 0:
-    stderr.writeLine "info: " & task.logLine
   if task.decompress:
     var f: File
     discard open(f, FileHandle(task.outFd), fmWrite)
@@ -91,12 +89,29 @@ proc doWriteShard*(task: ShardTask): int {.gcsafe.} =
     # fd-level writes + sendfile — no File wrapper to avoid buffer conflicts.
     writeAllFd(task.outFd, task.prepend)
     if task.rawEnd > task.rawStart:
-      rawCopyBytesFd(task.vcfPath, task.outFd, task.rawStart,
+      copyRangeFromFile(task.vcfPath, task.outFd, task.rawStart,
                       task.rawEnd - task.rawStart)
     if task.boundaryHead.len > 0:
       writeAllFd(task.outFd, task.boundaryHead)
     writeAllFd(task.outFd, task.eofSeq)
     discard posix.close(task.outFd)
+  if task.logLine.len > 0:
+    stderr.writeLine "info: " & task.logLine
+  return 0
+
+# ---------------------------------------------------------------------------
+# Bounded scatter worker — atomic pull from shared task list
+# ---------------------------------------------------------------------------
+
+var gScatterNext {.global.}: Atomic[int]
+
+proc scatterWorker(tasksPtr: ptr seq[ShardTask]; nTotal: int): int {.gcsafe.} =
+  ## Pull shard indices atomically and write each shard.  Exactly nWorkers
+  ## of these run concurrently, bounding I/O concurrency on the input file.
+  while true:
+    let idx = gScatterNext.fetchAdd(1, moRelaxed)
+    if idx >= nTotal: break
+    discard doWriteShard(tasksPtr[][idx])
   return 0
 
 # ---------------------------------------------------------------------------
@@ -326,10 +341,12 @@ proc scatter*(vcfPath: string; nShards: int; outputTemplate: string;
       tasks[i].logLine = &"shard {i+1}/{nShards}: {outPath} " &
         &"(prepend {tasks[i].prepend.len}B, raw {rs}..{re} = {re-rs}B{bn})"
   if actualThreads > 1:
-    var writeFVs = newSeq[FlowVar[int]](nShards)
-    for i, task in tasks:
-      writeFVs[i] = spawn doWriteShard(task)
-    for fv in writeFVs:
+    gScatterNext.store(0, moRelaxed)
+    let nWorkers = min(actualThreads, nShards)
+    var fvs = newSeq[FlowVar[int]](nWorkers)
+    for i in 0 ..< nWorkers:
+      fvs[i] = spawn scatterWorker(addr tasks, nShards)
+    for fv in fvs:
       discard ^fv
   else:
     for task in tasks:

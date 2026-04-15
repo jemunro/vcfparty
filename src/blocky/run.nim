@@ -367,7 +367,7 @@ proc concatProc*(depositsPtr: ptr DepositQueue; outFd: cint;
     else:
       # Copy fileSize - 28 bytes (skip trailing BGZF EOF block).
       let copySize = if fileSize >= 28: fileSize - 28 else: fileSize
-      sendfileAll(outFd, fd, copySize)
+      copyRange(outFd, fd, copySize)
     discard posix.close(fd)
     try: removeFile(tmpPath) except OSError: discard
 

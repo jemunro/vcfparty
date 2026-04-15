@@ -3,7 +3,7 @@
 ## Only external dependency: libdeflate (-ldeflate), no htslib required.
 ## All proc signatures use explicit types per project style guide.
 
-import std/[algorithm, os, posix, strformat, strutils]
+import std/[algorithm, atomics, os, posix, strformat, strutils]
 
 # ---------------------------------------------------------------------------
 # Verbose logging — enabled by -v flag, shared across all modules
@@ -204,45 +204,99 @@ proc scanBgzfBlockStarts*(path: string; startAt: int64 = 0;
 # ---------------------------------------------------------------------------
 
 when defined(linux):
-  proc c_sendfile*(outFd, inFd: cint; offset: ptr Off; count: csize_t): int
+  proc c_copy_file_range(fd_in: cint; off_in: ptr Off;
+                          fd_out: cint; off_out: ptr Off;
+                          len: csize_t; flags: cuint): int
+    {.importc: "copy_file_range", header: "<unistd.h>".}
+  proc c_sendfile(outFd, inFd: cint; offset: ptr Off; count: csize_t): int
     {.importc: "sendfile", header: "<sys/sendfile.h>".}
 
-proc sendfileAll*(outFd, inFd: cint; count: Off; startOffset: Off = 0) =
-  ## Copy count bytes from inFd to outFd using sendfile (Linux) or read/write.
-  ## When startOffset > 0, sendfile reads from that file offset (ignoring the
-  ## fd's current position); the non-Linux fallback uses lseek instead.
-  when defined(linux):
-    var offset: Off = startOffset
-    while offset < startOffset + count:
-      let remaining = startOffset + count - offset
-      let sent = c_sendfile(outFd, inFd, addr offset, csize_t(remaining))
-      if sent <= 0: break
-  else:
-    if startOffset > 0:
-      discard posix.lseek(inFd, startOffset, SEEK_SET)
-    const BufSize = 65536
-    var buf = newSeqUninit[byte](BufSize)
-    var remaining = count
-    while remaining > 0:
-      let toRead = min(remaining, BufSize.Off)
-      let n = posix.read(inFd, addr buf[0], toRead.int)
-      if n <= 0: break
-      var written = 0
-      while written < n:
-        let w = posix.write(outFd, addr buf[written], n - written)
-        if w <= 0: break
-        written += w
-      remaining -= n.Off
+proc isPermanentUnsupport(e: cint): bool {.inline.} =
+  ## True for errno values that indicate the syscall is permanently
+  ## unsupported on this filesystem/kernel — safe to cache and skip.
+  e == ENOSYS or e == EXDEV or e == EOPNOTSUPP
 
-proc rawCopyBytesFd*(srcPath: string; dstFd: cint; start: int64; length: int64) =
-  ## Copy length bytes from srcPath[start..] to dstFd using sendfile on Linux,
-  ## falling back to read/write on other platforms.
+var gTierCopyFileRangeFailed* {.global.}: Atomic[bool]
+var gTierSendfileFailed* {.global.}: Atomic[bool]
+var tlCopyBuf {.threadvar.}: seq[byte]
+
+proc copyRange*(outFd, inFd: cint; count: Off; startOffset: Off = 0) =
+  ## Copy count bytes from inFd at startOffset to outFd.
+  ## Tries copy_file_range → sendfile → pread/pwrite (Linux).
+  ## Each tier caches permanent failures (ENOSYS/EXDEV/EOPNOTSUPP)
+  ## globally so all threads skip it.  Retries on EINTR.
+  ## outFd must be positioned by the caller.  copy_file_range uses and
+  ## advances the fd position (off_out = nil).  sendfile writes at the
+  ## current fd position.  pread/pwrite tracks write offset explicitly.
+  var curInOff: Off = startOffset
+  var copied: Off = 0
+  when defined(linux):
+    # Tier 1: copy_file_range (kernel-space, CoW, widest FS support).
+    if not gTierCopyFileRangeFailed.load(moRelaxed):
+      while copied < count:
+        let remaining = count - copied
+        # off_out = nil: use and advance outFd's current file position.
+        let sent = c_copy_file_range(inFd, addr curInOff, outFd, nil,
+                                      csize_t(remaining), 0)
+        if sent > 0:
+          copied += sent.Off
+          continue
+        if sent < 0 and errno == EINTR: continue
+        if isPermanentUnsupport(errno):
+          gTierCopyFileRangeFailed.store(true, moRelease)
+          info("copy_file_range unsupported, trying sendfile")
+        break
+      if copied >= count: return
+
+    # Tier 2: sendfile (zero-copy, offset param controls inFd position).
+    if not gTierSendfileFailed.load(moRelaxed):
+      while copied < count:
+        let remaining = count - copied
+        let sent = c_sendfile(outFd, inFd, addr curInOff, csize_t(remaining))
+        if sent > 0:
+          copied += sent.Off
+          continue
+        if sent < 0 and errno == EINTR: continue
+        if isPermanentUnsupport(errno):
+          gTierSendfileFailed.store(true, moRelease)
+          info("sendfile unsupported, falling back to pread/pwrite")
+        break
+      if copied >= count: return
+
+  # Tier 3: pread/pwrite fallback (always works, no lseek on inFd).
+  # Get current outFd position for pwrite (pwrite doesn't advance fd pos).
+  var curOutOff: Off = posix.lseek(outFd, 0, SEEK_CUR)
+  const BufSize = 262144  # 256 KiB
+  if tlCopyBuf.len < BufSize: tlCopyBuf = newSeqUninit[byte](BufSize)
+  while copied < count:
+    let toRead = min(count - copied, BufSize.Off)
+    let n = posix.pread(inFd, addr tlCopyBuf[0], toRead.int, curInOff)
+    if n < 0:
+      if errno == EINTR: continue
+      break
+    if n == 0: break
+    var written: int = 0
+    while written < n:
+      let w = posix.pwrite(outFd, addr tlCopyBuf[written], n - written,
+                            curOutOff + written.Off)
+      if w < 0:
+        if errno == EINTR: continue
+        break
+      if w == 0: break
+      written += w
+    curInOff += n.Off
+    curOutOff += n.Off
+    copied += n.Off
+
+proc copyRangeFromFile*(srcPath: string; dstFd: cint; start: int64; length: int64) =
+  ## Copy length bytes from srcPath[start..] to dstFd.
+  ## Tries copy_file_range → sendfile → pread/pwrite.
   if length <= 0: return
   let srcFd = posix.open(srcPath.cstring, O_RDONLY)
   if srcFd < 0:
-    quit("rawCopyBytesFd: could not open " & srcPath, 1)
+    quit("copyRangeFromFile: could not open " & srcPath, 1)
   defer: discard posix.close(srcFd)
-  sendfileAll(dstFd, srcFd, length.Off, start.Off)
+  copyRange(dstFd, srcFd, length.Off, start.Off)
 
 proc decompressBgzf*(data: openArray[byte]): seq[byte] =
   ## Decompress the first BGZF block in data; return the uncompressed bytes.

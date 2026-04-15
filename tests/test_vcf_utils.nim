@@ -3,7 +3,7 @@
 
 echo "--------------- Test BGZF ---------------"
 
-import std/[algorithm, os, strformat]
+import std/[algorithm, atomics, os, posix, strformat]
 import test_utils
 import "../src/blocky/bgzf"
 
@@ -422,3 +422,95 @@ timed("V5.2", "bgzfCompressStream: empty input -> EOF block only"):
 
   removeFile(tmpIn)
   removeFile(tmpOut)
+
+# ===========================================================================
+# V6 — copyRange / copyRangeFromFile: tiered copy with fallback
+# ===========================================================================
+
+# Helper: write known data, copy a range, verify identity.
+proc testCopyRangeTier(tierName: string) =
+  let tmpSrc = getTempDir() / "blocky_test_copysrc.bin"
+  let tmpDst = getTempDir() / "blocky_test_copydst.bin"
+  # Write 1 MB of known data: repeating pattern 0x00..0xFF.
+  const DataSize = 1024 * 1024
+  var srcData = newSeqUninit[byte](DataSize)
+  for i in 0 ..< DataSize: srcData[i] = byte(i and 0xFF)
+  block:
+    let f = open(tmpSrc, fmWrite)
+    discard f.writeBytes(srcData, 0, DataSize)
+    f.close()
+  # Copy a sub-range: skip first 1024 bytes, copy 500 KiB.
+  const CopyStart = 1024
+  const CopyLen = 500 * 1024
+  let srcFd = posix.open(tmpSrc.cstring, O_RDONLY)
+  let dstFd = posix.open(tmpDst.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o666.Mode)
+  doAssert srcFd >= 0, tierName & ": could not open src"
+  doAssert dstFd >= 0, tierName & ": could not open dst"
+  copyRange(dstFd, srcFd, CopyLen.Off, CopyStart.Off)
+  discard posix.close(srcFd)
+  discard posix.close(dstFd)
+  # Verify.
+  let got = cast[seq[byte]](readFile(tmpDst))
+  doAssert got.len == CopyLen,
+    &"{tierName}: expected {CopyLen} bytes, got {got.len}"
+  for i in 0 ..< CopyLen:
+    doAssert got[i] == srcData[CopyStart + i],
+      &"{tierName}: mismatch at byte {i}"
+  removeFile(tmpSrc)
+  removeFile(tmpDst)
+
+# ---------------------------------------------------------------------------
+# V6.1 — copyRange via copy_file_range (default, both flags clear)
+# ---------------------------------------------------------------------------
+
+timed("V6.1", "copyRange: copy_file_range tier"):
+  gTierCopyFileRangeFailed.store(false, moRelaxed)
+  gTierSendfileFailed.store(false, moRelaxed)
+  testCopyRangeTier("V6.1 copy_file_range")
+
+# ---------------------------------------------------------------------------
+# V6.2 — copyRange via sendfile (copy_file_range disabled)
+# ---------------------------------------------------------------------------
+
+timed("V6.2", "copyRange: sendfile tier"):
+  gTierCopyFileRangeFailed.store(true, moRelaxed)
+  gTierSendfileFailed.store(false, moRelaxed)
+  testCopyRangeTier("V6.2 sendfile")
+
+# ---------------------------------------------------------------------------
+# V6.3 — copyRange via pread/pwrite (both tiers disabled)
+# ---------------------------------------------------------------------------
+
+timed("V6.3", "copyRange: pread/pwrite tier"):
+  gTierCopyFileRangeFailed.store(true, moRelaxed)
+  gTierSendfileFailed.store(true, moRelaxed)
+  testCopyRangeTier("V6.3 pread/pwrite")
+
+# ---------------------------------------------------------------------------
+# V6.4 — copyRangeFromFile round-trip
+# ---------------------------------------------------------------------------
+
+timed("V6.4", "copyRangeFromFile: round-trip identity"):
+  gTierCopyFileRangeFailed.store(false, moRelaxed)
+  gTierSendfileFailed.store(false, moRelaxed)
+  let tmpSrc = getTempDir() / "blocky_test_crff_src.bin"
+  let tmpDst = getTempDir() / "blocky_test_crff_dst.bin"
+  const DataSize = 256 * 1024
+  var srcData = newSeqUninit[byte](DataSize)
+  for i in 0 ..< DataSize: srcData[i] = byte(i and 0xFF)
+  block:
+    let f = open(tmpSrc, fmWrite)
+    discard f.writeBytes(srcData, 0, DataSize)
+    f.close()
+  let dstFd = posix.open(tmpDst.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o666.Mode)
+  doAssert dstFd >= 0, "V6.4: could not open dst"
+  copyRangeFromFile(tmpSrc, dstFd, 0, DataSize)
+  discard posix.close(dstFd)
+  let got = cast[seq[byte]](readFile(tmpDst))
+  doAssert got == srcData, "V6.4: round-trip mismatch"
+  removeFile(tmpSrc)
+  removeFile(tmpDst)
+
+# Reset flags to not pollute subsequent test runs.
+gTierCopyFileRangeFailed.store(false, moRelaxed)
+gTierSendfileFailed.store(false, moRelaxed)

@@ -65,16 +65,6 @@ proc inferFileFormat*(path: string; fmtOverride: string): (FileFormat, Compressi
 # Header stripping helpers
 # ---------------------------------------------------------------------------
 
-proc stripBcfHeader*(data: seq[byte]): seq[byte] =
-  ## Strip BCF header (magic + l_text + header text) from uncompressed BCF bytes.
-  ## Returns only the binary record bytes that follow the header.
-  ## Returns @[] if data is too short to contain the full header or has no records.
-  if data.len < 9: return @[]
-  let lText = leU32(data, 5).int
-  let headerSize = 5 + 4 + lText
-  if headerSize >= data.len: return @[]
-  result = data[headerSize ..< data.len]
-
 # ---------------------------------------------------------------------------
 # Header-end finders
 # ---------------------------------------------------------------------------
@@ -449,7 +439,7 @@ proc gatherShard(outFile: File; shardPath: string;
       if compression == compBgzf:
         # BGZF→BGZF: sendfile raw blocks.
         outFile.flushFile()
-        sendfileAll(getFileHandle(outFile).cint, getFileHandle(f).cint,
+        copyRange(getFileHandle(outFile).cint, getFileHandle(f).cint,
                     (dataEnd - blockPosI64).Off, blockPosI64.Off)
       else:
         # BGZF→uncompressed: stream-decompress remaining blocks.
@@ -485,7 +475,7 @@ proc gatherShard(outFile: File; shardPath: string;
       else:
         # uncompressed→uncompressed: sendfile from dataStart.
         outFile.flushFile()
-        rawCopyBytesFd(shardPath, getFileHandle(outFile).cint, dataStart.int64, remaining)
+        copyRangeFromFile(shardPath, getFileHandle(outFile).cint, dataStart.int64, remaining)
   return 0
 
 proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
@@ -527,7 +517,7 @@ proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
       let copySize = s0Size - 28
       if copySize > 0:
         outFile.flushFile()
-        rawCopyBytesFd(inputPaths[0], getFileHandle(outFile).cint, 0, copySize)
+        copyRangeFromFile(inputPaths[0], getFileHandle(outFile).cint, 0, copySize)
     elif isBgzf and cfg.compression == compNone:
       # BGZF→uncompressed: stream-decompress.
       bgzfDecompressStream(fs0, outFile)
@@ -537,7 +527,7 @@ proc gatherFiles*(cfg: GatherConfig; inputPaths: seq[string]) =
     else:
       # uncompressed→uncompressed: sendfile raw.
       outFile.flushFile()
-      rawCopyBytesFd(inputPaths[0], getFileHandle(outFile).cint, 0, s0Size)
+      copyRangeFromFile(inputPaths[0], getFileHandle(outFile).cint, 0, s0Size)
 
   # Write shards 1..N: validate #CHROM, strip headers, stream data.
   for j in 1 ..< inputPaths.len:

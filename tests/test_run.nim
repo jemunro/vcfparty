@@ -51,7 +51,7 @@ timed("R1.2", "parseRunArgv: multi-stage pipeline"):
     "multi-stage: wrong stage 1 tokens"
 
 # ---------------------------------------------------------------------------
-# R3 — testSepFirst: --- at argv[0]; empty partyvcf args, one stage
+# R3 — testSepFirst: --- at argv[0]; empty blocky args, one stage
 # ---------------------------------------------------------------------------
 timed("R1.3", "parseRunArgv: --- first, no blocky args"):
   let argv = @["---", "cat"]

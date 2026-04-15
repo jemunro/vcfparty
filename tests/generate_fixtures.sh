@@ -297,6 +297,61 @@ if [[ "${PERF}" -eq 1 ]]; then
   fi
 fi
 
+# ---------------------------------------------------------------------------
+# small_unaligned.vcf.gz — same content as small.vcf.gz but BGZF blocks do
+# NOT align to record boundaries.  This exercises the scan-mode boundary
+# resolution code path where records span block boundaries.
+#
+# Method: decompress small.vcf.gz, split the raw text at fixed byte offsets
+# that do NOT fall on newlines, compress each chunk with bgzip, concatenate
+# the compressed chunks (stripping intermediate EOF blocks).
+# ---------------------------------------------------------------------------
+UNALIGNED="${DATA_DIR}/small_unaligned.vcf.gz"
+if [[ ! -f "${UNALIGNED}" ]]; then
+  echo "Generating ${UNALIGNED} (unaligned BGZF blocks) ..."
+  TMPRAW="${DATA_DIR}/_unaligned_raw.tmp"
+  bgzip -d -c "${SMALL}" > "${TMPRAW}"
+  RAW_SIZE=$(stat -c%s "${TMPRAW}" 2>/dev/null || stat -f%z "${TMPRAW}")
+  # Split into ~8 chunks at byte positions that avoid newlines.
+  # Use dd to extract each chunk, bgzip each, then concatenate.
+  CHUNK_SIZE=$(( RAW_SIZE / 8 ))
+  OUTPARTS=""
+  OFFSET=0
+  PART=0
+  while [[ ${OFFSET} -lt ${RAW_SIZE} ]]; do
+    PART_FILE="${DATA_DIR}/_unaligned_part${PART}.tmp.gz"
+    REMAINING=$(( RAW_SIZE - OFFSET ))
+    if [[ ${REMAINING} -le $(( CHUNK_SIZE + 1000 )) ]]; then
+      # Last chunk: take everything remaining.
+      dd if="${TMPRAW}" bs=1 skip=${OFFSET} 2>/dev/null | bgzip -c > "${PART_FILE}"
+    else
+      dd if="${TMPRAW}" bs=1 skip=${OFFSET} count=${CHUNK_SIZE} 2>/dev/null | bgzip -c > "${PART_FILE}"
+    fi
+    OUTPARTS="${OUTPARTS} ${PART_FILE}"
+    OFFSET=$(( OFFSET + CHUNK_SIZE ))
+    PART=$(( PART + 1 ))
+  done
+  # Concatenate: for each part except the last, strip the trailing 28-byte EOF.
+  # The last part keeps its EOF.
+  > "${UNALIGNED}"
+  PARTS_ARRAY=(${OUTPARTS})
+  NPARTS=${#PARTS_ARRAY[@]}
+  for (( i=0; i<NPARTS; i++ )); do
+    PFILE="${PARTS_ARRAY[$i]}"
+    PSIZE=$(stat -c%s "${PFILE}" 2>/dev/null || stat -f%z "${PFILE}")
+    if [[ $i -lt $(( NPARTS - 1 )) ]]; then
+      # Strip trailing 28-byte EOF block.
+      dd if="${PFILE}" bs=1 count=$(( PSIZE - 28 )) 2>/dev/null >> "${UNALIGNED}"
+    else
+      cat "${PFILE}" >> "${UNALIGNED}"
+    fi
+  done
+  rm -f ${OUTPARTS} "${TMPRAW}"
+  echo "  -> $(bgzip -d -c "${UNALIGNED}" | grep -v '^#' | wc -l) records (unaligned blocks, no index)"
+else
+  echo "Skipping ${UNALIGNED} (already exists)"
+fi
+
 echo ""
 echo "All fixtures ready in ${DATA_DIR}/"
 ls -lh "${DATA_DIR}"/*.vcf.gz "${DATA_DIR}"/*.bcf "${DATA_DIR}"/*.bed.gz "${DATA_DIR}"/*.gtf.gz "${DATA_DIR}"/*.tsv.gz "${DATA_DIR}"/*.tbi "${DATA_DIR}"/*.csi 2>/dev/null || true

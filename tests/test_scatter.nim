@@ -12,12 +12,13 @@ import test_utils
 import "../src/blocky/bgzf"
 import "../src/blocky/scatter"
 
-const DataDir  = "tests/data"
-const SmallVcf = DataDir / "small.vcf.gz"     # TBI indexed
-const CsiVcf   = DataDir / "small_csi.vcf.gz" # CSI indexed only (no .tbi)
-const GziVcf   = DataDir / "small_gzi.vcf.gz" # GZI indexed only (no .tbi/.csi)
-const SmallBcf = DataDir / "small.bcf"
-const KgBcf    = DataDir / "chr22_1kg.bcf"
+const DataDir      = "tests/data"
+const SmallVcf     = DataDir / "small.vcf.gz"          # TBI indexed
+const CsiVcf       = DataDir / "small_csi.vcf.gz"      # CSI indexed only (no .tbi)
+const GziVcf       = DataDir / "small_gzi.vcf.gz"      # GZI indexed only (no .tbi/.csi)
+const UnalignedVcf = DataDir / "small_unaligned.vcf.gz" # no index, blocks don't align to records
+const SmallBcf     = DataDir / "small.bcf"
+const KgBcf        = DataDir / "chr22_1kg.bcf"
 
 proc readMagic(path: string; offset: int64): array[3, byte] =
   let f = open(path, fmRead)
@@ -216,6 +217,19 @@ timed("SC5.4", "scatter GZI: 4 shards, completeness, order"):
     removeDir(tmpDir)
   else:
     echo "  [skipped — small_gzi.vcf.gz.gzi not found, run generate_fixtures.sh]"
+
+# ---------------------------------------------------------------------------
+# SC5.5 — scatter unaligned blocks: records span BGZF block boundaries
+# ---------------------------------------------------------------------------
+timed("SC5.5", "scatter unaligned blocks: completeness, order"):
+  if fileExists(UnalignedVcf):
+    let tmpDir = createTempDir("blocky_", "")
+    let tmpl = tmpDir / "shard.{}.vcf.gz"
+    scatter(UnalignedVcf, 4, tmpl, 1, forceScan = true)
+    checkShards(UnalignedVcf, tmpl, 4)
+    removeDir(tmpDir)
+  else:
+    echo "  [skipped — small_unaligned.vcf.gz not found, run generate_fixtures.sh]"
 
 # ===========================================================================
 # SC16–SC20 — BCF: header extraction and scatter end-to-end

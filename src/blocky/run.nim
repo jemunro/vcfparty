@@ -228,11 +228,13 @@ var gAnyFailed* {.global.}: Atomic[bool]
 proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
                  stagesPtr: ptr seq[seq[string]]; tmpDirPtr: ptr string;
                  depositsPtr: ptr DepositQueue; chromBufPtr: ptr SharedBuf;
-                 toolManaged: bool; noKill: bool): int {.gcsafe.} =
+                 toolManaged: bool; noKill: bool;
+                 outFd: cint; forceUncompress: bool): int {.gcsafe.} =
   ## Worker loop: atomically pull shard indices from gNextShard, fork a
   ## subprocess for each, write decompressed shard data to its stdin,
   ## intercept stdout (strip headers, BGZF-compress) to a tmp file,
   ## and deposit the path to the concat queue.
+  ## Shard 0 writes directly to outFd when outFd >= 0.
   while true:
     if gAnyFailed.load(moRelaxed) and not noKill:
       break
@@ -284,10 +286,17 @@ proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
     discard posix.close(stdinPipe[0])
     discard posix.close(stdoutFd)
 
-    # Spawn interceptor thread (reads subprocess stdout, writes tmp file).
+    # Spawn interceptor thread (reads subprocess stdout, writes tmp/output).
     var interceptFv: FlowVar[int]
     if not toolManaged:
-      interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr)
+      if idx == 0 and outFd >= 0:
+        interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr,
+                                            outFd, forceUncompress)
+      elif forceUncompress:
+        interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr,
+                                            compressLevel = 1)
+      else:
+        interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr)
 
     # Write decompressed shard data to subprocess stdin (synchronous).
     var task = tasksPtr[][idx]
@@ -310,9 +319,10 @@ proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
       if interceptRc != 0:
         gAnyFailed.store(true, moRelease)
 
-    # Deposit tmp path for concat thread.
+    # Deposit tmp path for concat thread (sentinel "" for shard 0 direct write).
     if not toolManaged:
-      depositsPtr[].deposit(idx, tmpPath)
+      let depositPath = if idx == 0 and outFd >= 0: "" else: tmpPath
+      depositsPtr[].deposit(idx, depositPath)
 
   result = 0
 
@@ -327,6 +337,8 @@ proc concatProc*(depositsPtr: ptr DepositQueue; outFd: cint;
   ## If forceUncompress: decompresses BGZF before writing (for -u flag).
   for i in 0 ..< nTotalShards:
     let tmpPath = depositsPtr[].waitFor(i)
+    if tmpPath.len == 0:
+      continue  # shard 0 wrote directly to outFd
     let fd = posix.open(tmpPath.cstring, O_RDONLY)
     if fd < 0:
       stderr.writeLine &"error: could not open tmp file: {tmpPath}"
@@ -455,7 +467,8 @@ proc runPipeline*(cfg: RunPipelineCfg) =
   for i in 0 ..< nWorkers:
     workerFvs[i] = spawn workerProc(addr tasks, nShards, addr stages,
                                      unsafeAddr tmpDir, addr deposits,
-                                     chromBuf, cfg.toolManaged, cfg.noKill)
+                                     chromBuf, cfg.toolManaged, cfg.noKill,
+                                     outFd, cfg.forceUncompress)
 
   # Wait for all workers to finish.
   for fv in workerFvs:

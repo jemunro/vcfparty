@@ -182,11 +182,19 @@ type SharedBuf* = object
 # ---------------------------------------------------------------------------
 
 proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
-                     chromBufPtr: ptr SharedBuf): int {.gcsafe.} =
+                     chromBufPtr: ptr SharedBuf;
+                     directFd: cint = -1;
+                     directUncompress: bool = false;
+                     compressLevel: int = 6): int {.gcsafe.} =
   ## Read subprocess stdout from inputFd (pipe), strip headers for shards 1..N,
   ## BGZF-compress, and write to tmpPath. Shard 0 writes everything and sets
   ## chromBufPtr with the #CHROM line. Shards 1..N validate #CHROM against it.
   ## Returns 0 on success, 1 on #CHROM mismatch.
+  ##
+  ## directFd >= 0: write directly to this fd instead of tmpPath (shard 0 only).
+  ##   No BGZF EOF is written; the concat thread appends it at the end.
+  ## directUncompress: when directFd >= 0, write uncompressed data (-u flag).
+  ## compressLevel: BGZF compression level for tmp files (1 when -u is set).
   const ChunkSize = 65536
   const FlushThresh = 1 * 1024 * 1024
   var readBuf {.threadvar.}: seq[byte]
@@ -200,10 +208,12 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
       chromBufPtr[].len = 0
       chromBufPtr[].ready = true
     discard posix.close(inputFd)
-    # Write empty BGZF file (just EOF block).
-    let f = open(tmpPath, fmWrite)
-    discard f.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
-    f.close()
+    if directFd < 0:
+      # Write empty BGZF file (just EOF block) to tmp.
+      let f = open(tmpPath, fmWrite)
+      discard f.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
+      f.close()
+    # directFd: nothing to write (concat thread writes final EOF).
     return 0
 
   let (fmt, isBgzf) = sniffStreamFormat(readBuf.toOpenArray(0, initRead.int - 1))
@@ -273,19 +283,32 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
       discard posix.close(inputFd)
       return 1
 
-  # Phase D: write tmp file.
-  let outFile = open(tmpPath, fmWrite)
+  # Phase D: write output (direct to fd for shard 0, or tmp file).
+  let outFile =
+    if directFd >= 0:
+      var f: File
+      discard open(f, FileHandle(directFd), fmWrite)
+      f
+    else:
+      open(tmpPath, fmWrite)
+  let direct = directFd >= 0
 
   if isBgzf:
     # ── BGZF optimised path ──────────────────────────────────────────────
     if shardIdx == 0:
-      # Shard 0: raw-forward all BGZF blocks accumulated so far, then stream rest.
-      var p = 0
-      while p + 18 <= bgzfPos:
-        let blkSize = bgzfBlockSize(rawAccum.toOpenArray(p, bgzfPos - 1))
-        if blkSize <= 0 or p + blkSize > bgzfPos: break
-        discard outFile.writeBytes(rawAccum, p, blkSize)
-        p += blkSize
+      # Shard 0: forward all BGZF blocks accumulated so far, then stream rest.
+      if direct and directUncompress:
+        # -u: write decompressed bytes directly.
+        if pending.len > 0:
+          discard outFile.writeBytes(pending, 0, pending.len)
+      else:
+        # Raw-forward BGZF blocks.
+        var p = 0
+        while p + 18 <= bgzfPos:
+          let blkSize = bgzfBlockSize(rawAccum.toOpenArray(p, bgzfPos - 1))
+          if blkSize <= 0 or p + blkSize > bgzfPos: break
+          discard outFile.writeBytes(rawAccum, p, blkSize)
+          p += blkSize
     else:
       # Shards 1..N: find which raw BGZF block contains hEnd, skip header blocks.
       # Walk rawAccum's BGZF blocks, tracking cumulative decompressed size.
@@ -322,7 +345,7 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
         let splitBlockDecompEnd = splitBlockDecompStart + splitBlkIsize
         let tail = pending[hEnd ..< splitBlockDecompEnd]
         if tail.len > 0:
-          compressToBgzfMulti(outFile, tail)
+          compressToBgzfMulti(outFile, tail, compressLevel)
         rawWriteStart = splitBlockRawEnd
 
       # Raw-forward remaining phase-B blocks (skip BGZF EOF blocks).
@@ -335,11 +358,12 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
           discard outFile.writeBytes(rawAccum, fp, blkSize)
         fp += blkSize
 
-    # Stream remaining pipe data: raw-forward complete BGZF blocks.
+    # Stream remaining pipe data: forward complete BGZF blocks.
     var carry: seq[byte] =
       if bgzfPos < rawAccum.len: rawAccum[bgzfPos ..< rawAccum.len]
       else: @[]
     rawAccum.setLen(0); pending.setLen(0)
+    var decompBuf: seq[byte]
     while true:
       let n = posix.read(inputFd, cast[pointer](addr readBuf[0]), ChunkSize)
       if n <= 0: break
@@ -350,39 +374,57 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
         if blkSize <= 0: break
         if p + blkSize > carry.len: break
         if blkSize != BGZF_EOF.len or carry[p ..< p + blkSize] != @BGZF_EOF:
-          discard outFile.writeBytes(carry, p, blkSize)
+          if direct and directUncompress:
+            decompressBgzfInto(carry.toOpenArray(p, p + blkSize - 1), decompBuf)
+            if decompBuf.len > 0:
+              discard outFile.writeBytes(decompBuf, 0, decompBuf.len)
+          else:
+            discard outFile.writeBytes(carry, p, blkSize)
         p += blkSize
       if p > 0:
         carry = if p < carry.len: carry[p ..< carry.len] else: @[]
 
   else:
     # ── Uncompressed path ────────────────────────────────────────────────
-    # BGZF-compress and write.
     if shardIdx == 0:
-      # Write header + post-header data.
-      if pending.len > 0:
-        compressToBgzfMulti(outFile, pending)
+      if direct and directUncompress:
+        # -u direct: write raw bytes.
+        if pending.len > 0:
+          discard outFile.writeBytes(pending, 0, pending.len)
+      else:
+        # BGZF-compress header + post-header data.
+        if pending.len > 0:
+          compressToBgzfMulti(outFile, pending)
     else:
-      # Skip header, write post-header data.
+      # Skip header, BGZF-compress post-header data.
       if hEnd < pending.len:
-        compressToBgzfMulti(outFile, pending[hEnd ..< pending.len])
+        compressToBgzfMulti(outFile, pending[hEnd ..< pending.len], compressLevel)
     pending.setLen(0)
 
-    # Stream remaining pipe data: compress in chunks.
+    # Stream remaining pipe data.
     var accum: seq[byte]
     while true:
       let n = posix.read(inputFd, cast[pointer](addr readBuf[0]), ChunkSize)
       if n <= 0: break
       accum.add(readBuf.toOpenArray(0, n.int - 1))
       if accum.len >= FlushThresh:
-        compressToBgzfMulti(outFile, accum)
+        if direct and directUncompress:
+          discard outFile.writeBytes(accum, 0, accum.len)
+        else:
+          compressToBgzfMulti(outFile, accum, compressLevel)
         accum.setLen(0)
     if accum.len > 0:
-      compressToBgzfMulti(outFile, accum)
+      if direct and directUncompress:
+        discard outFile.writeBytes(accum, 0, accum.len)
+      else:
+        compressToBgzfMulti(outFile, accum, compressLevel)
 
-  # Write BGZF EOF block.
-  discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
-  outFile.close()
+  if direct:
+    flushFile(outFile)
+    # Do NOT write EOF or close — concat thread owns the fd and writes final EOF.
+  else:
+    discard outFile.writeBytes(BGZF_EOF, 0, BGZF_EOF.len)
+    outFile.close()
   discard posix.close(inputFd)
   result = 0
 

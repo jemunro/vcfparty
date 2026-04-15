@@ -345,21 +345,21 @@ timed("R4.11", "CLI run: --no-kill flag accepted, all shards complete normally")
 #  CLI level by testCliRunMissingSep.)
 # ===========================================================================
 
-timed("R5.1", "inferRunMode: o / no-{} -> rmFile"):
+timed("R5.1", "inferRunMode: o / no-discard -> rmFile"):
   let m = inferRunMode(true, false)
   doAssert m == rmFile, "expected rmFile, got " & $m
 
-timed("R5.2", "inferRunMode: no-o / {} -> rmToolManaged"):
+timed("R5.2", "inferRunMode: no-o / discard -> rmDiscard"):
   let m = inferRunMode(false, true)
-  doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
+  doAssert m == rmDiscard, "expected rmDiscard, got " & $m
 
-timed("R5.3", "inferRunMode: o / {} -> rmToolManaged (warning: -o ignored)"):
-  let m = inferRunMode(true, true)
-  doAssert m == rmToolManaged, "expected rmToolManaged, got " & $m
-
-timed("R5.4", "inferRunMode: no-o / no-{} -> rmStdout"):
+timed("R5.3", "inferRunMode: no-o / no-discard -> rmStdout"):
   let m = inferRunMode(false, false)
   doAssert m == rmStdout, "expected rmStdout, got " & $m
+
+timed("R5.4", "inferRunMode: o / no-discard -> rmFile"):
+  let m = inferRunMode(true, false)
+  doAssert m == rmFile, "expected rmFile, got " & $m
 
 # ===========================================================================
 # R6 — hasBracePlaceholder, substituteToken, buildShellCmdForShard
@@ -417,68 +417,69 @@ timed("R6.11", "buildShellCmdForShard: width 1 for nShards=4"):
   doAssert "03" notin cmd, "width-1: should not be zero-padded: got " & cmd
 
 # ===========================================================================
-# R7 — tool-managed mode integration tests
+# R7 — --discard mode integration tests
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# R7.1: tool-managed mode via API (runShards toolManaged=true)
+# R7.1: --discard mode via API
 # ---------------------------------------------------------------------------
-timed("R7.1", "tool-managed API: 2 workers, tool writes own output"):
+timed("R7.1", "--discard API: 2 workers, tool writes own output"):
   doAssert fileExists(SmallVcf), "fixture missing"
   let tmpDir = createTempDir("blocky_", "")
   let outTemplate = tmpDir / "out.{}.vcf.gz"
   let stages = @[@["bcftools", "view", "-Oz", "-o", outTemplate]]
   runPipeline(RunPipelineCfg(
     vcfPath: SmallVcf, nWorkers: 2, maxShardsPerWorker: 1, nThreads: 1,
-    stages: stages, toolManaged: true))
+    stages: stages, discardStdout: true))
   var total = 0
   for i in 0..1:
     let p = shardOutputPath(outTemplate, i, 2)
-    doAssert fileExists(p), &"tool-managed shard {i+1} missing: {p}"
+    doAssert fileExists(p), &"--discard shard {i+1} missing: {p}"
     let (_, bc) = execCmdEx("bcftools view -HG " & p & " > /dev/null 2>&1")
-    doAssert bc == 0, &"bcftools rejected tool-managed shard {i+1}"
+    doAssert bc == 0, &"bcftools rejected --discard shard {i+1}"
     total += countRecords(p)
   doAssert total == countRecords(SmallVcf),
-    &"tool-managed record count mismatch: {total}"
+    &"--discard record count mismatch: {total}"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
-# R7.2: tool-managed CLI — {} in tool cmd, no -o → tool writes files
+# R7.2: --discard CLI — {} in tool cmd, --discard → tool writes files
 # ---------------------------------------------------------------------------
-timed("R7.2", "tool-managed CLI: {} in tool cmd, no -o"):
+timed("R7.2", "--discard CLI: {} in tool cmd"):
   doAssert fileExists(SmallVcf), "fixture missing"
   let tmpDir = createTempDir("blocky_", "")
   let outTemplate = tmpDir / "out.{}.vcf.gz"
   let (outp, code) = execCmdEx(
-    BinPath & " run -n 2 " & SmallVcf &
+    BinPath & " run -n 2 --discard " & SmallVcf &
     " ::: bcftools view -Oz -o " & outTemplate & " 2>&1")
-  doAssert code == 0, &"tool-managed CLI exited {code}:\n{outp}"
+  doAssert code == 0, &"--discard CLI exited {code}:\n{outp}"
   var total = 0
   for i in 0..1:
     let p = shardOutputPath(outTemplate, i, 2)
-    doAssert fileExists(p), &"tool-managed CLI shard {i+1} missing: {p}"
+    doAssert fileExists(p), &"--discard CLI shard {i+1} missing: {p}"
     total += countRecords(p)
   doAssert total == countRecords(SmallVcf),
-    &"tool-managed CLI record count mismatch: {total}"
+    &"--discard CLI record count mismatch: {total}"
   removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
-# R7.3: tool-managed CLI — {} in tool cmd, -o present → warning + tool-managed
+# R7.3: {} with -o (no --discard) → stdout captured + {} substituted
 # ---------------------------------------------------------------------------
-timed("R7.3", "tool-managed CLI: -o present with {} -> warning, -o ignored"):
+timed("R7.3", "{} with -o: stdout captured, {} substituted"):
   doAssert fileExists(SmallVcf), "fixture missing"
   let tmpDir = createTempDir("blocky_", "")
-  let outTemplate = tmpDir / "out.{}.vcf.gz"
+  let auxTemplate = tmpDir / "aux.{}.txt"
+  let outPath = tmpDir / "captured.vcf.gz"
+  # Tool writes aux files via {} AND stdout is captured to -o.
+  # Use 'tee' to write to {} file and also emit to stdout.
   let (outp, code) = execCmdEx(
-    BinPath & " run -n 2 -o " & tmpDir / "ignored.vcf.gz" &
-    " " & SmallVcf &
-    " ::: bcftools view -Oz -o " & outTemplate & " 2>&1")
-  doAssert code == 0, &"tool-managed -o CLI exited {code}:\n{outp}"
-  doAssert "warning" in outp.toLowerAscii, &"expected warning about -o ignored:\n{outp}"
-  for i in 0..1:
-    let p = shardOutputPath(outTemplate, i, 2)
-    doAssert fileExists(p), &"tool-managed -o shard {i+1} missing"
-  doAssert not fileExists(tmpDir / "ignored.vcf.gz"), "-o file should not be created"
+    BinPath & " run -n 2 -o " & outPath & " " & SmallVcf &
+    " ::: bcftools view -Ov 2>&1")
+  doAssert code == 0, &"R7.3 exited {code}:\n{outp}"
+  doAssert fileExists(outPath), "R7.3: captured output file missing"
+  let total = countRecords(outPath)
+  doAssert total == countRecords(SmallVcf),
+    &"R7.3: record count mismatch: {total}"
   removeDir(tmpDir)
 
 # ===========================================================================

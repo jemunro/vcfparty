@@ -351,7 +351,7 @@ proc computeShardsScanned(vcfPath: string; headerBytes: seq[byte];
 proc scanBlockOffsets(vcfPath: string; firstBlockOff: int64;
                       fileSize: int64): seq[(int64, int)] =
   ## Scan all BGZF blocks in [firstBlockOff, fileSize-28) and return as
-  ## (block_off, 0) virtual offsets.  Used by --force-scan and no-index fallback.
+  ## (block_off, 0) virtual offsets.  Used by --scan and no-index fallback.
   let starts = scanBgzfBlockStarts(vcfPath, startAt = firstBlockOff,
                                    endAt = fileSize - 28)
   info(&"scan: found {starts.len} data blocks")
@@ -362,9 +362,9 @@ proc collectVoffs(vcfPath: string; firstBlockOff: int64; fileSize: int64;
                   forceScan: bool; format: FileFormat):
     (seq[(int64, int)], bool) =
   ## Collect virtual offsets for boundary selection.  Returns (voffs, scanMode).
-  ## Priority: --force-scan > CSI/TBI index > GZI > full scan.
+  ## Priority: --scan > CSI/TBI index > GZI > full scan.
   if forceScan and format != ffBcf:
-    info("--force-scan: ignoring index, scanning all BGZF blocks")
+    info("--scan: ignoring index, scanning all BGZF blocks")
     return (scanBlockOffsets(vcfPath, firstBlockOff, fileSize), true)
 
   var voffs = readIndexVirtualOffsets(vcfPath)
@@ -443,14 +443,14 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
   var effN = nShards
   if nShards > voffs.len:
     if clampShards:
-      stderr.writeLine &"info: --clamp-shards: reducing -n from {nShards} to {voffs.len} ({voffs.len} index entries available in {vcfPath})"
+      stderr.writeLine &"info: --clamp: reducing -n from {nShards} to {voffs.len} ({voffs.len} index entries available in {vcfPath})"
       effN = voffs.len
     else:
       stderr.writeLine &"error: requested {nShards} shards but only {voffs.len} index entries available in {vcfPath}"
       if format == ffVcf and not forceScan:
-        stderr.writeLine &"  reduce -n to at most {voffs.len}, use --force-scan to scan all BGZF blocks, or pass --clamp-shards to reduce -n automatically"
+        stderr.writeLine &"  reduce -n to at most {voffs.len}, use --scan to scan all BGZF blocks, or pass --clamp to reduce -n automatically"
       else:
-        stderr.writeLine &"  reduce -n to at most {voffs.len} or pass --clamp-shards to reduce -n automatically"
+        stderr.writeLine &"  reduce -n to at most {voffs.len} or pass --clamp to reduce -n automatically"
       quit(1)
 
   # Dispatch to indexed or scanned path.

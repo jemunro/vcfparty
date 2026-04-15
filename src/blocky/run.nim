@@ -72,8 +72,8 @@ proc buildShellCmd*(stages: seq[seq[string]]): string =
 
 type RunMode* = enum
   rmFile,        ## concat thread writes to -o output file
-  rmStdout,      ## concat thread writes to stdout (no -o, no {})
-  rmToolManaged  ## tool manages own output; blocky discards shard stdout
+  rmStdout,      ## concat thread writes to stdout (no -o)
+  rmDiscard      ## --discard: stdout → /dev/null, tool manages own output
 
 proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
   ## Return true if any token in any stage contains an unescaped {}.
@@ -90,15 +90,13 @@ proc hasBracePlaceholder*(stages: seq[seq[string]]): bool =
           i += 1
   false
 
-proc inferRunMode*(hasOutput: bool; hasBrace: bool): RunMode =
-  ## Infer run mode from -o presence and {} in tool cmd.
-  ## No -o and no {}: stdout mode (concat thread writes to stdout).
-  ## {} present: tool-managed (warns if -o also present).
-  ## -o present, no {}: file mode (concat thread writes to -o).
-  if hasBrace:
-    if hasOutput:
-      stderr.writeLine "warning: -o is ignored in tool-managed mode (tool command contains {})"
-    return rmToolManaged
+proc inferRunMode*(hasOutput: bool; hasDiscard: bool): RunMode =
+  ## Infer run mode from -o and --discard flags.
+  ## --discard: stdout discarded (tool manages own output).
+  ## -o present: file mode (concat thread writes to -o).
+  ## Neither: stdout mode (concat thread writes to stdout).
+  if hasDiscard:
+    return rmDiscard
   if hasOutput:
     return rmFile
   return rmStdout
@@ -194,20 +192,26 @@ proc waitFor*(q: DepositQueue; idx: int): string =
 # ---------------------------------------------------------------------------
 
 proc forkExecSh(pipeReadFd: cint; pipeWriteFd: cint; stdoutFd: cint;
-                shellCmd: string; shardIdx: int): Pid =
+                shellCmd: string; shardIdx: int;
+                stderrFd: cint = -1): Pid =
   ## Fork a child that runs sh -c shellCmd with stdin = pipeReadFd and
-  ## stdout = stdoutFd.  stderr is inherited.  Returns child PID.
-  ## All three fds should have FD_CLOEXEC set by the caller so that
+  ## stdout = stdoutFd.  If stderrFd >= 0, redirect stderr to it;
+  ## otherwise stderr is inherited.  Returns child PID.
+  ## All fds should have FD_CLOEXEC set by the caller so that
   ## concurrent workers' children do not inherit stale pipe ends.
   let pid = posix.fork()
   if pid < 0:
     stderr.writeLine &"error: fork() failed for shard {shardIdx + 1}"
     quit(1)
   if pid == 0:
-    # Child: rewire stdin and stdout, close originals, exec shell.
+    # Child: rewire stdin, stdout, and optionally stderr.
     if posix.dup2(pipeReadFd, STDIN_FILENO) < 0 or
        posix.dup2(stdoutFd,   STDOUT_FILENO) < 0:
       exitnow(1)
+    if stderrFd >= 0:
+      if posix.dup2(stderrFd, STDERR_FILENO) < 0:
+        exitnow(1)
+      discard posix.close(stderrFd)
     discard posix.close(pipeReadFd)
     discard posix.close(pipeWriteFd)
     discard posix.close(stdoutFd)
@@ -225,11 +229,16 @@ var gAnyFailed* {.global.}: Atomic[bool]
   ## Set by any worker that observes a non-zero child exit code.
   ## Checked by other workers to abort early (unless --no-kill).
 
+var gShardsWithOutput* {.global.}: Atomic[int]
+  ## Incremented by interceptors that receive at least one byte of stdout.
+  ## Checked after run completes when {} is present without --discard.
+
 proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
                  stagesPtr: ptr seq[seq[string]]; tmpDirPtr: ptr string;
                  depositsPtr: ptr DepositQueue; chromBufPtr: ptr SharedBuf;
-                 toolManaged: bool; noKill: bool;
-                 outFd: cint; forceUncompress: bool): int {.gcsafe.} =
+                 discardStdout: bool; discardStderr: bool; noKill: bool;
+                 outFd: cint; forceUncompress: bool;
+                 outputCounterPtr: ptr Atomic[int]): int {.gcsafe.} =
   ## Worker loop: atomically pull shard indices from gNextShard, fork a
   ## subprocess for each, write decompressed shard data to its stdin,
   ## intercept stdout (strip headers, BGZF-compress) to a tmp file,
@@ -243,14 +252,14 @@ proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
       break
 
     var tmpPath: string
-    if not toolManaged:
+    if not discardStdout:
       tmpPath = tmpDirPtr[] / &"shard_{idx}.tmp"
 
     # Subprocess stdout goes to a pipe (interceptor reads the other end)
     # or /dev/null for tool-managed mode.
     var stdoutFd: cint
     var stdoutPipeR: cint = -1
-    if toolManaged:
+    if discardStdout:
       stdoutFd = posix.open("/dev/null".cstring, O_WRONLY)
       if stdoutFd < 0:
         stderr.writeLine &"error: could not open /dev/null for shard {idx + 1}"
@@ -280,23 +289,33 @@ proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
     discard posix.fcntl(stdinPipe[1], F_SETFD, FD_CLOEXEC)
 
     # Fork subprocess.
+    var stderrFd: cint = -1
+    if discardStderr:
+      stderrFd = posix.open("/dev/null".cstring, O_WRONLY)
+      if stderrFd >= 0:
+        discard posix.fcntl(stderrFd, F_SETFD, FD_CLOEXEC)
     let shardCmd = buildShellCmdForShard(stagesPtr[], idx, nTotalShards)
     info(&"shard {idx + 1}/{nTotalShards}: {shardCmd}")
-    let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutFd, shardCmd, idx)
+    let pid = forkExecSh(stdinPipe[0], stdinPipe[1], stdoutFd, shardCmd, idx,
+                          stderrFd)
     discard posix.close(stdinPipe[0])
     discard posix.close(stdoutFd)
+    if stderrFd >= 0: discard posix.close(stderrFd)
 
     # Spawn interceptor thread (reads subprocess stdout, writes tmp/output).
     var interceptFv: FlowVar[int]
-    if not toolManaged:
+    if not discardStdout:
       if idx == 0 and outFd >= 0:
         interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr,
-                                            outFd, forceUncompress)
+                                            outFd, forceUncompress,
+                                            outputCounter = outputCounterPtr)
       elif forceUncompress:
         interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr,
-                                            compressLevel = 1)
+                                            compressLevel = 1,
+                                            outputCounter = outputCounterPtr)
       else:
-        interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr)
+        interceptFv = spawn interceptShard(idx, stdoutPipeR, tmpPath, chromBufPtr,
+                                            outputCounter = outputCounterPtr)
 
     # Write decompressed shard data to subprocess stdin (synchronous).
     var task = tasksPtr[][idx]
@@ -314,13 +333,13 @@ proc workerProc*(tasksPtr: ptr seq[ShardTask]; nTotalShards: int;
       gAnyFailed.store(true, moRelease)
 
     # Wait for interceptor to finish writing tmp file.
-    if not toolManaged:
+    if not discardStdout:
       let interceptRc = ^interceptFv
       if interceptRc != 0:
         gAnyFailed.store(true, moRelease)
 
     # Deposit tmp path for concat thread (sentinel "" for shard 0 direct write).
-    if not toolManaged:
+    if not discardStdout:
       let depositPath = if idx == 0 and outFd >= 0: "" else: tmpPath
       depositsPtr[].deposit(idx, depositPath)
 
@@ -408,8 +427,10 @@ type RunPipelineCfg* = object
   clampShards*:         bool
   outputPath*:          string   ## single output file path; "" when toStdout
   toStdout*:            bool     ## concat thread writes to stdout
-  toolManaged*:         bool     ## {} in tool cmd: discard stdout, no concat
+  discardStdout*:         bool     ## --discard: stdout → /dev/null, no concat
+  discardStderr*:       bool     ## --discard-stderr: tool stderr → /dev/null
   forceUncompress*:     bool     ## -u: decompress BGZF tmp files for final output
+  warnBraceNoDiscard*:  bool     ## {} present without --discard: warn + check
 
 proc runPipeline*(cfg: RunPipelineCfg) =
   ## Scatter into n*m shards, run n workers concurrently, concat output
@@ -432,6 +453,7 @@ proc runPipeline*(cfg: RunPipelineCfg) =
   # Reset global state.
   gNextShard.store(0, moRelaxed)
   gAnyFailed.store(false, moRelaxed)
+  gShardsWithOutput.store(0, moRelaxed)
   # Workers need pool slots for: worker thread + interceptor thread each,
   # plus 1 for the concat thread.
   setMaxPoolSize(nWorkers * 2 + 1)
@@ -441,7 +463,7 @@ proc runPipeline*(cfg: RunPipelineCfg) =
 
   # Open output fd for concat thread (unless tool-managed).
   var outFd: cint = -1
-  if not cfg.toolManaged:
+  if not cfg.discardStdout:
     if cfg.toStdout:
       outFd = STDOUT_FILENO
     else:
@@ -452,30 +474,32 @@ proc runPipeline*(cfg: RunPipelineCfg) =
         quit(1)
 
   # Spawn concat thread (unless tool-managed).
-  if cfg.toolManaged: info("run: tool-managed mode, no concat thread")
+  if cfg.discardStdout: info("run: --discard mode, no concat thread")
   elif cfg.toStdout: info("run: concat to stdout")
   else: info(&"run: concat to {cfg.outputPath}")
-  var deposits = if cfg.toolManaged: DepositQueue() else: newDepositQueue(nShards)
+  var deposits = if cfg.discardStdout: DepositQueue() else: newDepositQueue(nShards)
   var concatFv: FlowVar[int]
-  if not cfg.toolManaged:
+  if not cfg.discardStdout:
     concatFv = spawn concatProc(addr deposits, outFd, nShards,
                                  cfg.forceUncompress)
 
   # Spawn worker threads.
   var stages = cfg.stages
   var workerFvs = newSeq[FlowVar[int]](nWorkers)
+  let counterPtr = if cfg.warnBraceNoDiscard: addr gShardsWithOutput else: nil
   for i in 0 ..< nWorkers:
     workerFvs[i] = spawn workerProc(addr tasks, nShards, addr stages,
                                      unsafeAddr tmpDir, addr deposits,
-                                     chromBuf, cfg.toolManaged, cfg.noKill,
-                                     outFd, cfg.forceUncompress)
+                                     chromBuf, cfg.discardStdout,
+                                     cfg.discardStderr, cfg.noKill,
+                                     outFd, cfg.forceUncompress, counterPtr)
 
   # Wait for all workers to finish.
   for fv in workerFvs:
     discard ^fv
 
   # Wait for concat thread to finish.
-  if not cfg.toolManaged:
+  if not cfg.discardStdout:
     discard ^concatFv
     freeDepositQueue(deposits)
     if not cfg.toStdout:
@@ -488,4 +512,10 @@ proc runPipeline*(cfg: RunPipelineCfg) =
   if gAnyFailed.load(moRelaxed):
     info("run: pipeline failed")
     quit(1)
+
+  # Check for {} without --discard: if no shard produced output, likely user error.
+  if cfg.warnBraceNoDiscard and gShardsWithOutput.load(moRelaxed) == 0:
+    stderr.writeLine "error: no output received from any shard — did you mean --discard?"
+    quit(1)
+
   info(&"run: complete, {nShards} shards processed")

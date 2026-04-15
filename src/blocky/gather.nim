@@ -1,6 +1,6 @@
 ## gather — format inference and concatenation for gather subcommand.
 
-import std/[os, strformat, strutils]
+import std/[atomics, os, strformat, strutils]
 import std/posix
 import bgzf
 
@@ -185,7 +185,8 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
                      chromBufPtr: ptr SharedBuf;
                      directFd: cint = -1;
                      directUncompress: bool = false;
-                     compressLevel: int = 6): int {.gcsafe.} =
+                     compressLevel: int = 6;
+                     outputCounter: ptr Atomic[int] = nil): int {.gcsafe.} =
   ## Read subprocess stdout from inputFd (pipe), strip headers for shards 1..N,
   ## BGZF-compress, and write to tmpPath. Shard 0 writes everything and sets
   ## chromBufPtr with the #CHROM line. Shards 1..N validate #CHROM against it.
@@ -195,6 +196,7 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
   ##   No BGZF EOF is written; the concat thread appends it at the end.
   ## directUncompress: when directFd >= 0, write uncompressed data (-u flag).
   ## compressLevel: BGZF compression level for tmp files (1 when -u is set).
+  ## outputCounter: if non-nil, incremented when subprocess produces output.
   const ChunkSize = 65536
   const FlushThresh = 1 * 1024 * 1024
   var readBuf {.threadvar.}: seq[byte]
@@ -217,6 +219,8 @@ proc interceptShard*(shardIdx: int; inputFd: cint; tmpPath: string;
     return 0
 
   let (fmt, isBgzf) = sniffStreamFormat(readBuf.toOpenArray(0, initRead.int - 1))
+  if outputCounter != nil:
+    discard outputCounter[].fetchAdd(1, moRelaxed)
   info(&"intercept shard {shardIdx}: {fmt}, bgzf={isBgzf}")
 
   # Phase B: accumulate header.

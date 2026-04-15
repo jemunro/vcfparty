@@ -44,7 +44,7 @@ blocky run -n 8 input.vcf.gz \
   ::: bcftools view -i "GT='alt'" -Oz -o output.{}.vcf.gz
 
 # Process a BED file
-blocky run -n 4 --clamp-shards -o out.bed.gz input.bed.gz ::: cat
+blocky run -n 4 --clamp -o out.bed.gz input.bed.gz ::: cat
 
 # Compress/decompress (like bgzip)
 blocky compress input.vcf
@@ -68,8 +68,8 @@ blocky scatter -n <n_shards> -o <output> [options] <input>
 | `-n`/`--n-shards` | Number of shards (required, >= 1) |
 | `-o`/`--output` | Output path template (required). Use `{}` for shard number. |
 | `-t`/`--max-threads` | Max threads for scatter (default: min(n, 8)) |
-| `--force-scan` | Ignore index, scan all BGZF blocks (not valid for BCF) |
-| `--clamp-shards` | Reduce -n if fewer split points available (instead of erroring) |
+| `--scan` | Ignore index, scan all BGZF blocks (not valid for BCF) |
+| `--clamp` | Reduce -n if fewer split points available (instead of erroring) |
 | `-v`/`--verbose` | Print progress to stderr |
 
 ```bash
@@ -96,10 +96,12 @@ blocky run -n <n_workers> [-m <shards_per_worker>] [options] <input> ::: <cmd> [
 | `-n`/`--n-workers` | Number of concurrent worker pipelines (required, >= 1) |
 | `-m`/`--max-shards-per-worker` | Max shards each worker processes sequentially (default: 1) |
 | `-o`/`--output` | Output path (optional; absent -> stdout) |
-| `-u` | Force uncompressed file output (error with `{}`) |
-| `-t`/`--max-threads` | Max threads for scatter (default: min(n, 8)) |
-| `--force-scan` | Ignore index, scan all BGZF blocks |
-| `--clamp-shards` | Reduce shard count if fewer split points available |
+| `-u`/`--uncompressed` | Force uncompressed file output |
+| `--discard` | Discard subprocess stdout (tool manages own output) |
+| `--discard-stderr` | Discard subprocess stderr |
+| `-t`/`--max-threads` | Max scatter threads (default: min(n-workers, 8)) |
+| `--scan` | Ignore index, scan all BGZF blocks |
+| `--clamp` | Reduce shard count if fewer split points available |
 | `--no-kill` | On failure, let sibling shards finish (default: kill them) |
 | `-v`/`--verbose` | Print per-shard progress to stderr |
 
@@ -169,23 +171,28 @@ These subcommands are included for convenience (e.g. on systems without htslib).
 
 ---
 
-## Tool-managed output
+## `{}` placeholder and `--discard`
 
-When `{}` appears in the tool command and `-o` is absent, blocky enters tool-managed mode: subprocess stdout is discarded and the tool writes its own output files. `{}` is replaced with the zero-padded shard number.
+`{}` in the tool command is replaced with the zero-padded shard number. This works in all modes — you can use `{}` for auxiliary output files (reports, logs) while still capturing stdout via `-o`.
 
 ```bash
-blocky run -n 8 input.vcf.gz \
+# Tool manages its own output files — use --discard to drop stdout
+blocky run -n 8 --discard input.vcf.gz \
   ::: bcftools view -Oz -o output.{}.vcf.gz
+
+# {} for auxiliary files, stdout captured to -o
+blocky run -n 4 -o annotated.vcf.gz input.vcf.gz \
+  ::: vep --stats_file report.{}.html
 ```
 
 To pass a literal `{}` to a tool, escape as `\{}` (use single quotes: `'\{}'`).
 
-| `-o` | `{}` in cmd | Mode |
+| `-o` | `--discard` | Mode |
 |---|---|---|
 | Yes | No | File output (concat thread writes to `-o`) |
 | No | No | Stdout output |
-| No | Yes | Tool-managed (tool writes its own files) |
-| Yes | Yes | Tool-managed (warning: `-o` ignored) |
+| No | Yes | Discard stdout (tool manages own output) |
+| Yes | Yes | Error (mutually exclusive) |
 
 ---
 
@@ -252,3 +259,7 @@ nimble release          # build
 nimble test             # run all tests (requires bcftools, bgzip, tabix)
 bash tests/generate_fixtures.sh  # regenerate test fixtures
 ```
+
+---
+
+Blocky started as a Python prototype and was built into a portable, statically-linked Nim binary using [Claude Code](https://claude.com/product/claude-code).

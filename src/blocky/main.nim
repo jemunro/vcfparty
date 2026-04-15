@@ -42,10 +42,10 @@ proc scatterUsage() =
   stderr.writeLine "Options:"
   stderr.writeLine "  -n, --n-shards <int>      number of output shards (required, >= 1)"
   stderr.writeLine "  -o, --output <str>        output file prefix (required)"
-  stderr.writeLine "  -t, --max-threads <int>   max threads for scan/split/write (default: min(n-shards, 8))"
-  stderr.writeLine "      --force-scan          always scan BGZF blocks (ignore index even if present)"
-  stderr.writeLine "      --clamp-shards        if -n exceeds available index entries, reduce -n instead of erroring"
-  stderr.writeLine "  -v, --verbose             print progress info to stderr (block offsets, boundaries, shards)"
+  stderr.writeLine "  -t, --max-threads <int>   max threads for scan/split/write (default: min(n, 8))"
+  stderr.writeLine "      --scan                scan BGZF blocks (ignore index even if present)"
+  stderr.writeLine "      --clamp               reduce -n if fewer split points available"
+  stderr.writeLine "  -v, --verbose             print progress info to stderr"
   stderr.writeLine "  -h, --help                show this help"
   quit(1)
 
@@ -102,9 +102,9 @@ proc runScatter(rawArgs: seq[string]) =
           stderr.writeLine "error: -t must be >= 0, got: " & $nThreads
           quit(1)
         nThreadsSet = true
-      of "force-scan":
+      of "scan", "force-scan":
         forceScan = true
-      of "clamp-shards":
+      of "clamp", "clamp-shards":
         clampShards = true
       of "v", "verbose":
         bgzf.verbose = true
@@ -112,32 +112,32 @@ proc runScatter(rawArgs: seq[string]) =
         scatterUsage()
       else:
         stderr.writeLine "error: unknown option: -" & p.key
-        quit(1)
+        scatterUsage()
     of cmdArgument:
       if inputFile != "":
         stderr.writeLine "error: unexpected argument: " & p.key
-        quit(1)
+        scatterUsage()
       inputFile = p.key
   if not nShardsSet:
     stderr.writeLine "error: -n/--n-shards is required"
-    quit(1)
+    scatterUsage()
   if nShards < 1:
     stderr.writeLine "error: -n must be >= 1, got: " & $nShards
-    quit(1)
+    scatterUsage()
   if outPrefix == "":
     stderr.writeLine "error: -o/--output is required"
-    quit(1)
+    scatterUsage()
   if inputFile == "":
-    stderr.writeLine "error: input VCF file is required"
-    quit(1)
+    stderr.writeLine "error: input file is required"
+    scatterUsage()
   if not fileExists(inputFile):
     stderr.writeLine "error: input file not found: " & inputFile
-    quit(1)
+    scatterUsage()
   let fmt = inferInputFormat(inputFile)
   info(&"scatter: input={inputFile}, format={fmt}")
   if fmt == ffBcf and forceScan:
-    stderr.writeLine "error: blocky: --force-scan is not supported for BCF input"
-    quit(1)
+    stderr.writeLine "error: --scan is not supported for BCF input"
+    scatterUsage()
   if not nThreadsSet:
     nThreads = min(nShards, 8)
   warnFormatMismatch(inputFile, outPrefix)
@@ -148,21 +148,23 @@ proc runUsage() =
   stderr.writeLine "Usage: blocky run -n <n_workers> [-m <shards_per_worker>] [options] <input> (--- | :::) <cmd> [args...]"
   stderr.writeLine ""
   stderr.writeLine "Options:"
-  stderr.writeLine "  -n, --n-workers <int>          number of concurrent worker pipelines (required, >= 1)"
+  stderr.writeLine "  -n, --n-workers <int>              number of concurrent worker pipelines (required, >= 1)"
   stderr.writeLine "  -m, --max-shards-per-worker <int>  max shards each worker processes (default: 1)"
-  stderr.writeLine "  -o, --output <str>             output path (default: stdout)"
-  stderr.writeLine "  -u                             force uncompressed file output (error with tool-managed {})"
-  stderr.writeLine "  -t, --max-threads <int>        max threads for scatter (default: min(n, 8))"
-  stderr.writeLine "      --force-scan               always scan BGZF blocks (ignore index even if present)"
-  stderr.writeLine "      --clamp-shards             if total shards exceeds index entries, reduce instead of erroring"
-  stderr.writeLine "      --no-kill                  on failure, let sibling shards finish (default: kill them)"
-  stderr.writeLine "  -v, --verbose                  print per-shard progress to stderr"
-  stderr.writeLine "  -h, --help                     show this help"
+  stderr.writeLine "  -o, --output <str>                 output path (default: stdout)"
+  stderr.writeLine "  -u, --uncompressed                 force uncompressed file output"
+  stderr.writeLine "      --discard                      discard subprocess stdout (tool manages own output)"
+  stderr.writeLine "      --discard-stderr               discard subprocess stderr"
+  stderr.writeLine "  -t, --max-threads <int>            max scatter threads (default: min(n-workers, 8))"
+  stderr.writeLine "      --scan                         scan BGZF blocks (ignore index even if present)"
+  stderr.writeLine "      --clamp                        reduce total shards if fewer split points available"
+  stderr.writeLine "      --no-kill                      on failure, let sibling shards finish"
+  stderr.writeLine "  -v, --verbose                      print per-shard progress to stderr"
+  stderr.writeLine "  -h, --help                         show this help"
   stderr.writeLine ""
-  stderr.writeLine "Separate pipeline stages with --- or :::."
+  stderr.writeLine "Separate pipeline stages with ::: or ---."
   stderr.writeLine "  blocky run -n 4 -o out.vcf input.vcf.gz ::: bcftools view -Ov"
-  stderr.writeLine "  blocky run -n 4 -m 2 -o out.vcf.gz input.vcf.gz ::: bcftools view -Oz"
-  stderr.writeLine "  blocky run -n 4 input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
+  stderr.writeLine "  blocky run -n 4 -o out.bcf input.vcf.gz ::: bcftools +fill-tags -Ou ::: bcftools view -Ob"
+  stderr.writeLine "  blocky run -n 4 --discard input.vcf.gz ::: bcftools view -Oz -o out.{}.vcf.gz"
   quit(1)
 
 proc runRun(rawArgs: seq[string]) =
@@ -188,6 +190,8 @@ proc runRun(rawArgs: seq[string]) =
   var forceScan       = false
   var clampShards     = false
   var forceUncompress = false
+  var discardStdout   = false
+  var discardStderr   = false
   var noKill          = false
   var p = initOptParser(blockyPart, shortNoVal = ShortNoVal)
   while true:
@@ -216,7 +220,7 @@ proc runRun(rawArgs: seq[string]) =
           quit(1)
       of "o", "output":
         outPrefix = nextVal(p, "o")
-      of "u":
+      of "u", "uncompressed":
         forceUncompress = true
       of "t", "max-threads":
         let v = nextVal(p, "t")
@@ -224,15 +228,19 @@ proc runRun(rawArgs: seq[string]) =
           nThreads = v.parseInt
         except ValueError:
           stderr.writeLine "error: -t must be an integer, got: " & v
-          quit(1)
+          runUsage()
         if nThreads < 0:
           stderr.writeLine "error: -t must be >= 0, got: " & $nThreads
-          quit(1)
+          runUsage()
         nThreadsSet = true
-      of "force-scan":
+      of "scan", "force-scan":
         forceScan = true
-      of "clamp-shards":
+      of "clamp", "clamp-shards":
         clampShards = true
+      of "discard":
+        discardStdout = true
+      of "discard-stderr":
+        discardStderr = true
       of "no-kill":
         noKill = true
       of "v", "verbose":
@@ -241,38 +249,46 @@ proc runRun(rawArgs: seq[string]) =
         runUsage()
       else:
         stderr.writeLine "error: unknown option: -" & p.key
-        quit(1)
+        runUsage()
     of cmdArgument:
       if inputFile != "":
         stderr.writeLine "error: unexpected argument: " & p.key
-        quit(1)
+        runUsage()
       inputFile = p.key
   if not nWorkersSet:
     stderr.writeLine "error: -n/--n-workers is required"
-    quit(1)
+    runUsage()
   if nWorkers < 1:
     stderr.writeLine "error: -n must be >= 1, got: " & $nWorkers
-    quit(1)
+    runUsage()
   if inputFile == "":
-    stderr.writeLine "error: input VCF file is required"
-    quit(1)
+    stderr.writeLine "error: input file is required"
+    runUsage()
   if not fileExists(inputFile):
     stderr.writeLine "error: input file not found: " & inputFile
-    quit(1)
+    runUsage()
   let fmt = inferInputFormat(inputFile)
   info(&"run: input={inputFile}, format={fmt}")
   if fmt == ffBcf and forceScan:
-    stderr.writeLine "error: blocky: --force-scan is not supported for BCF input"
-    quit(1)
+    stderr.writeLine "error: --scan is not supported for BCF input"
+    runUsage()
   if not nThreadsSet:
     nThreads = min(nWorkers, 8)
   let (_, stages) = parseRunArgv(rawArgs)
   let hasBrace    = hasBracePlaceholder(stages)
-  let mode        = inferRunMode(outPrefix != "", hasBrace)
+  if discardStdout and outPrefix != "":
+    stderr.writeLine "error: --discard and -o are mutually exclusive"
+    runUsage()
+  if discardStdout and forceUncompress:
+    stderr.writeLine "error: --discard and -u/--uncompressed are mutually exclusive"
+    runUsage()
+  let mode = inferRunMode(outPrefix != "", discardStdout)
   info(&"run: mode={mode}, stages={stages.len}")
-  if mode == rmToolManaged and forceUncompress:
-    stderr.writeLine "error: -u cannot be used with tool-managed output ({}); blocky does not control that output"
-    quit(1)
+  # Warn if {} present without --discard (user may have forgotten --discard).
+  let warnBrace = hasBrace and not discardStdout
+  if warnBrace:
+    stderr.writeLine "warning: {} found in tool command but stdout is not discarded"
+    stderr.writeLine "  (use --discard if the tool manages its own output files)"
   if mode == rmFile:
     warnFormatMismatch(inputFile, outPrefix)
   runPipeline(RunPipelineCfg(
@@ -286,8 +302,10 @@ proc runRun(rawArgs: seq[string]) =
     clampShards:         clampShards,
     outputPath:          outPrefix,
     toStdout:            (mode == rmStdout),
-    toolManaged:         (mode == rmToolManaged),
-    forceUncompress:     forceUncompress))
+    discardStdout:       (mode == rmDiscard),
+    discardStderr:       discardStderr,
+    forceUncompress:     forceUncompress,
+    warnBraceNoDiscard:  warnBrace))
 
 proc gatherUsage() =
   ## Print gather subcommand usage to stderr and exit 1.
@@ -318,12 +336,12 @@ proc runGather(rawArgs: seq[string]) =
         gatherUsage()
       else:
         stderr.writeLine "error: unknown option: -" & p.key
-        quit(1)
+        gatherUsage()
     of cmdArgument:
       inputFiles.add(p.key)
   if inputFiles.len == 0:
     stderr.writeLine "error: at least one input shard file is required"
-    quit(1)
+    gatherUsage()
   for f in inputFiles:
     if not fileExists(f):
       stderr.writeLine "error: input file not found: " & f

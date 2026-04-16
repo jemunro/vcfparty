@@ -7,6 +7,9 @@ on:
         required: false
         default: ''
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: write
   packages: write
@@ -15,14 +18,14 @@ jobs:
   build-and-test:
     runs-on: ubuntu-22.04
     container:
-      image: quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0
+      image: condaforge/mambaforge:latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
-          apt-get update
-          apt-get install -y cmake curl git xz-utils
+          mamba install -y -c bioconda -c conda-forge bcftools tabix cmake
+          apt-get update && apt-get install -y xz-utils
 
       - name: Install Nim
         run: |

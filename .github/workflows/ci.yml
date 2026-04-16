@@ -1,0 +1,110 @@
+name: CI
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0) — leave empty for test-only run'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-22.04
+    container:
+      image: quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y cmake curl git xz-utils
+
+      - name: Install Nim
+        run: |
+          curl -fsSL https://nim-lang.org/choosenim/init.sh | bash -s -- -y
+          echo "$HOME/.nimble/bin" >> "$GITHUB_PATH"
+
+      - name: Cache vendor
+        uses: actions/cache@v4
+        with:
+          path: vendor/
+          key: libdeflate-1.25
+
+      - name: Generate test fixtures
+        run: bash tests/generate_fixtures.sh
+
+      - name: Test
+        run: nimble test -y
+
+      - name: Build release
+        run: nimble release -y
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: blocky-binary
+          path: blocky
+
+  release:
+    needs: build-and-test
+    if: inputs.tag != ''
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: blocky-binary
+
+      - name: Prepare binary
+        run: chmod +x blocky
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          generate_release_notes: true
+          files: blocky
+
+  push-images:
+    needs: build-and-test
+    if: inputs.tag != ''
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - base: quay.io/biocontainers/vcfanno:0.3.7--he881be0_0
+            suffix: vcfanno
+          - base: quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0
+            suffix: bcftools
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: blocky-binary
+
+      - run: chmod +x blocky
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: .github/docker/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/blocky-${{ matrix.suffix }}:${{ inputs.tag }}
+            ghcr.io/${{ github.repository }}/blocky-${{ matrix.suffix }}:latest
+          build-args: |
+            BASE_IMAGE=${{ matrix.base }}

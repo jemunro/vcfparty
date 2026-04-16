@@ -40,15 +40,15 @@ before build:
 
 task release, "Build release binary":
   buildLibdeflate()
-  exec "nim c -d:release src/blocky.nim"
+  exec "nim c -d:release -d:strip src/blocky.nim"
 
 task test, "Run all tests":
-  exec "nimble build"   # triggers before build hook → buildLibdeflate + nim compile
+  exec "nimble build -y"  # CLI tests shell out to the binary
   # Clear test nimcaches so source changes in imported modules are picked up.
   exec "rm -rf nimcache/tests"
+  # run individual tests
   exec "nim c --hints:off -r tests/test_vcf_utils.nim"
   exec "nim c --hints:off -r tests/test_scatter.nim"
   exec "nim c --hints:off -r tests/test_run.nim"
   exec "nim c --hints:off -r tests/test_gather.nim"
   exec "nim c --hints:off -r tests/test_cli.nim"
-  # exec "testament pattern 'tests/test_*.nim'"

@@ -80,9 +80,6 @@ jobs:
         with:
           name: blocky-binary
 
-      - name: Prepare binary
-        run: chmod +x blocky
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:

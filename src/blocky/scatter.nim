@@ -306,9 +306,29 @@ proc computeShardsIndexed(vcfPath: string; headerBytes: seq[byte];
                           nThreads: int; fileSize: int64): seq[ShardTask] =
   ## Index-mode: voffs have correct uOff values from TBI/CSI.
   ## Split boundary blocks in parallel using the existing boundaryWorker.
+  let dataStart = firstBlockOff        # first byte of data (after header)
+  let dataEnd   = fileSize - 28        # BGZF EOF block start
+  let dataRange = dataEnd - dataStart
+
   var boundaryVoffs: seq[(int64, int)]
+  var lastIdx = -1
   for i in 1 ..< effN:
-    boundaryVoffs.add(voffs[(i * voffs.len) div effN])
+    let targetOff = dataStart + (i.int64 * dataRange) div effN.int64
+    # Binary search: first voff whose block_off >= targetOff.
+    let idx = lowerBound(voffs, (targetOff, 0),
+                         proc(a, b: (int64, int)): int = cmp(a[0], b[0]))
+    # Valid range for this boundary: must not reuse an earlier voff, and must
+    # leave one slot per remaining boundary (so the last i can always use
+    # voffs[voffs.len-1]).
+    let lo = lastIdx + 1
+    let hi = voffs.len - (effN - i)   # leaves (effN-1-i) slots after this one
+    var best = clamp(if idx < voffs.len: idx else: hi, lo, hi)
+    # Snap backward if closer to target and still within [lo, hi].
+    if best > lo and
+       abs(voffs[best - 1][0] - targetOff) <= abs(voffs[best][0] - targetOff):
+      best -= 1
+    lastIdx = best
+    boundaryVoffs.add(voffs[best])
 
   var splits = newSeq[BoundarySplit](boundaryVoffs.len)
   if boundaryVoffs.len > 0:
@@ -336,7 +356,7 @@ proc computeShardsIndexed(vcfPath: string; headerBytes: seq[byte];
 # ---------------------------------------------------------------------------
 
 proc computeShardsScanned(vcfPath: string; headerBytes: seq[byte];
-                          firstBlockOff: int64;
+                          firstBlockOff: int64; firstUOff: int;
                           voffs: seq[(int64, int)]; effN: int;
                           fileSize: int64): seq[ShardTask] =
   ## Scan-mode: voffs are block-level only (uOff=0).  Resolve each boundary
@@ -351,7 +371,7 @@ proc computeShardsScanned(vcfPath: string; headerBytes: seq[byte];
     info(&"scan boundary resolution: reduced to {actualN} shards")
 
   info(&"computeShards: {actualN} shards, file size {fileSize} bytes, EOF at {fileSize - 28}")
-  buildShardTasks(vcfPath, headerBytes, firstBlockOff, 0,
+  buildShardTasks(vcfPath, headerBytes, firstBlockOff, firstUOff,
                   boundaryVoffs, splits, fileSize - 28)
 
 # ---------------------------------------------------------------------------
@@ -423,10 +443,10 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
     firstBlockOff = fdbo
     firstUOff = uOff
   else:
-    let (hb, fb) = getHeaderAndFirstBlock(vcfPath)
+    let (hb, fb, uOff) = getHeaderAndFirstBlock(vcfPath)
     headerBytes = hb
     firstBlockOff = fb
-    firstUOff = 0
+    firstUOff = uOff
 
   # Collect virtual offsets: index > GZI > scan.
   var (voffs, scanMode) = collectVoffs(vcfPath, firstBlockOff, fileSize,
@@ -465,7 +485,7 @@ proc computeShards*(vcfPath: string; nShards: int; nThreads: int = 1;
 
   # Dispatch to indexed or scanned path.
   if scanMode:
-    computeShardsScanned(vcfPath, headerBytes, firstBlockOff, voffs, effN, fileSize)
+    computeShardsScanned(vcfPath, headerBytes, firstBlockOff, firstUOff, voffs, effN, fileSize)
   else:
     computeShardsIndexed(vcfPath, headerBytes, firstBlockOff, firstUOff,
                          voffs, effN, nThreads, fileSize)

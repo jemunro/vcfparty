@@ -79,7 +79,7 @@ timed("S04", "readIndexVirtualOffsets via CSI"):
 # S05 — testGetHeaderAndFirstBlock: header is valid BGZF, starts with '#'; firstBlock has BGZF magic
 # ---------------------------------------------------------------------------
 timed("S05", "getHeaderAndFirstBlock: header valid, firstBlock has BGZF magic"):
-  let (hdrBytes, firstBlock) = getHeaderAndFirstBlock(SmallVcf)
+  let (hdrBytes, firstBlock, firstUOff) = getHeaderAndFirstBlock(SmallVcf)
   # Compressed header must be a valid BGZF block
   doAssert bgzfBlockSize(hdrBytes) > 0,
     "getHeaderAndFirstBlock: header not a valid BGZF block"
@@ -92,6 +92,8 @@ timed("S05", "getHeaderAndFirstBlock: header valid, firstBlock has BGZF magic"):
   let magic = readMagic(SmallVcf, firstBlock)
   doAssert magic[0] == 0x1f and magic[1] == 0x8b,
     &"getHeaderAndFirstBlock: firstBlock {firstBlock} has bad BGZF magic"
+  doAssert firstUOff >= 0,
+    &"getHeaderAndFirstBlock: firstUOff {firstUOff} must be non-negative"
 
 # (partitionBoundaries, isValidBoundary, optimiseBoundaries) removed:
 # these procs no longer exist after Milestone V — scatter now uses index virtual
@@ -145,6 +147,21 @@ proc checkShards(vcfPath: string; tmpl: string; n: int) =
     let content = decompressBgzfFile(path)
     doAssert content.len > 0, &"shard {i}: empty after decompression"
     doAssert content[0] == byte('#'), &"shard {i}: does not start with '#'"
+
+    # Exactly one #CHROM line per shard (catches duplicate header bug).
+    # In VCF the #CHROM line is the only header line starting with '#'
+    # but not '##', so counting these detects duplicated headers.
+    block:
+      var chromLineCount = 0
+      var ls = 0
+      for idx in 0 ..< content.len:
+        if content[idx] == byte('\n'):
+          if idx > ls and content[ls] == byte('#') and
+              (idx == ls + 1 or content[ls + 1] != byte('#')):
+            chromLineCount += 1
+          ls = idx + 1
+      doAssert chromLineCount == 1,
+        &"shard {i}: {chromLineCount} #CHROM lines (expected 1, duplicate header?)"
 
     let recs = collectRecords(content)
     for j in 1 ..< recs.len:
@@ -408,4 +425,49 @@ timed("S14", "BCF scatter: chr22_1kg.bcf large header, 4 shards"):
   let tmpl = tmpDir / "shard.{}.bcf"
   scatter(KgBcf, 4, tmpl, format = ffBcf)
   checkBcfShards(KgBcf, tmpl, 4)
+  removeDir(tmpDir)
+
+# ===========================================================================
+# S15 — VCF scatter with header+data in same BGZF block (regression test)
+# ===========================================================================
+
+proc createMixedBlockVcf(path: string) =
+  ## Create a VCF.gz where the first BGZF block contains both header lines
+  ## and data records.  This triggers the duplicate-header bug when firstUOff
+  ## is incorrectly set to 0.
+  let header = "##fileformat=VCFv4.2\n" &
+               "##contig=<ID=chr1,length=248956422>\n" &
+               "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE1\n"
+  # Block 1: header + first 50 records (mixed block)
+  var block1: seq[byte]
+  for c in header: block1.add(byte(c))
+  for i in 1..50:
+    let rec = &"chr1\t{i * 1000}\t.\tA\tT\t50\tPASS\tDP=10\tGT\t0/1\n"
+    for c in rec: block1.add(byte(c))
+  let compressed1 = compressToBgzf(block1)
+  # Blocks 2–10: data only (50 records each)
+  var f = open(path, fmWrite)
+  discard f.writeBytes(compressed1, 0, compressed1.len)
+  for blk in 2..10:
+    var content: seq[byte]
+    for i in 1..50:
+      let pos = ((blk - 1) * 50 + i) * 1000
+      let rec = &"chr1\t{pos}\t.\tA\tT\t50\tPASS\tDP=10\tGT\t0/1\n"
+      for c in rec: content.add(byte(c))
+    let cb = compressToBgzf(content)
+    discard f.writeBytes(cb, 0, cb.len)
+  let eof = @BGZF_EOF
+  discard f.writeBytes(eof, 0, eof.len)
+  f.close()
+
+# ---------------------------------------------------------------------------
+# S15 — scatter with header+data sharing a BGZF block: no duplicate headers
+# ---------------------------------------------------------------------------
+timed("S15", "scatter: header+data in same block, no duplicate headers"):
+  let tmpDir = createTempDir("blocky_", "")
+  let fixturePath = tmpDir / "mixed.vcf.gz"
+  createMixedBlockVcf(fixturePath)
+  let tmpl = tmpDir / "shard.{}.vcf.gz"
+  scatter(fixturePath, 2, tmpl, 1, forceScan = true)
+  checkShards(fixturePath, tmpl, 2)
   removeDir(tmpDir)

@@ -691,10 +691,11 @@ proc blockHasData(content: openArray[byte]; prevEndedWithNewline: bool): bool =
   # whose '#' character lives in the next block.
   return false
 
-proc getHeaderAndFirstBlock*(vcfPath: string): (seq[byte], int64) =
+proc getHeaderAndFirstBlock*(vcfPath: string): (seq[byte], int64, int) =
   ## Scan BGZF blocks to collect all VCF header lines ('#' lines) and locate
   ## the first block containing data.  No htslib dependency — reads raw bytes.
-  ## Returns (header recompressed as BGZF, first-data-block file offset).
+  ## Returns (header recompressed as BGZF, first-data-block file offset,
+  ## uncompressed offset within that block where data begins).
   ## Handles long header lines spanning BGZF block boundaries correctly.
   let f = open(vcfPath, fmRead)
   defer: f.close()
@@ -728,14 +729,23 @@ proc getHeaderAndFirstBlock*(vcfPath: string): (seq[byte], int64) =
               break
             i += 1
         var lineStart = i
+        var firstDataOff = -1
         while i < content.len:
           if content[i] == byte('\n'):
             if i > lineStart and content[lineStart] == byte('#'):
               for j in lineStart .. i: headerBytes.add(content[j])
+            elif firstDataOff < 0:
+              firstDataOff = lineStart
             lineStart = i + 1
           i += 1
+        # Partial last line that is data (no trailing newline)
+        if firstDataOff < 0 and lineStart < content.len and
+            content[lineStart] != byte('#'):
+          firstDataOff = lineStart
+        # blockHasData guarantees at least one complete non-# line
+        if firstDataOff < 0: firstDataOff = 0
         let compressedHeader = compressToBgzfMulti(headerBytes)
-        return (compressedHeader, pos)
+        return (compressedHeader, pos, firstDataOff)
       else:
         # Pure header block — collect all decompressed bytes.
         headerBytes.add(content)
@@ -743,7 +753,7 @@ proc getHeaderAndFirstBlock*(vcfPath: string): (seq[byte], int64) =
     pos += blkSize.int64
   # Edge case: file has no data records (header only).
   let compressedHeader = compressToBgzfMulti(headerBytes)
-  result = (compressedHeader, pos)
+  result = (compressedHeader, pos, 0)
 
 # ---------------------------------------------------------------------------
 # Format sniffing

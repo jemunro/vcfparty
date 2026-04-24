@@ -1,0 +1,165 @@
+---
+title: "blocky benchmark report"
+output: github_document
+params:
+  data_file: "benchmark_data.tsv"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6, dpi = 150)
+library(tidyverse)
+```
+
+```{r load-data}
+df <- read_tsv(params$data_file) %>%
+  mutate(
+    test   = factor(test),
+    mode   = factor(mode),
+    format = factor(format)
+  )
+```
+
+```{r compute-metrics}
+# Split scaling tests from scatter tests
+df_scaling <- df %>% filter(test != "scatter")
+df_scatter <- df %>% filter(test == "scatter")
+
+# Baseline: median wall time per test x format (native, ncpus == 1)
+baselines <- df_scaling %>%
+  filter(mode == "native", ncpus == 1) %>%
+  group_by(test, format) %>%
+  summarise(wall_baseline = median(wall_seconds), .groups = "drop")
+
+# Scaling results: join baselines and compute metrics
+results <- df_scaling %>%
+  left_join(baselines, by = c("test", "format")) %>%
+  group_by(test, mode, ncpus, nthreads, format) %>%
+  summarise(
+    wall_median    = median(wall_seconds),
+    wall_min       = min(wall_seconds),
+    wall_max       = max(wall_seconds),
+    rss_median     = median(peak_rss_mb),
+    rss_min        = min(peak_rss_mb),
+    rss_max        = max(peak_rss_mb),
+    wall_baseline  = first(wall_baseline),
+    n_reps         = n(),
+    .groups        = "drop"
+  ) %>%
+  mutate(
+    speedup        = wall_baseline / wall_median,
+    speedup_min    = wall_baseline / wall_max,
+    speedup_max    = wall_baseline / wall_min,
+    efficiency     = speedup / ncpus * 100,
+    efficiency_min = speedup_min / ncpus * 100,
+    efficiency_max = speedup_max / ncpus * 100
+  )
+
+# Scatter results: compare index types
+# Wall times are divided by 5 (5 internal reps per process invocation)
+scatter_results <- df_scatter %>%
+  mutate(wall_seconds = wall_seconds / 5) %>%
+  group_by(mode) %>%
+  summarise(
+    wall_median = median(wall_seconds),
+    wall_min    = min(wall_seconds),
+    wall_max    = max(wall_seconds),
+    rss_median  = median(peak_rss_mb),
+    rss_min     = min(peak_rss_mb),
+    rss_max     = max(peak_rss_mb),
+    n_reps      = n(),
+    .groups     = "drop"
+  ) %>%
+  mutate(
+    index_type = str_replace(mode, "scatter_", ""),
+    index_type = factor(index_type, levels = c("csi", "tbi", "gzi", "none"))
+  )
+```
+
+```{r plot-theme}
+mode_lines <- c(
+  "native"    = "dashed",
+  "blocky"    = "solid"
+)
+
+theme_bench <- theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Speedup
+
+```{r speedup-plot}
+ggplot(results, aes(x = ncpus, y = speedup, colour = mode, linetype = mode)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = speedup_min, ymax = speedup_max), width = 0.3, linewidth = 0.4) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+  scale_linetype_manual(values = mode_lines) +
+  facet_grid(test ~ format) +
+  labs(x = "CPUs", y = "Speedup (vs baseline)", colour = "Mode", linetype = "Mode") +
+  theme_bench
+```
+
+## Parallel efficiency
+
+Efficiency = speedup / ncpus x 100%. A value of 100% means perfect linear scaling.
+
+```{r efficiency-plot}
+ggplot(results, aes(x = ncpus, y = efficiency, colour = mode, linetype = mode)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = efficiency_min, ymax = efficiency_max), width = 0.3, linewidth = 0.4) +
+  geom_hline(yintercept = 100, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
+  scale_linetype_manual(values = mode_lines) +
+  facet_grid(test ~ format) +
+  labs(x = "CPUs", y = "Efficiency (%)", colour = "Mode", linetype = "Mode") +
+  theme_bench
+```
+
+## Wall time
+
+```{r walltime-plot}
+ggplot(results, aes(x = ncpus, y = wall_median, colour = mode, linetype = mode)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = wall_min, ymax = wall_max), width = 0.3, linewidth = 0.4) +
+  scale_linetype_manual(values = mode_lines) +
+  facet_grid(test ~ format, scales = "free_y") +
+  labs(x = "CPUs", y = "Wall time (seconds)", colour = "Mode", linetype = "Mode") +
+  theme_bench
+```
+
+## Peak RSS
+
+```{r rss-plot}
+ggplot(results, aes(x = ncpus, y = rss_median, colour = mode, linetype = mode)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = rss_min, ymax = rss_max), width = 0.3, linewidth = 0.4) +
+  scale_linetype_manual(values = mode_lines) +
+  facet_grid(test ~ format, scales = "free_y") +
+  labs(x = "CPUs", y = "Peak RSS (MB)", colour = "Mode", linetype = "Mode") +
+  theme_bench
+```
+
+## Scatter: index format comparison
+
+Wall time for `blocky scatter -n 4` by index type. CSI and TBI use index-based splitting; GZI uses BGZF block offsets; none uses blocky's scan mechanism.
+
+```{r scatter-wall-plot, eval=nrow(scatter_results) > 0}
+ggplot(scatter_results, aes(x = index_type, y = wall_median, fill = index_type)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(ymin = wall_min, ymax = wall_max), width = 0.2, linewidth = 0.4) +
+  labs(x = "Index type", y = "Wall time (seconds)", fill = "Index") +
+  theme_bench +
+  theme(legend.position = "none")
+```
+
+```{r scatter-rss-plot, eval=nrow(scatter_results) > 0}
+ggplot(scatter_results, aes(x = index_type, y = rss_median, fill = index_type)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(ymin = rss_min, ymax = rss_max), width = 0.2, linewidth = 0.4) +
+  labs(x = "Index type", y = "Peak RSS (MB)", fill = "Index") +
+  theme_bench +
+  theme(legend.position = "none")
+```

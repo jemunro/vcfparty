@@ -11,7 +11,6 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  CONDA_PKGS: bcftools tabix cmake make c-compiler 'nim>=2.2.6'
 
 permissions:
   contents: write
@@ -21,7 +20,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-22.04
     container:
-      image: condaforge/mambaforge:latest
+      image: ghcr.io/${{ github.repository }}/ci:latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,17 +28,6 @@ jobs:
 
       - name: Trust workspace
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Cache conda env
-        uses: actions/cache@v4
-        id: conda-cache
-        with:
-          path: /opt/conda
-          key: conda-${{ env.CONDA_PKGS }}
-
-      - name: Install dependencies
-        if: steps.conda-cache.outputs.cache-hit != 'true'
-        run: mamba install -y -c bioconda -c conda-forge ${{ env.CONDA_PKGS }}
 
       - name: Cache libdeflate build
         uses: actions/cache@v4
@@ -94,8 +82,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - base: quay.io/biocontainers/vcfanno:0.3.7--he881be0_0
-            suffix: vcfanno
           - base: quay.io/biocontainers/bcftools:1.23.1--hb2cee57_0
             suffix: bcftools
     steps:

@@ -14,24 +14,40 @@ library(tidyverse)
 ```{r load-data}
 df <- read_tsv(params$data_file) %>%
   mutate(
-    test   = factor(test),
-    mode   = factor(mode),
-    format = factor(format)
+    mode = fct_recode(factor(mode),
+      "native"                = "native",
+      "blocky run"            = "blocky",
+      "blocky scatter/gather" = "scatter_gather"
+    ),
+    test = fct_recode(factor(test),
+      "bcftools norm"       = "norm",
+      "bcftools fill-tags"  = "fill_tags",
+      "cat"                 = "cat",
+      "bgzip"               = "bgzip",
+      "cat x4 pipeline"     = "cat4",
+      "vcfanno"             = "vcfanno",
+      "scatter"             = "scatter"
+    ),
+    format = fct_recode(factor(format),
+      "VCF" = "vcf",
+      "BCF" = "bcf"
+    )
   )
 ```
 
 ```{r compute-metrics}
-# Split scaling tests from scatter tests
+# Split scaling tests from scatter index tests
 df_scaling <- df %>% filter(test != "scatter")
 df_scatter <- df %>% filter(test == "scatter")
 
-# Baseline: median wall time per test x format (native, ncpus == 1)
+# Baseline: median wall time of native at lowest ncpus per test x format
 baselines <- df_scaling %>%
-  filter(mode == "native", ncpus == 1) %>%
+  filter(mode == "native") %>%
   group_by(test, format) %>%
+  filter(ncpus == min(ncpus)) %>%
   summarise(wall_baseline = median(wall_seconds), .groups = "drop")
 
-# Scaling results: join baselines and compute metrics
+# Scaling results
 results <- df_scaling %>%
   left_join(baselines, by = c("test", "format")) %>%
   group_by(test, mode, ncpus, nthreads, format) %>%
@@ -53,13 +69,20 @@ results <- df_scaling %>%
     efficiency     = speedup / ncpus * 100,
     efficiency_min = speedup_min / ncpus * 100,
     efficiency_max = speedup_max / ncpus * 100
+  ) %>%
+  mutate(
+    panel = if_else(format == "BCF", paste0(test, " (BCF)"), as.character(test))
   )
 
 # Scatter results: compare index types
 # Wall times are divided by 5 (5 internal reps per process invocation)
 scatter_results <- df_scatter %>%
-  mutate(wall_seconds = wall_seconds / 5) %>%
-  group_by(mode) %>%
+  mutate(
+    wall_seconds = wall_seconds / 5,
+    index_type = str_replace(as.character(mode), "scatter_", ""),
+    index_type = factor(index_type, levels = c("csi", "tbi", "gzi", "none"))
+  ) %>%
+  group_by(index_type) %>%
   summarise(
     wall_median = median(wall_seconds),
     wall_min    = min(wall_seconds),
@@ -69,31 +92,24 @@ scatter_results <- df_scatter %>%
     rss_max     = max(peak_rss_mb),
     n_reps      = n(),
     .groups     = "drop"
-  ) %>%
-  mutate(
-    index_type = str_replace(mode, "scatter_", ""),
-    index_type = factor(index_type, levels = c("csi", "tbi", "gzi", "none"))
   )
 ```
 
-```{r plot-theme}
-theme_bench <- theme_minimal() +
-  theme(legend.position = "bottom")
-```
 
 ## Speedup
 
 ```{r speedup-plot}
+max_cpu <- max(results$ncpus)
 ggplot(results, aes(x = ncpus, y = speedup, colour = mode)) +
   geom_line(linewidth = 0.8) +
   geom_point(size = 2) +
-  geom_errorbar(aes(ymin = speedup_min, ymax = speedup_max), width = 0.3, linewidth = 0.4) +
+  geom_errorbar(aes(ymin = speedup_min, ymax = speedup_max), width = 0.05, linewidth = 0.4) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
-  scale_x_continuous(trans = "log2") +
-  scale_y_continuous(trans = "log2") +
-  facet_grid(test ~ format) +
-  labs(x = "CPUs", y = "Speedup (vs baseline)", colour = "Mode") +
-  theme_bench
+  scale_x_continuous(trans = "log2", limits = c(1, max_cpu)) +
+  scale_y_continuous(trans = "log2", limits = c(NA, max_cpu)) +
+  coord_fixed() +
+  facet_wrap(~ panel, ncol = 3) +
+  labs(x = "CPUs", y = "Speedup (vs single-threaded native)", colour = "Mode")
 ```
 
 ## Parallel efficiency
@@ -104,38 +120,23 @@ Efficiency = speedup / ncpus x 100%. A value of 100% means perfect linear scalin
 ggplot(results, aes(x = ncpus, y = efficiency, colour = mode)) +
   geom_line(linewidth = 0.8) +
   geom_point(size = 2) +
-  geom_errorbar(aes(ymin = efficiency_min, ymax = efficiency_max), width = 0.3, linewidth = 0.4) +
+  geom_errorbar(aes(ymin = efficiency_min, ymax = efficiency_max), width = 0.05, linewidth = 0.4) +
   geom_hline(yintercept = 100, linetype = "dashed", colour = "grey60", linewidth = 0.4) +
   scale_x_continuous(trans = "log2") +
-  facet_grid(test ~ format) +
-  labs(x = "CPUs", y = "Efficiency (%)", colour = "Mode") +
-  theme_bench
+  facet_wrap(~ panel, ncol = 3, scales = "free_y") +
+  labs(x = "CPUs", y = "Efficiency (%)", colour = "Mode")
 ```
 
-## Wall time
-
-```{r walltime-plot}
-ggplot(results, aes(x = ncpus, y = wall_median, colour = mode)) +
-  geom_line(linewidth = 0.8) +
-  geom_point(size = 2) +
-  geom_errorbar(aes(ymin = wall_min, ymax = wall_max), width = 0.3, linewidth = 0.4) +
-  scale_x_continuous(trans = "log2") +
-  scale_y_continuous(trans = "log2") +
-  facet_grid(test ~ format, scales = "free_y") +
-  labs(x = "CPUs", y = "Wall time (seconds)", colour = "Mode") +
-  theme_bench
-```
-
-## Peak RSS
+## Peak memory
 
 ```{r rss-plot}
 ggplot(results, aes(x = ncpus, y = rss_median, colour = mode)) +
   geom_line(linewidth = 0.8) +
   geom_point(size = 2) +
-  geom_errorbar(aes(ymin = rss_min, ymax = rss_max), width = 0.3, linewidth = 0.4) +
-  facet_grid(test ~ format, scales = "free_y") +
-  labs(x = "CPUs", y = "Peak RSS (MB)", colour = "Mode") +
-  theme_bench
+  geom_errorbar(aes(ymin = rss_min, ymax = rss_max), width = 0.05, linewidth = 0.4) +
+  scale_x_continuous(trans = "log2") +
+  facet_wrap(~ panel, ncol = 3, scales = "free_y") +
+  labs(x = "CPUs", y = "Peak memory (MB)", colour = "Mode")
 ```
 
 ## Scatter: index format comparison
@@ -147,7 +148,6 @@ ggplot(scatter_results, aes(x = index_type, y = wall_median, fill = index_type))
   geom_col(width = 0.6) +
   geom_errorbar(aes(ymin = wall_min, ymax = wall_max), width = 0.2, linewidth = 0.4) +
   labs(x = "Index type", y = "Wall time (seconds)", fill = "Index") +
-  theme_bench +
   theme(legend.position = "none")
 ```
 
@@ -156,6 +156,16 @@ ggplot(scatter_results, aes(x = index_type, y = rss_median, fill = index_type)) 
   geom_col(width = 0.6) +
   geom_errorbar(aes(ymin = rss_min, ymax = rss_max), width = 0.2, linewidth = 0.4) +
   labs(x = "Index type", y = "Peak RSS (MB)", fill = "Index") +
-  theme_bench +
   theme(legend.position = "none")
 ```
+
+## Command templates
+
+| Test | Native | blocky run | scatter/gather (per shard) |
+|------|--------|------------|---------------------------|
+| bcftools norm | `bcftools norm -m-any --threads <N> -Oz -o <OUTPUT> <INPUT>` | `blocky run -n <N> -o <OUTPUT> <INPUT> ::: bcftools norm -m-any --threads 0 -Oz` | `bcftools norm -m-any --threads 0 -Oz -o <OUTPUT> <SHARD>` |
+| bcftools fill-tags | `bcftools +fill-tags --threads <N> -Oz -o <OUTPUT> <INPUT> -- -t AC,AF,AN` | `blocky run -n <N> -o <OUTPUT> <INPUT> ::: bcftools +fill-tags --threads 0 -Oz -- -t AC,AF,AN` | `bcftools +fill-tags --threads 0 -Oz -o <OUTPUT> <SHARD> -- -t AC,AF,AN` |
+| cat | `blocky decompress <INPUT> \| cat \| blocky compress > <OUTPUT>` | `blocky run -n <N> -o <OUTPUT> <INPUT> ::: cat` | `blocky decompress <SHARD> \| cat \| blocky compress > <OUTPUT>` |
+| bgzip | `blocky decompress <INPUT> \| bgzip --threads <N> > <OUTPUT>` | `blocky run -n <N> -o <OUTPUT> <INPUT> ::: bgzip` | `blocky decompress <SHARD> \| bgzip > <OUTPUT>` |
+| cat x4 pipeline | `blocky decompress <INPUT> \| cat \| cat \| cat \| cat \| blocky compress > <OUTPUT>` | `blocky run -n <N> -o <OUTPUT> <INPUT> ::: cat ::: cat ::: cat ::: cat` | `blocky decompress <SHARD> \| cat \| cat \| cat \| cat \| blocky compress > <OUTPUT>` |
+| vcfanno | `vcfanno -p <N> conf <INPUT> \| bgzip > <OUTPUT>` | `blocky run -n <N> -o <OUTPUT> <INPUT> ::: vcfanno -p 1 conf /dev/stdin` | `vcfanno -p 1 conf <SHARD> \| bgzip > <OUTPUT>` |

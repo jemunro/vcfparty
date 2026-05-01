@@ -14,5 +14,7 @@ process BASELINE {
     """
     bench_run.sh '${meta.test}' '${meta.mode}' ${meta.ncpus} ${meta.nthreads} ${meta.rep} '${meta.format}' -- \
         bash -c '${cmd}'
+
+    rm $input
     """
 }

@@ -1,7 +1,6 @@
-include { PREPARE_INPUT }      from '../subworkflows/local/prepare_input'
-include { BENCHMARK_BCFTOOLS } from '../subworkflows/local/benchmark_bcftools'
-include { BENCHMARK_VCFANNO }  from '../subworkflows/local/benchmark_vcfanno'
-include { REPORT }             from '../modules/local/report'
+include { PREPARE_INPUT }   from '../subworkflows/local/prepare_input'
+include { BENCHMARK_TESTS } from '../subworkflows/local/benchmark_tests'
+include { REPORT }          from '../modules/local/report'
 
 workflow BENCHMARK {
     // Input channels
@@ -11,22 +10,11 @@ workflow BENCHMARK {
     // Prepare indices and vcfanno.conf
     PREPARE_INPUT(ch_test_vcf, ch_clinvar_vcf)
 
-    ch_results = channel.empty()
-
-    if (params.run_bcftools) {
-        BENCHMARK_BCFTOOLS(PREPARE_INPUT.out.indexed)
-        ch_results = ch_results.mix(BENCHMARK_BCFTOOLS.out.results)
-    }
-
-    if (params.run_vcfanno) {
-        ch_vcf_with_csi = PREPARE_INPUT.out.indexed
-            .map { vcf, _tbi, csi, _gzi, _bcf, _bcf_csi -> tuple(vcf, csi) }
-        BENCHMARK_VCFANNO(ch_vcf_with_csi, PREPARE_INPUT.out.vcfanno_bundle)
-        ch_results = ch_results.mix(BENCHMARK_VCFANNO.out.results)
-    }
+    // Run all benchmarks
+    BENCHMARK_TESTS(PREPARE_INPUT.out.indexed, PREPARE_INPUT.out.vcfanno_bundle)
 
     // Collect all results into single TSV
-    ch_data = ch_results
+    ch_data = BENCHMARK_TESTS.out.results
         .collectFile(name: 'benchmark_data.tsv', storeDir: params.outdir, keepHeader: true)
 
     // Generate report

@@ -15,5 +15,7 @@ process BLOCKY_RUN {
     """
     bench_run.sh '${meta.test}' '${meta.mode}' ${meta.ncpus} ${meta.nthreads} ${meta.rep} '${meta.format}' -- \
         bash -c 'blocky run -n ${meta.ncpus} -o output.${out_ext} ${input} ::: ${cmd}'
+
+    rm $input
     """
 }

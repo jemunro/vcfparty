@@ -20,6 +20,11 @@ proc warnFormatMismatch(inputPath: string; outputPath: string) =
 const NimblePkgVersion {.strdefine.} = "dev"
 const VERSION = NimblePkgVersion
 
+# License files bgzip-compressed by the nimble before-build hook.
+# staticRead embeds the binary at compile time; decompressBgzf unpacks at runtime.
+const blockyLicenseData    = staticRead("license_blocky.bgz")
+const libdeflateLicenseData = staticRead("license_libdeflate.bgz")
+
 proc usage(code: int = 1) =
   ## Print top-level usage and exit with code (0 for --help, 1 for errors).
   let f = if code == 0: stdout else: stderr
@@ -33,6 +38,11 @@ proc usage(code: int = 1) =
   f.writeLine "  gather       Concatenate pre-existing shard files into a single output"
   f.writeLine "  compress     BGZF-compress a file (like bgzip)"
   f.writeLine "  decompress   Decompress a BGZF file"
+  f.writeLine ""
+  f.writeLine "Flags:"
+  f.writeLine "  --version                show version"
+  f.writeLine "  --help, -h               show this help"
+  f.writeLine "  --license                show license information"
   f.writeLine ""
   f.writeLine "Run 'blocky <subcommand> --help' for subcommand options."
   quit(code)
@@ -391,23 +401,26 @@ proc decompressUsage(code: int = 1) =
 proc runCompress(rawArgs: seq[string]) =
   var toStdout = false
   var inputFile = ""
-  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
-  while true:
-    p.next()
-    case p.kind
-    of cmdEnd: break
-    of cmdShortOption, cmdLongOption:
-      case p.key
-      of "c", "stdout": toStdout = true
-      of "h", "help": compressUsage(0)
-      else:
-        stderr.writeLine "error: unknown option: -" & p.key
-        quit(1)
-    of cmdArgument:
-      if inputFile != "":
-        stderr.writeLine "error: unexpected argument: " & p.key
-        quit(1)
-      inputFile = p.key
+  # Note: initOptParser falls back to commandLineParams() when given an empty
+  # seq, so we must skip parsing entirely when there are no subcommand args.
+  if rawArgs.len > 0:
+    var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+    while true:
+      p.next()
+      case p.kind
+      of cmdEnd: break
+      of cmdShortOption, cmdLongOption:
+        case p.key
+        of "c", "stdout": toStdout = true
+        of "h", "help": compressUsage(0)
+        else:
+          stderr.writeLine "error: unknown option: -" & p.key
+          quit(1)
+      of cmdArgument:
+        if inputFile != "":
+          stderr.writeLine "error: unexpected argument: " & p.key
+          quit(1)
+        inputFile = p.key
 
   var inFile: File
   var outFile: File
@@ -452,23 +465,26 @@ proc runCompress(rawArgs: seq[string]) =
 proc runDecompress(rawArgs: seq[string]) =
   var toStdout = false
   var inputFile = ""
-  var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
-  while true:
-    p.next()
-    case p.kind
-    of cmdEnd: break
-    of cmdShortOption, cmdLongOption:
-      case p.key
-      of "c", "stdout": toStdout = true
-      of "h", "help": decompressUsage(0)
-      else:
-        stderr.writeLine "error: unknown option: -" & p.key
-        quit(1)
-    of cmdArgument:
-      if inputFile != "":
-        stderr.writeLine "error: unexpected argument: " & p.key
-        quit(1)
-      inputFile = p.key
+  # Note: initOptParser falls back to commandLineParams() when given an empty
+  # seq, so we must skip parsing entirely when there are no subcommand args.
+  if rawArgs.len > 0:
+    var p = initOptParser(rawArgs, shortNoVal = ShortNoVal)
+    while true:
+      p.next()
+      case p.kind
+      of cmdEnd: break
+      of cmdShortOption, cmdLongOption:
+        case p.key
+        of "c", "stdout": toStdout = true
+        of "h", "help": decompressUsage(0)
+        else:
+          stderr.writeLine "error: unknown option: -" & p.key
+          quit(1)
+      of cmdArgument:
+        if inputFile != "":
+          stderr.writeLine "error: unexpected argument: " & p.key
+          quit(1)
+        inputFile = p.key
 
   var inFile: File
   var outFile: File
@@ -480,6 +496,17 @@ proc runDecompress(rawArgs: seq[string]) =
       quit(1)
     inFile = stdin
     toStdout = true
+    # Peek first 2 bytes to validate gzip magic (stdin is not seekable,
+    # so push them back with ungetc).
+    var peek: array[2, byte]
+    let n = readBytes(inFile, peek, 0, 2)
+    if n < 2 or peek[0] != 0x1f or peek[1] != 0x8b:
+      stderr.writeLine "error: input does not appear to be gzip/BGZF compressed"
+      quit(1)
+    # Push bytes back in reverse order so they are re-read correctly.
+    proc cungetc(c: cint, f: File): cint {.importc: "ungetc", header: "<stdio.h>".}
+    discard cungetc(cint(peek[1]), inFile)
+    discard cungetc(cint(peek[0]), inFile)
   else:
     if not fileExists(inputFile):
       stderr.writeLine "error: input file not found: " & inputFile
@@ -533,6 +560,17 @@ proc mainEntry*() =
     echo "blocky v" & VERSION
   of "--help", "-h":
     usage(0)
+  of "--license":
+    proc licenseStr(data: string): string =
+      let b = decompressBgzf(data.toOpenArrayByte(0, data.high))
+      result = newString(b.len)
+      if b.len > 0: copyMem(addr result[0], unsafeAddr b[0], b.len)
+    echo "=== blocky ==="
+    echo ""
+    echo licenseStr(blockyLicenseData)
+    echo "=== libdeflate ==="
+    echo ""
+    echo licenseStr(libdeflateLicenseData)
   else:
     stderr.writeLine "error: unknown subcommand '" & args[0] & "'"
     usage()

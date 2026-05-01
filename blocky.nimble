@@ -32,10 +32,14 @@ proc buildLibdeflate() =
 
 before build:
   buildLibdeflate()
+  exec "bgzip -c LICENSE > src/blocky/license_blocky.bgz"
+  exec "bgzip -c vendor/libdeflate/COPYING > src/blocky/license_libdeflate.bgz"
 
 task release, "Build release binary":
-  buildLibdeflate()
-  exec "nim c -d:release -d:strip src/blocky.nim"
+  --define:release
+  --define:strip
+  --panics:on
+  setCommand "build"
 
 task test, "Run all tests":
   exec "nimble build -y"  # CLI tests shell out to the binary

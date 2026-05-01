@@ -32,6 +32,8 @@ proc buildLibdeflate() =
 
 before build:
   buildLibdeflate()
+  exec "bgzip -c LICENSE > src/blocky/license_blocky.bgz"
+  exec "bgzip -c vendor/libdeflate/COPYING > src/blocky/license_libdeflate.bgz"
 
 task release, "Build release binary":
   --define:release

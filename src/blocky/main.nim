@@ -20,6 +20,11 @@ proc warnFormatMismatch(inputPath: string; outputPath: string) =
 const NimblePkgVersion {.strdefine.} = "dev"
 const VERSION = NimblePkgVersion
 
+# License files bgzip-compressed by the nimble before-build hook.
+# staticRead embeds the binary at compile time; decompressBgzf unpacks at runtime.
+const blockyLicenseData    = staticRead("license_blocky.bgz")
+const libdeflateLicenseData = staticRead("license_libdeflate.bgz")
+
 proc usage(code: int = 1) =
   ## Print top-level usage and exit with code (0 for --help, 1 for errors).
   let f = if code == 0: stdout else: stderr
@@ -33,6 +38,11 @@ proc usage(code: int = 1) =
   f.writeLine "  gather       Concatenate pre-existing shard files into a single output"
   f.writeLine "  compress     BGZF-compress a file (like bgzip)"
   f.writeLine "  decompress   Decompress a BGZF file"
+  f.writeLine ""
+  f.writeLine "Flags:"
+  f.writeLine "  --version                show version"
+  f.writeLine "  --help, -h               show this help"
+  f.writeLine "  --license                show license information"
   f.writeLine ""
   f.writeLine "Run 'blocky <subcommand> --help' for subcommand options."
   quit(code)
@@ -550,6 +560,17 @@ proc mainEntry*() =
     echo "blocky v" & VERSION
   of "--help", "-h":
     usage(0)
+  of "--license":
+    proc licenseStr(data: string): string =
+      let b = decompressBgzf(data.toOpenArrayByte(0, data.high))
+      result = newString(b.len)
+      if b.len > 0: copyMem(addr result[0], unsafeAddr b[0], b.len)
+    echo "=== blocky ==="
+    echo ""
+    echo licenseStr(blockyLicenseData)
+    echo "=== libdeflate ==="
+    echo ""
+    echo licenseStr(libdeflateLicenseData)
   else:
     stderr.writeLine "error: unknown subcommand '" & args[0] & "'"
     usage()

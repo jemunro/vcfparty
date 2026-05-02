@@ -1,4 +1,4 @@
-# blocky
+# blocky - fast parallel VCF, BCF and BGZF processing for bioinformatics
 
 Parallelise processing of bgzipped files by splitting along BGZF block boundaries and piping each shard through a tool pipeline concurrently. Works with any BGZF+TBI/CSI file: VCF, BCF, BED, GFF, GTF, TSV, or any newline-delimited bgzipped format.
 

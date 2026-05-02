@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>blocky — Parallel BGZF Scatter &amp; Gather for VCF, BCF, BED and GFF</title>
+  <meta name="description" content="blocky splits bgzipped files (VCF, BCF, BED, GFF) along BGZF block boundaries and sends each shard through a parallel bioinformatics pipeline. Works with bcftools, vcfanno, VEP and more." />
+  <meta property="og:title" content="blocky — Parallel BGZF Scatter &amp; Gather for VCF, BCF, BED and GFF" />
+  <meta property="og:description" content="blocky splits bgzipped files (VCF, BCF, BED, GFF) along BGZF block boundaries and sends each shard through a parallel bioinformatics pipeline. Works with bcftools, vcfanno, VEP and more." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://jemunro.github.io/blocky/" />
+  <link rel="canonical" href="https://jemunro.github.io/blocky/" />
+  <style>
+    :root {
+      --bg: #1a1b26;
+      --bg-alt: #24283b;
+      --fg: #c0caf5;
+      --fg-dim: #9aa5ce;
+      --accent: #7aa2f7;
+      --accent2: #bb9af7;
+      --green: #9ece6a;
+      --orange: #ff9e64;
+      --red: #f7768e;
+      --border: #3b4261;
+      --code-bg: #1f2335;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html {
+      font-size: 16px;
+      scroll-behavior: smooth;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                   "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.7;
+      max-width: 52rem;
+      margin: 0 auto;
+      padding: 2rem 1.5rem 4rem;
+    }
+
+    h1, h2, h3, h4, h5, h6 {
+      color: var(--accent);
+      margin-top: 2rem;
+      margin-bottom: 0.75rem;
+      line-height: 1.3;
+    }
+
+    h1 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 0.4rem; }
+    h2 { font-size: 1.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+    h3 { font-size: 1.25rem; color: var(--accent2); }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    p { margin-bottom: 1rem; }
+
+    hr {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 2rem 0;
+    }
+
+    code {
+      font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
+      font-size: 0.9em;
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1rem 1.25rem;
+      overflow-x: auto;
+      margin-bottom: 1rem;
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+      font-size: 0.85em;
+      line-height: 1.5;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 1rem;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 0.5rem 0.75rem;
+      border: 1px solid var(--border);
+    }
+
+    th {
+      background: var(--bg-alt);
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    tr:nth-child(even) { background: var(--bg-alt); }
+
+    blockquote {
+      border-left: 3px solid var(--accent2);
+      padding: 0.5rem 1rem;
+      margin: 0 0 1rem;
+      color: var(--fg-dim);
+      background: var(--bg-alt);
+      border-radius: 0 4px 4px 0;
+    }
+
+    ul, ol {
+      margin-bottom: 1rem;
+      padding-left: 1.5rem;
+    }
+
+    li { margin-bottom: 0.25rem; }
+
+    img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 6px;
+    }
+
+    strong { color: var(--fg); }
+
+    /* Pandoc syntax highlighting overrides for dark theme */
+    .sourceCode { background: var(--code-bg); }
+    code span.kw { color: var(--accent2); font-weight: bold; }  /* Keyword */
+    code span.dt { color: var(--green); }                        /* DataType */
+    code span.st { color: var(--green); }                        /* String */
+    code span.co { color: var(--fg-dim); font-style: italic; }  /* Comment */
+    code span.op { color: var(--fg); }                           /* Operator */
+    code span.fu { color: var(--accent); }                       /* Function */
+    code span.va { color: var(--orange); }                       /* Variable */
+    code span.cf { color: var(--accent2); }                      /* ControlFlow */
+    code span.al { color: var(--red); font-weight: bold; }      /* Alert */
+    code span.er { color: var(--red); font-weight: bold; }      /* Error */
+    code span.bn { color: var(--orange); }                       /* BaseN */
+    code span.dv { color: var(--orange); }                       /* DecVal */
+
+    @media (max-width: 600px) {
+      body { padding: 1rem; }
+      h1 { font-size: 1.5rem; }
+      pre { padding: 0.75rem; }
+    }
+  </style>
+</head>
+<body>
+$body$
+</body>
+</html>

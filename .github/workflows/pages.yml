@@ -3,7 +3,7 @@ name: Deploy GitHub Pages
 on:
   push:
     branches: [main]
-    paths: [README.md]
+    paths: [README.md, docs/template.html, docs/blocky_diagram.svg]
   workflow_dispatch:
 
 permissions:

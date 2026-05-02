@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>blocky — Parallel BGZF Scatter &amp; Gather for VCF, BCF, BED and GFF</title>
+  <title>blocky - fast parallel VCF, BCF and BGZF processing for bioinformatics</title>
   <meta name="description" content="blocky splits bgzipped files (VCF, BCF, BED, GFF) along BGZF block boundaries and sends each shard through a parallel bioinformatics pipeline. Works with bcftools, vcfanno, VEP and more." />
   <meta property="og:title" content="blocky — Parallel BGZF Scatter &amp; Gather for VCF, BCF, BED and GFF" />
   <meta property="og:description" content="blocky splits bgzipped files (VCF, BCF, BED, GFF) along BGZF block boundaries and sends each shard through a parallel bioinformatics pipeline. Works with bcftools, vcfanno, VEP and more." />
@@ -148,14 +148,47 @@
     code span.bn { color: var(--orange); }                       /* BaseN */
     code span.dv { color: var(--orange); }                       /* DecVal */
 
+    .site-header {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: var(--bg-alt);
+      border-bottom: 1px solid var(--border);
+      padding: 0.5rem 1.5rem;
+      margin: -2rem -1.5rem 2rem;
+      font-size: 0.9rem;
+    }
+
+    .site-header .site-name {
+      font-weight: 700;
+      color: var(--accent);
+      font-size: 1.1rem;
+    }
+
+    .site-header .github-link {
+      color: var(--fg-dim);
+    }
+
+    .site-header .github-link:hover {
+      color: var(--accent);
+    }
+
     @media (max-width: 600px) {
       body { padding: 1rem; }
+      .site-header { margin: -1rem -1rem 1.5rem; padding: 0.5rem 1rem; }
       h1 { font-size: 1.5rem; }
       pre { padding: 0.75rem; }
     }
   </style>
 </head>
 <body>
+<header class="site-header">
+  <span class="site-name">blocky</span>
+  <a class="github-link" href="https://github.com/jemunro/blocky">View on GitHub &rarr;</a>
+</header>
 $body$
 </body>
 </html>
